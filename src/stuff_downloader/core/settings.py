@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 class Settings:
     download_dir: str = ""
     max_concurrent: int = 3
+    notifications: bool = True
     tool_paths: dict[str, str] = field(default_factory=dict)
     schema_version: int = SCHEMA_VERSION
 
@@ -50,6 +51,9 @@ def load(path: Path | None = None) -> Settings:
     concurrent = raw.get("max_concurrent")
     if isinstance(concurrent, int) and not isinstance(concurrent, bool):
         settings.max_concurrent = min(5, max(1, concurrent))
+    notifications = raw.get("notifications")
+    if isinstance(notifications, bool):
+        settings.notifications = notifications
     tools = raw.get("tool_paths")
     if isinstance(tools, dict):
         settings.tool_paths = {k: v for k, v in tools.items() if isinstance(v, str)}

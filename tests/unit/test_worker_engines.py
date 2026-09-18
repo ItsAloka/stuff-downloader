@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -50,14 +52,45 @@ def test_trusted_tool_only_uses_fixed_names_in_runner_dir(monkeypatch, tmp_path)
     assert ytdlp.trusted_tool("calc") is None  # not an allowed tool
 
 
-def test_ytdlp_ignores_job_supplied_executable_paths(monkeypatch, tmp_path):
+FIXTURE = Path(__file__).parent / "fixtures" / "youtube_video.json"
+
+
+class FakeDownloadError(Exception):
+    pass
+
+
+@pytest.fixture
+def fake_ytdlp(monkeypatch):
+    """A stand-in yt_dlp module: returns raw info with URLs and runs the configured hooks."""
     from stuff_downloader_worker.engines import ytdlp
 
-    captured = {}
+    state = {"opts": None, "raise": None, "write": None}
+    raw = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    for fmt in raw["formats"]:
+        fmt["url"] = f"https://rr1.googlevideo.com/videoplayback?sig=SECRET&itag={fmt['format_id']}"
+        fmt["http_headers"] = {"Cookie": "SID=secret"}
+    raw["thumbnails"] = [
+        {"url": "https://evil.example/huge.jpg", "width": 9999, "height": 9999},
+        {"url": "https://i.ytimg.com/vi/x/hq.jpg", "width": 480, "height": 360},
+        {"url": "http://i.ytimg.com/vi/x/sq.jpg", "width": 544, "height": 544},
+    ]
+
+    class Resp:
+        def __init__(self, data):
+            self.data = data
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, n):
+            return self.data[:n]
 
     class FakeYDL:
         def __init__(self, opts):
-            captured.update(opts)
+            state["opts"] = opts
 
         def __enter__(self):
             return self
@@ -66,21 +99,153 @@ def test_ytdlp_ignores_job_supplied_executable_paths(monkeypatch, tmp_path):
             return False
 
         def extract_info(self, url, download=False):
-            return {"title": "t", "id": "x", "formats": []}
+            assert download is False
+            if state["raise"]:
+                raise FakeDownloadError(state["raise"])
+            return json.loads(json.dumps(raw))
+
+        def urlopen(self, url):
+            state["thumb_url"] = url
+            return Resp(b"\xff\xd8jpegdata")
+
+        def process_ie_result(self, info, download=True):
+            opts = state["opts"]
+            hook = opts["progress_hooks"][0]
+            hook(
+                {
+                    "status": "downloading",
+                    "downloaded_bytes": 5,
+                    "total_bytes": 10,
+                    "info_dict": {"vcodec": "avc1"},
+                }
+            )
+            hook({"status": "finished"})
+            for pp in opts.get("postprocessors", []):
+                opts["postprocessor_hooks"][0](
+                    {"status": "started", "postprocessor": pp["key"].removeprefix("FFmpeg")}
+                )
+            if state["write"]:
+                state["write"].write_bytes(b"media")
+                opts["post_hooks"][0](str(state["write"]))
+            return {"requested_formats": [{"height": 720}, {"height": None}]}
 
     fake = type(sys)("yt_dlp")
     fake.YoutubeDL = FakeYDL
     fake.version = type(sys)("yt_dlp.version")
-    fake.version.__version__ = "0"
+    fake.version.__version__ = "2026.08.19"
     fake.utils = type(sys)("yt_dlp.utils")
-    fake.utils.DownloadError = RuntimeError
+    fake.utils.DownloadError = FakeDownloadError
     monkeypatch.setitem(sys.modules, "yt_dlp", fake)
     monkeypatch.delenv(ytdlp.TOOLS_DIR_ENV_VAR, raising=False)
-    evil = tmp_path / "evil.exe"
-    evil.write_bytes(b"")
-    spec = _spec("ytdlp", deno_path=str(evil), ffmpeg_location=str(evil))
-    get_engine("ytdlp").download(spec, lambda *_: None)
-    assert "js_runtimes" not in captured and "ffmpeg_location" not in captured
+    return state
+
+
+def _collect():
+    events = []
+    return events, lambda kind, data: events.append((kind, data))
+
+
+def test_analyze_returns_sanitized_info_and_safe_thumbnail(fake_ytdlp):
+    events, emit = _collect()
+    result = get_engine("ytdlp").download(_spec("ytdlp", mode="analyze"), emit)
+    text = json.dumps(result)
+    assert "googlevideo" not in text and "SECRET" not in text and "Cookie" not in text
+    assert result["title"] and result["engine_version"] == "2026.08.19"
+    assert all("url" not in f for f in result["formats"])
+    assert fake_ytdlp["thumb_url"] == "https://i.ytimg.com/vi/x/hq.jpg"  # https + known host only
+    assert result["thumbnail"]["data"]
+    assert events[0] == ("stage", {"stage": "analyzing"})
+    assert fake_ytdlp["opts"]["noplaylist"] is True
+
+
+def test_download_emits_stages_progress_and_file(fake_ytdlp, tmp_path):
+    out = tmp_path / "Video [x].mp4"
+    fake_ytdlp["write"] = out
+    events, emit = _collect()
+    spec = JobSpec(
+        "j1",
+        "ytdlp",
+        "https://www.youtube.com/watch?v=x",
+        str(tmp_path),
+        {
+            "mode": "download",
+            "preset": "video_1080",
+            "height": 480,
+            "compatible": True,
+            "crop_cover": True,
+        },
+    )
+    result = get_engine("ytdlp").download(spec, emit)
+    assert result["files"] == [str(out)] and result["total_bytes"] == 5
+    assert "formats" not in result and result["preset"] == "video_1080"
+    stages = [d["stage"] for k, d in events if k == "stage"]
+    assert stages == ["analyzing", "downloading", "downloading video", "completed"]
+    progress = [d for k, d in events if k == "progress"]
+    assert progress == [
+        {"downloaded_bytes": 5, "total_bytes": 10, "percent": 50.0, "speed": None, "eta": None}
+    ]
+    logs = [d["message"] for k, d in events if k == "log"]
+    assert logs == ["480p was not available; got 720p instead"]
+    assert fake_ytdlp["opts"]["paths"] == {"home": str(tmp_path)}
+
+
+def test_download_without_output_file_is_an_error(fake_ytdlp, tmp_path):
+    spec = JobSpec(
+        "j1",
+        "ytdlp",
+        "https://www.youtube.com/watch?v=x",
+        str(tmp_path),
+        {"mode": "download", "preset": "audio_original"},
+    )
+    with pytest.raises(EngineError) as info:
+        get_engine("ytdlp").download(spec, lambda *_: None)
+    assert info.value.code == "no_output"
+
+
+def test_extractor_errors_become_download_error(fake_ytdlp):
+    fake_ytdlp["raise"] = "ERROR: Private video"
+    with pytest.raises(EngineError) as info:
+        get_engine("ytdlp").download(_spec("ytdlp"), lambda *_: None)
+    assert info.value.code == "download_error" and "Private video" in info.value.message
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        {"mode": "analyze", "format": "b"},
+        {"mode": "download", "preset": "video_best", "deno_path": "C:/evil.exe"},
+        {"mode": "download", "preset": "video_best", "ffmpeg_location": "C:/evil.exe"},
+    ],
+)
+def test_ytdlp_rejects_job_supplied_engine_options(fake_ytdlp, options):
+    with pytest.raises(EngineError) as info:
+        get_engine("ytdlp").download(_spec("ytdlp", **options), lambda *_: None)
+    assert info.value.code == "bad_options"
+    assert fake_ytdlp["opts"] is None  # rejected before yt-dlp was even constructed
+
+
+def test_tools_come_only_from_runner_dir(fake_ytdlp, monkeypatch, tmp_path):
+    from stuff_downloader_worker.engines import ytdlp
+
+    get_engine("ytdlp").download(_spec("ytdlp"), lambda *_: None)
+    assert "js_runtimes" not in fake_ytdlp["opts"]
+    assert "ffmpeg_location" not in fake_ytdlp["opts"]
+    (tmp_path / "deno.exe").write_bytes(b"")
+    (tmp_path / "ffmpeg.exe").write_bytes(b"")
+    monkeypatch.setenv(ytdlp.TOOLS_DIR_ENV_VAR, str(tmp_path))
+    get_engine("ytdlp").download(_spec("ytdlp"), lambda *_: None)
+    assert fake_ytdlp["opts"]["js_runtimes"] == {"deno": {"path": str(tmp_path / "deno.exe")}}
+    assert fake_ytdlp["opts"]["ffmpeg_location"] == str(tmp_path / "ffmpeg.exe")
+
+
+def test_jpeg_size_reads_sof_header():
+    from stuff_downloader_worker.tagging import jpeg_size
+
+    sof = b"\xff\xc0\x00\x11\x08" + (360).to_bytes(2, "big") + (480).to_bytes(2, "big")
+    app0 = b"\xff\xe0\x00\x04ab"
+    assert jpeg_size(b"\xff\xd8" + app0 + sof + b"\x00" * 12) == (480, 360)
+    assert jpeg_size(b"PNG....") is None
+    assert jpeg_size(b"\xff\xd8\x00garbage-without-markers") is None
 
 
 def test_ytdlp_missing_engine_is_a_clean_error(monkeypatch):

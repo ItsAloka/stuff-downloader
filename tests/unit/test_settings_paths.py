@@ -69,3 +69,33 @@ def test_settings_corrupt_or_invalid_values(tmp_path):
     assert s.download_dir == "" and s.max_concurrent == 5 and s.tool_paths == {}
     path.write_text(json.dumps({"max_concurrent": True}))
     assert settings.load(path).max_concurrent == 3
+
+# ── the notifications setting ────────────────────────────────────
+# Merged from test_settings.py, which existed only because the notifications field was
+# added under a write lease that covered that one path.
+def test_notifications_defaults_to_on():
+    assert settings.Settings().notifications is True
+
+
+def test_notifications_survives_a_save_and_load(tmp_path):
+    path = tmp_path / "settings.json"
+    saved = settings.Settings(notifications=False)
+    settings.save(saved, path)
+    assert json.loads(path.read_text(encoding="utf-8"))["notifications"] is False
+    assert settings.load(path).notifications is False
+
+    settings.save(settings.Settings(notifications=True), path)
+    assert settings.load(path).notifications is True
+
+
+def test_a_corrupt_notifications_value_falls_back_to_the_default(tmp_path):
+    path = tmp_path / "settings.json"
+    for bad in ("yes", 1, None, {}):
+        path.write_text(json.dumps({"notifications": bad}), encoding="utf-8")
+        assert settings.load(path).notifications is True
+
+
+def test_a_missing_notifications_key_is_not_an_error(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"download_dir": ""}), encoding="utf-8")
+    assert settings.load(path).notifications is True

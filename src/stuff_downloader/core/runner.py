@@ -78,9 +78,18 @@ def runtime_python(engine: str = "fake") -> Path:
     return root / "python" / "python.exe"
 
 
+DEV_ENGINES = frozenset({"fake", "probe"})
+
+
 def default_worker_command(engine: str = "fake") -> list[str]:
     if not is_frozen():
-        return [sys.executable, "-u", "-m", "stuff_downloader_worker"]
+        # From source, real engines use the installed engine env when there is one, because the
+        # dev venv deliberately does not contain yt-dlp.
+        env_id = None if engine in DEV_ENGINES else _active_env(runtime_root(), engine)
+        python = runtime_python(engine) if env_id else None
+        if python is None or not python.is_file():
+            return [sys.executable, "-u", "-m", "stuff_downloader_worker"]
+        return [str(python), "-s", "-u", "-m", "stuff_downloader_worker"]
     python = runtime_python(engine)
     if not python.is_file():
         raise WorkerRuntimeMissing(f"engine runtime not found: {python}")
@@ -103,10 +112,12 @@ _INTERPRETER_VARS = {
 }
 
 
-def _worker_env() -> dict[str, str]:
+def _worker_env(external_python: bool = False) -> dict[str, str]:
     env = dict(os.environ)
     # Only the runner decides which tools a worker may execute (see worker engines/ytdlp.py).
     env[TOOLS_DIR_ENV_VAR] = str(tools.app_tools_dir())
+    if not is_frozen() and external_python:
+        env = {k: v for k, v in env.items() if k.upper() not in _INTERPRETER_VARS}
     if is_frozen():
         # The frozen bundle's own modules are not importable by another interpreter; the worker
         # package lives in the runtime's app dir.
@@ -176,7 +187,7 @@ class JobRun:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                env=_worker_env(),
+                env=_worker_env(external_python=self._command[0] != sys.executable),
                 creationflags=creationflags,
             )
             self.state = RunState.RUNNING

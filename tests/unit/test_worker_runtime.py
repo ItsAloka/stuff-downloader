@@ -33,6 +33,37 @@ def test_dev_uses_current_interpreter(monkeypatch):
     assert runner.default_worker_command("ytdlp")[0] == sys.executable
 
 
+def test_dev_uses_installed_engine_env_for_real_engines_only(monkeypatch, tmp_path):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setenv(runner.RUNTIME_ENV_VAR, str(tmp_path))
+    env_python = _touch(tmp_path / "envs" / "ytdlp" / "2026.8.19-abc" / "Scripts" / "python.exe")
+    _touch(tmp_path / "python" / "python.exe")
+    (tmp_path / "active.json").write_text(
+        json.dumps({"ytdlp": {"active": "2026.8.19-abc"}, "fake": {"active": "x"}}),
+        encoding="utf-8",
+    )
+    assert runner.default_worker_command("ytdlp") == [
+        str(env_python),
+        "-s",
+        "-u",
+        "-m",
+        "stuff_downloader_worker",
+    ]
+    assert runner.default_worker_command("fake")[0] == sys.executable
+    env_python.unlink()
+    assert runner.default_worker_command("ytdlp")[0] == sys.executable
+
+
+def test_dev_external_python_env_drops_interpreter_vars(monkeypatch):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    monkeypatch.setenv("__PYVENV_LAUNCHER__", "C:\\dev\\.venv\\Scripts\\python.exe")
+    monkeypatch.setenv("PYTHONPATH", "C:\\elsewhere")
+    src = str(Path(runner.__file__).resolve().parents[2])
+    env = runner._worker_env(external_python=True)
+    assert "__PYVENV_LAUNCHER__" not in env and env["PYTHONPATH"] == src
+    assert "__PYVENV_LAUNCHER__" in runner._worker_env()
+
+
 def test_default_runtime_root_is_localappdata(monkeypatch, tmp_path):
     monkeypatch.delenv(runner.RUNTIME_ENV_VAR, raising=False)
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
