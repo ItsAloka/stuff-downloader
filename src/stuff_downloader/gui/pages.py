@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import time
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -115,56 +116,56 @@ FAILURE_SUMMARY = "The download did not finish. Open Stuff Downloader for the re
 _CONTROL_CHARS = re.compile(
     r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028\u2029\u202a-\u202e]"
 )
-_DRIVE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
-# A location does not stop being one because a sentence wrapped it: "(example.com)" and
-# "example.com." must be judged on the host inside, so every non-word edge is trimmed first.
+# This used to be a denylist: patterns for the host shapes we could think of, and a list of
+# common TLDs. It failed seven times, because enumerating every way to write a location is a
+# race you lose — IDN hosts, punycode, Cyrillic homoglyphs, a fullwidth dot, a trailing dot,
+# percent-encoding, octal and decimal IPv4, and every TLD absent from the list all walked
+# straight through. So it is an allowlist now, and it fails CLOSED: a token is emitted only if
+# it is recognisably ordinary text, and anything else is redacted whether or not we can name
+# what it is. Over-redacting a toast is a cosmetic bug; under-redacting one puts a download
+# location on a lock screen and in Windows notification history.
+#
+# Structural characters a title has no business containing, and every URL, path and host does.
+# Detection runs on an NFKC-normalised copy, so fullwidth ／ ： ？ and the ideographic full stop
+# collapse onto the ASCII forms they imitate before any of this is checked.
+_STRUCTURAL = frozenset('/\\:@?#%&=<>|"`')
+# A dot immediately followed by a letter or digit is what every hostname looks like, in any
+# script: example.com, 例え.テスト, examplе.com, xn--r8jz45g.xn--zckzah, 0300.0250.0.1.
+# "Vol. 1" and a sentence's final full stop are not, because a space or the end follows.
+_DOT_THEN_ALNUM = re.compile(r"\.\w", re.UNICODE)
+# Two narrow exemptions, so the common toast text that is not a location still reads properly.
+_CLOCK = re.compile(r"^\d{1,2}(?::\d{2}){1,2}$")  # a running time: 1:23, 1:23:45
+_NUMBER = re.compile(r"^\d{1,4}(?:\.\d{1,2})?$")  # a count or a size: 12, 3.5
 _EDGE_NOISE = re.compile(r"^\W+|\W+$")
-_HOSTISH = re.compile(r"^(?:[A-Za-z0-9-]+\.)+([A-Za-z]{2,24})(?=$|[:/?#])")
-_IPV4 = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}(?=$|[:/?#])")
-# A port only counts as one when a path follows it, so a running time like 1:23 survives.
-_HOST_PORT = re.compile(r"^[A-Za-z0-9-]+:\d{2,5}(?=[/?#])")
-# A schemeless host still names where the file came from, and one path segment is enough
-# to identify it, so cdn.example.com/private-video must not survive either.
-COMMON_TLDS = frozenset(
-    {
-        "com", "net", "org", "io", "co", "tv", "me", "fm", "to", "cc",
-        "ru", "de", "fr", "uk", "jp", "cn", "in", "br", "nl", "eu",
-        "xyz", "info", "biz", "dev", "app", "site", "online", "live",
-        "watch", "stream", "video", "media", "cloud", "link", "page",
-    }
-)
-_FILE_SUFFIX = re.compile(r"[\\/][^\\/]*\.[A-Za-z0-9]{1,5}$")
+# There is deliberately NO exemption for a slash. An earlier version allowed one for band names
+# like AC/DC, gated on both sides being short letters and the token not being all lowercase. The
+# security review rejected it: "SRV/x" and "Host/Path" satisfied that gate too, and a compact
+# internal host and path is exactly what must never reach notification history. A band name
+# rendering as [removed] in a toast is a cosmetic loss; a location on a lock screen is not.
+
+# Every pattern here is anchored and free of nested quantifiers: this runs on the GUI thread,
+# so a pathological input must not be able to make it backtrack.
 
 
-def _is_host(probe: str) -> bool:
-    """Whether an already-trimmed, lowercased token starts with somewhere you can reach."""
-    host = _HOSTISH.match(probe)
-    if host is not None and (len(probe) > host.end() or host.group(1) in COMMON_TLDS):
+def _is_plain_text(token: str) -> bool:
+    """Whether one token is ordinary enough to show. Anything unrecognised is not."""
+    probe = unicodedata.normalize("NFKC", token)
+    # Punctuation on its own names nowhere: the "@" in "Live @ Wembley" is not a userinfo.
+    if not any(char.isalnum() for char in probe):
         return True
-    return bool(_IPV4.match(probe) or _HOST_PORT.match(probe))
+    # The exemptions are matched on the token's core, so a trailing bracket in "(Set 1:23:45)"
+    # does not turn a running time back into something unrecognised.
+    core = _EDGE_NOISE.sub("", probe)
+    if _CLOCK.match(core) or _NUMBER.match(core):
+        return True
+    if any(char in _STRUCTURAL for char in probe):
+        return False
+    return not _DOT_THEN_ALNUM.search(probe)
 
 
 def _leaks_location(token: str) -> bool:
-    """Whether one whitespace-separated token looks like a URL, a query string or a path."""
-    if not token:
-        return False
-    lowered = token.lower()
-    if "://" in lowered or lowered.startswith(("www.", "file:", "http:", "https:")):
-        return True
-    if "?" in token and "=" in token.split("?", 1)[1]:
-        return True  # a query string carries ids, tokens and keys
-    if "\\" in token or _DRIVE_PATH.match(token):
-        return True  # any Windows path, UNC included
-    if token.startswith(("/", "~/", "./", "../")):
-        return True
-    if token.startswith("[") and "]" in token and ":" in token:
-        return True  # a bracketed IPv6 literal
-    probe = _EDGE_NOISE.sub("", token).lower()
-    if "@" in probe and _is_host(probe.rsplit("@", 1)[1]):
-        return True  # userinfo@host hides the host from a start-anchored match
-    if _is_host(probe):
-        return True  # a schemeless URL: cdn.example.com/private-video, example.com
-    return token.count("/") >= 2 or bool(_FILE_SUFFIX.search(token))
+    """Whether one whitespace-separated token must not be shown. The inverse of the allowlist."""
+    return bool(token) and not _is_plain_text(token)
 
 
 def safe_notification_line(text: object, limit: int = NOTIFICATION_LINE_LIMIT) -> str:

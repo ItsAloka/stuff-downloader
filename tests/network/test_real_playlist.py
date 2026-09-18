@@ -16,30 +16,19 @@ this project; read the reason before believing it.
 
 from __future__ import annotations
 
-import json
-import subprocess
-import sys
-import threading
 from pathlib import Path
 
+import netjob
 import pytest
+from netjob import ffprobe
 
-from stuff_downloader.core import playlist, presets, tools
-from stuff_downloader.core.protocol import Event, JobSpec
-from stuff_downloader.core.runner import JobRun, default_worker_command
+from stuff_downloader.core import playlist, presets
+from stuff_downloader.core.protocol import JobSpec
 
 pytestmark = pytest.mark.network
 
-# Resolved at import time, on purpose. tests/conftest.py redirects LOCALAPPDATA for every test,
-# and the yt-dlp engine runtime lives under the real one — so a worker started from inside a
-# test would run in the dev venv, which deliberately has no yt_dlp. Every JobRun below is given
-# this command explicitly rather than letting it re-resolve under the patched environment.
-WORKER_COMMAND = default_worker_command("ytdlp")
-if Path(WORKER_COMMAND[0]).resolve() == Path(sys.executable).resolve():
-    pytest.skip(
-        "the yt-dlp engine runtime is not installed; build it before running network tests",
-        allow_module_level=True,
-    )
+# Resolved at import time, on purpose -- see the note in netjob.worker_command.
+WORKER_COMMAND = netjob.require_engine_runtime()
 
 # Kevin MacLeod — "25 Years, Vol. 1", Creative Commons BY. Real album, real track numbers,
 # real cover art, and short tracks.
@@ -48,42 +37,9 @@ TRACKS = 2
 JOB_TIMEOUT = 300.0
 
 
-def run_job(spec: JobSpec) -> tuple[Event, list[Event]]:
-    """Run one real worker job to its terminal event. Returns (terminal, all events)."""
-    events: list[Event] = []
-    done = threading.Event()
-
-    def on_event(event: Event) -> None:
-        events.append(event)
-        if event.is_terminal:
-            done.set()
-
-    run = JobRun(spec, on_event, worker_command=WORKER_COMMAND)
-    run.start()
-    if not done.wait(JOB_TIMEOUT):
-        run.cancel()
-        raise AssertionError(f"job did not finish within {JOB_TIMEOUT}s: {spec.url}")
-    return events[-1], events
-
-
-def ffprobe(path: Path) -> dict:
-    exe = tools.app_tools_dir() / "ffprobe.exe"
-    assert exe.is_file(), f"ffprobe not found at {exe}; see tools/SOURCES.txt"
-    out = subprocess.run(  # noqa: S603 (fixed, app-owned tool path)
-        [
-            str(exe),
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            "-show_streams",
-            str(path),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
-    assert out.returncode == 0, out.stderr
-    return json.loads(out.stdout)
+def run_job(spec: JobSpec):
+    """One real job, with transient provider refusals retried then skipped. See netjob."""
+    return netjob.run_job(spec, WORKER_COMMAND, JOB_TIMEOUT)
 
 
 @pytest.fixture(scope="module")

@@ -738,6 +738,73 @@ def test_leading_punctuation_does_not_smuggle_a_host_through(tray_window):
         assert pages.REDACTED in shown[-1][1], text
 
 
+KNOWN_BYPASSES = [
+    # Found by author self-testing at version 8, after four rounds of patching the old
+    # denylist. Each one used to be emitted verbatim. The needle is the part that leaked.
+    ("IDN unicode host", "Saved from 例え.テスト/video", "例"),
+    ("IDN punycode", "Saved from xn--r8jz45g.xn--zckzah/video", "xn--"),
+    ("Cyrillic homoglyph", "Saved from examplе.com/secret", "е.com"),
+    ("fullwidth dot", "Saved from example．com/x", "example"),
+    ("trailing-dot FQDN", "Saved from example.com./secret", "example"),
+    ("percent-encoded dot", "Saved from example%2ecom/secret", "example"),
+    ("octal IPv4", "Saved from 0300.0250.0.1/x", "0300"),
+    ("decimal IPv4", "Saved from 3232235777/x", "3232235777"),
+    ("uncommon TLD", "Saved from example.museum", "example"),
+    ("internal TLD", "Saved from example.internal", "example"),
+    ("bare host and one segment", "Saved from myserver/videos", "myserver"),
+    # The five closed before version 8 -- kept so a rewrite cannot quietly reopen them.
+    ("uppercase host", "Saved from EXAMPLE.COM/secret", "EXAMPLE"),
+    ("scheme-relative", "Saved from //cdn.example.com/private", "cdn"),
+    ("IPv6 with zone id", "Saved from [fe80::1%eth0]:8080/x", "fe80"),
+    ("userinfo", "Saved from user:pass@example.com/a", "pass"),
+    ("query string", "https://example.com/watch?v=a&token=s", "token"),
+    # Raised by the security review against the allowlist's one slash exemption, which is why
+    # there is no longer a slash exemption at all: a compact internal host and path satisfied
+    # every gate the exemption applied.
+    ("short host and path", "Saved from SRV/x", "SRV"),
+    ("mixed-case host and path", "Saved from Host/Path", "Host"),
+]
+
+
+@pytest.mark.parametrize(("name", "text", "needle"), KNOWN_BYPASSES)
+def test_no_known_bypass_reaches_a_toast(tray_window, name, text, needle):
+    """Every location shape that has ever got through, in one place.
+
+    This list only grows. A sanitizer that fails open loses the race against "every way to
+    write a host", which is why the implementation is an allowlist -- these are the cases that
+    proved it, not the definition of done.
+    """
+    shown = _toasts(tray_window)
+    assert tray_window._notify("Download failed", text, "failed") is True
+    message = shown[-1][1]
+    assert needle not in message, f"{name}: {message!r}"
+    assert pages.REDACTED in message, f"{name}: {message!r}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Kevin MacLeod - 25 Years, Vol. 1",
+        "Track 3 of 12 done",
+        "1:23 remaining",
+        "3.5 MB downloaded",
+        "Don't Stop Me Now",
+        "Mr. Smith goes to town",
+    ],
+)
+def test_ordinary_toast_text_survives_the_allowlist(tray_window, text):
+    """The other half of the bargain: failing closed must not redact normal text.
+
+    A sanitizer that redacts everything is trivially safe and useless. A running time, a
+    decimal size, a track count, an abbreviation's full stop and an apostrophe all have to
+    come through intact, or the toast stops being worth showing.
+    """
+    shown = _toasts(tray_window)
+    tray_window._notify("Download finished", text, "completed")
+    assert shown[-1][1] == text
+    assert pages.REDACTED not in shown[-1][1]
+
+
 def test_a_non_latin_title_is_left_alone(tray_window):
     """The edge trim is unicode-aware, so a title in another script is not eaten."""
     shown = _toasts(tray_window)
@@ -752,11 +819,20 @@ def test_an_at_sign_in_an_ordinary_title_is_not_a_host(tray_window):
     assert shown[0][1] == "Live @ Wembley (Set 1:23:45)"
 
 
-def test_an_ordinary_title_with_a_slash_or_a_dot_survives(tray_window):
-    """Redaction must not be so greedy that real titles become unreadable."""
+def test_redaction_stays_token_local_and_does_not_eat_the_line(tray_window):
+    """Redaction must not be so greedy that real titles become unreadable.
+
+    This test used to require "AC/DC - Thunderstruck (Ep. 12)" to survive whole, via a slash
+    exemption in the sanitizer. The security review rejected that exemption, because nothing
+    operating on a single token can tell the band name from "SRV/x" -- a compact internal host
+    and path, which is precisely what must not reach Windows notification history. So the
+    slash-bearing token now redacts, and what this guards instead is that the redaction is
+    confined to that token: the rest of the title, including "Ep. 12" with its full stop, still
+    reads. Losing a band name from a toast is the accepted cost; see pages._is_plain_text.
+    """
     shown = _toasts(tray_window)
     tray_window._notify("Download finished", "AC/DC - Thunderstruck (Ep. 12)", "completed")
-    assert shown[0][1] == "AC/DC - Thunderstruck (Ep. 12)"
+    assert shown[0][1] == f"{pages.REDACTED} - Thunderstruck (Ep. 12)"
 
 
 def test_toast_text_is_bounded_and_free_of_control_characters(tray_window):

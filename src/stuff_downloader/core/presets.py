@@ -27,7 +27,17 @@ class Preset:
 
 
 PRESETS: tuple[Preset, ...] = (
-    Preset("video_best", "Video — Best", "video", None, "Highest quality available"),
+    # "Best" is bounded by the compatibility toggle, and saying otherwise was a false promise:
+    # verified against a real 4K video, compatible=True picks 1080p avc1 where 2160p AV1 exists,
+    # because YouTube publishes no avc1 above 1080p. Turning compatibility off lifts that ceiling
+    # at the cost of a file some players and TVs will not open. See tests/network/.
+    Preset(
+        "video_best",
+        "Video — Best",
+        "video",
+        None,
+        "Highest quality that still plays everywhere; turn off compatibility for 4K",
+    ),
     Preset("video_1080", "Video — up to 1080p", "video", 1080, "Good quality, reasonable size"),
     Preset("video_720", "Video — up to 720p (small)", "video", 720, "Smaller files"),
     Preset(
