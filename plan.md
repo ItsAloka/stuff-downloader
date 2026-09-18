@@ -349,7 +349,7 @@ optional Fluent widget library.
 │ 🛠 Tools│ │ ( Video )( Audio )( Images )( Subtitles )( All formats )       │ │
 │ ⚙ Sett-│ │ Format: [MP3 — Music (square cover + tags) ▾]  Quality:[V0 ▾]  │ │
 │  ings  │ │ Resolution: [1080p60 · ~142 MB ▾]   ☑ Most compatible (MP4)    │ │
-│        │ │ Save to: [C:\Users\Aloka\Downloads        ] [Change…]           │ │
+│        │ │ Save to: [C:\Users\You\Downloads        ] [Change…]           │ │
 │        │ │ [cover preview ▣]  ☐ Don't crop cover        [ ⬇ Download ]    │ │
 │        │ └────────────────────────────────────────────────────────────────┘ │
 │        │ Queue  ▸ 3 active · 5 queued · 12 done        [Pause all][Clear done]│

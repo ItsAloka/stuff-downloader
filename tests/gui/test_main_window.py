@@ -652,14 +652,14 @@ def test_a_local_path_cannot_reach_a_toast(tray_window):
     shown = _toasts(tray_window)
     assert tray_window._notify(
         "Download failed",
-        "Song C:\\Users\\aloka\\Music\\song.mp3"
+        "Song C:\\Users\\testuser\\Music\\song.mp3"
         + "\n"
-        + "ffmpeg could not write /home/aloka/Music/song.mp3",
+        + "ffmpeg could not write /home/testuser/Music/song.mp3",
         "failed",
     ) is True
 
     title, message = shown[0][0], shown[0][1]
-    assert "C:" not in message and "Users" not in message and "aloka" not in message
+    assert "C:" not in message and "Users" not in message and "testuser" not in message
     assert "\\" not in message and "/home/" not in message
     assert pages.REDACTED in message
     assert "Song" in message and title == "Download failed"
@@ -853,7 +853,7 @@ def test_a_failed_job_notifies_a_fixed_summary_not_engine_text(window, runs, qtb
     runs[-1].emit(
         "error",
         code="download_error",
-        message="ERROR: unable to write C:\\Users\\aloka\\Music\\song.mp3 from https://x.test/v?id=9",
+        message="ERROR: unable to write C:\\Users\\testuser\\Music\\song.mp3 from https://x.test/v?id=9",
     )
 
     (title, message, state) = seen[0]
@@ -867,7 +867,7 @@ def test_an_untrusted_site_title_is_sanitized_before_it_is_emitted(window, runs,
     page = _analyzed(window, runs, qtbot)
     seen = _notices(page)
     job = page.start_download()
-    job.title = "Mix C:\\Users\\aloka\\Music\\song.mp3 https://x.test/a?k=v"
+    job.title = "Mix C:\\Users\\testuser\\Music\\song.mp3 https://x.test/a?k=v"
     page._finish_job(job, "completed", "Done")
 
     message = seen[0][1]
