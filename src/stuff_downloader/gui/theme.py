@@ -75,6 +75,8 @@ QProgressBar::chunk {{ background: {ACCENT}; border-radius: 3px; }}
 QProgressBar[state="completed"]::chunk {{ background: {SUCCESS}; }}
 QProgressBar[state="failed"]::chunk {{ background: {DANGER}; }}
 QProgressBar[state="cancelled"]::chunk {{ background: {WARNING}; }}
+QProgressBar[state="paused"]::chunk {{ background: {WARNING}; }}
+QProgressBar[state="skipped"]::chunk {{ background: {SUCCESS}; }}
 
 /* Status chips */
 QLabel#chip {{ border-radius: 10px; padding: 2px 10px; font-size: 9pt; font-weight: 600;
@@ -83,6 +85,9 @@ QLabel#chip[state="active"] {{ background: #133247; color: {ACCENT}; }}
 QLabel#chip[state="completed"] {{ background: #1c3a1a; color: {SUCCESS}; }}
 QLabel#chip[state="failed"] {{ background: #45201e; color: {DANGER}; }}
 QLabel#chip[state="cancelled"] {{ background: #44381a; color: {WARNING}; }}
+QLabel#chip[state="paused"] {{ background: #44381a; color: {WARNING}; }}
+QLabel#chip[state="queued"] {{ background: #23242a; color: {TEXT_DIM}; }}
+QLabel#chip[state="skipped"] {{ background: #1c3a1a; color: {SUCCESS}; }}
 QLabel#chip[state="ok"] {{ background: #1c3a1a; color: {SUCCESS}; }}
 QLabel#chip[state="missing"] {{ background: #45201e; color: {DANGER}; }}
 
