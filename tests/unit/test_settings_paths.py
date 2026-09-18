@@ -1,7 +1,8 @@
 import json
+import sys
 from pathlib import Path
 
-from stuff_downloader.core import paths, settings
+from stuff_downloader.core import paths, settings, tools
 
 
 def test_default_download_dir_is_existing_directory():
@@ -99,3 +100,54 @@ def test_a_missing_notifications_key_is_not_an_error(tmp_path):
     path = tmp_path / "settings.json"
     path.write_text(json.dumps({"download_dir": ""}), encoding="utf-8")
     assert settings.load(path).notifications is True
+
+
+# ── where a frozen build looks for ffmpeg ─────────────────────────────────
+# Regression cover for a real packaging defect: the spec bundled ffmpeg/ffprobe/deno correctly,
+# PyInstaller 6 placed them under _internal (sys._MEIPASS), and app_tools_dir() looked only next
+# to the exe -- so a build that contained all three reported all three "not found", and the
+# packaged app could not convert a single file. Only a real build showed it.
+
+
+def _frozen(monkeypatch, exe_dir, meipass=None):
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(exe_dir / "StuffDownloader.exe"))
+    if meipass is None:
+        monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+    else:
+        monkeypatch.setattr(sys, "_MEIPASS", str(meipass), raising=False)
+
+
+def test_frozen_finds_tools_bundled_under_meipass(monkeypatch, tmp_path):
+    """The normal PyInstaller 6 onedir layout: datas land in _internal."""
+    exe_dir = tmp_path / "StuffDownloader"
+    internal = exe_dir / "_internal"
+    (internal / "tools").mkdir(parents=True)
+    _frozen(monkeypatch, exe_dir, meipass=internal)
+
+    assert tools.app_tools_dir() == internal / "tools"
+
+
+def test_a_tools_folder_beside_the_exe_overrides_the_bundled_one(monkeypatch, tmp_path):
+    """So a broken or outdated bundled ffmpeg can be replaced without rebuilding the app."""
+    exe_dir = tmp_path / "StuffDownloader"
+    internal = exe_dir / "_internal"
+    (internal / "tools").mkdir(parents=True)
+    (exe_dir / "tools").mkdir(parents=True)
+    _frozen(monkeypatch, exe_dir, meipass=internal)
+
+    assert tools.app_tools_dir() == exe_dir / "tools"
+
+
+def test_frozen_without_meipass_falls_back_beside_the_exe(monkeypatch, tmp_path):
+    exe_dir = tmp_path / "StuffDownloader"
+    exe_dir.mkdir(parents=True)
+    _frozen(monkeypatch, exe_dir, meipass=None)
+
+    assert tools.app_tools_dir() == exe_dir / "tools"
+
+
+def test_from_source_the_tools_dir_is_the_repo_folder(monkeypatch):
+    monkeypatch.delattr(sys, "frozen", raising=False)
+    assert tools.app_tools_dir().name == "tools"
+    assert (tools.app_tools_dir().parent / "pyproject.toml").is_file()

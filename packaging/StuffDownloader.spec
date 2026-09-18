@@ -18,6 +18,20 @@ ENTRY.write_text(
     "import sys\nfrom stuff_downloader.__main__ import main\nsys.exit(main())\n", encoding="utf-8"
 )
 
+# The GUI shells out to ffmpeg/ffprobe (merge, transcode, cover art) and resolves them through
+# core.tools.app_tools_dir(), which is `<exe dir>\tools` when frozen. Without this the build
+# produces an app that launches, self-tests and then cannot finish a single real download --
+# verified: before this was here, a frozen --self-test reported all three tools "not found".
+#
+# This copies whatever is in the repo's git-ignored tools\ folder. Plan §8 wants them fetched
+# from official URLs pinned by SHA-256 by packaging/fetch_tools.py, which does not exist yet;
+# writing it, and the licence audit in §8.3, are M6 gates before anything is distributed.
+TOOLS_DIR = ROOT / "tools"
+TOOL_FILES = sorted(TOOLS_DIR.glob("*.exe")) if TOOLS_DIR.is_dir() else []
+if not TOOL_FILES:
+    # Loud, not silent: a toolless build is the failure mode this block exists to prevent.
+    print("WARNING: no tools found in tools\\ -- the built app will not be able to convert media")
+
 ENGINE_EXCLUDES = [
     "stuff_downloader_worker",
     "yt_dlp",
@@ -32,7 +46,7 @@ a = Analysis(
     [str(ENTRY)],
     pathex=[str(SRC)],
     binaries=[],
-    datas=[],
+    datas=[(str(path), "tools") for path in TOOL_FILES],
     hiddenimports=["stuff_downloader.app"],
     hookspath=[],
     runtime_hooks=[],

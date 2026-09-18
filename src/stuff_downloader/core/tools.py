@@ -30,8 +30,20 @@ class ToolStatus:
 
 
 def app_tools_dir() -> Path:
+    """Where the app's own ffmpeg/ffprobe/deno live.
+
+    Frozen, there are two candidates and the order matters. PyInstaller 6 collects bundled data
+    under ``_internal`` (``sys._MEIPASS``), which is where a normal build puts them. But a folder
+    the owner creates next to the exe wins, so a broken or outdated bundled ffmpeg can be replaced
+    without rebuilding the app. Checking only the exe's own directory is what made a build whose
+    tools were bundled correctly still report all three "not found".
+    """
     if getattr(sys, "frozen", False):
-        return Path(sys.executable).parent / "tools"
+        beside_exe = Path(sys.executable).parent / "tools"
+        if beside_exe.is_dir():
+            return beside_exe
+        bundled = getattr(sys, "_MEIPASS", None)
+        return Path(bundled) / "tools" if bundled else beside_exe
     return Path(__file__).resolve().parents[3] / "tools"
 
 
