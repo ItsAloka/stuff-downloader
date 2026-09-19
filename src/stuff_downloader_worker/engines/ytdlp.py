@@ -1,4 +1,8 @@
-"""yt-dlp engine (M1): analyze one YouTube/YT Music video, or download it with a preset.
+"""yt-dlp engine: analyze one video page, or download it with a preset.
+
+Since M3 the URL may name any public site, not just YouTube. Engine failure text from a site we
+do not control is therefore not passed through as-is: ``describe_download_error`` classifies it
+and strips any URL out of it, so a signed or tokenized link cannot reach the log or history.
 
 yt-dlp is imported lazily so this module loads in envs without it and fails with a clear error.
 
@@ -49,6 +53,19 @@ MAX_THUMB_BYTES = 1_500_000
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 MAX_PLAYLIST_ENTRIES = 500
 MAX_ENTRY_TEXT = 300
+MAX_ERROR_TEXT = 500
+
+# yt-dlp puts the failing URL in most of its messages, and for a generic site that URL can carry
+# a signature or a session token. Every one is replaced before the message leaves the worker.
+_URL_IN_TEXT = re.compile(r"[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
+_REDACTED_URL = "[link]"
+
+# (substring of the engine message, lower-case) -> error code. First match wins.
+_ERROR_CODES: tuple[tuple[str, str], ...] = (
+    ("unsupported url", "unsupported"),
+    ("no video formats found", "unsupported"),
+    ("is not a valid url", "unsupported"),
+)
 
 _UNAVAILABLE_REASONS = {
     "private": "Private video",
@@ -126,6 +143,21 @@ def sanitize_info(info: dict[str, Any]) -> dict[str, Any]:
     result["extractor"] = info.get("extractor_key") or info.get("extractor")
     result["formats"] = formats
     return result
+
+
+def redact_urls(text: str) -> str:
+    """``text`` with every URL replaced, so tokens and signatures never leave the worker."""
+    return _URL_IN_TEXT.sub(_REDACTED_URL, text)
+
+
+def describe_download_error(message: str) -> tuple[str, str]:
+    """An engine failure as (code, message the app may show), with URLs removed."""
+    safe = redact_urls(message).strip()[:MAX_ERROR_TEXT] or "the download failed"
+    lowered = safe.lower()
+    for needle, code in _ERROR_CODES:
+        if needle in lowered:
+            return code, safe
+    return "download_error", safe
 
 
 def _short_text(value: Any) -> str | None:
@@ -319,7 +351,7 @@ class YtDlpEngine:
                     return summary
                 return self._download(ydl, info, request, summary, files, stage, emit)
         except yt_dlp.utils.DownloadError as exc:
-            raise EngineError("download_error", str(exc)) from exc
+            raise EngineError(*describe_download_error(str(exc))) from exc
 
     @staticmethod
     def _thumbnail_preview(ydl: Any, info: dict[str, Any], emit: Emit) -> dict[str, Any] | None:

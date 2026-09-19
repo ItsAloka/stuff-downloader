@@ -209,7 +209,124 @@ STAGE_LABELS = {
     "completed": "Completed",
 }
 ANALYZE_TIMEOUT_MS = 90_000
+
+# A generic link's query can be the signed token that makes it work, so history stores the
+# link without it (see history.Store._migrate). Such a job can name the page but cannot be
+# replayed, and the owner is told that plainly rather than handed a download that will fail.
+LINK_REDACTED_REASON = (
+    "This link had a private part that was not saved. Paste the original link again to download it."
+)
 AUTO_HEIGHT = None
+
+# The Advanced view (plan §M3): what the site actually offers, read from the metadata the worker
+# already sanitized. Every cell is rebuilt here from a known field, never passed through, and the
+# table is read-only — the download itself still goes through the preset above.
+ADVANCED_COLUMNS = ("Kind", "Quality", "File", "Codecs", "Size")
+ADVANCED_MAX_ROWS = 120
+TITLE_LIMIT = 300
+SITE_LIMIT = 40
+_CELL_LIMIT = 40
+_NO_CODEC = ("none", "", "null")
+
+
+def _cell(value: Any, limit: int = _CELL_LIMIT) -> str:
+    """One table cell: a short, single-line, printable string or an em dash."""
+    if value is None or isinstance(value, bool):
+        return "—"
+    text = _CONTROL_CHARS.sub(" ", str(value)).strip()
+    if not text:
+        return "—"
+    return text[:limit]
+
+
+# Worker failure text is redacted in the engine for yt-dlp's own DownloadError, but an
+# unexpected exception is reported as str(exc), and a network or HTTP error object routinely
+# names what it was fetching. That text is stored in jobs.error_message and shown on the
+# History page, so it is redacted again here — at the boundary that owns what reaches disk,
+# not only in the process that happens to produce it.
+#
+# This reuses the notification allowlist rather than matching "scheme://", because the leak
+# that prompted it had no scheme: urllib3 reports `Max retries exceeded with url: /v/9?sig=…`,
+# a bare path and query. Deciding what is safe to keep beats listing what to remove.
+ERROR_MESSAGE_LIMIT = 300
+
+
+def safe_error_message(text: Any) -> str:
+    """Failure text safe to store and show: no locations, no control characters, bounded."""
+    cleaned = _CONTROL_CHARS.sub(" ", str(text or ""))
+    kept = [REDACTED if _leaks_location(token) else token for token in cleaned.split()]
+    return " ".join(kept).strip()[:ERROR_MESSAGE_LIMIT]
+
+
+def safe_job_title(title: Any, url: str) -> str:
+    """A title safe to store and show, for a link that may carry a token in its query.
+
+    A job needs a name before the site has told us one, and the obvious name is the link. For
+    a generic site that link can be the signed URL, and a title is written to history, shown in
+    the queue and the History page, searched, and put in a tray notification — so the raw link
+    must never become one. Anything carrying a scheme is refused as a title and replaced by the
+    durable form, which has already lost its query.
+    """
+    text = _CONTROL_CHARS.sub(" ", str(title or "")).strip()
+    if text and "://" not in text:
+        return text[:TITLE_LIMIT]
+    durable, _ = router.durable_url(url)
+    return durable or "Untitled"
+
+
+def _codec(value: Any) -> str:
+    """A codec name without yt-dlp's profile suffix, or "" when there is no such stream."""
+    text = str(value or "").split(".")[0].strip().lower()
+    return "" if text in _NO_CODEC else text
+
+
+def format_kind(fmt: dict[str, Any]) -> str:
+    video, audio = _codec(fmt.get("vcodec")), _codec(fmt.get("acodec"))
+    if video and audio:
+        return "Video + audio"
+    if video:
+        return "Video only"
+    if audio:
+        return "Audio only"
+    return "Other"
+
+
+def _quality(fmt: dict[str, Any]) -> str:
+    height, fps = fmt.get("height"), fmt.get("fps")
+    if _is_number(height) and height:
+        return f"{int(height)}p{int(fps)}" if _is_number(fps) and fps else f"{int(height)}p"
+    for key in ("abr", "tbr"):
+        value = fmt.get(key)
+        if _is_number(value) and value:
+            return f"{int(value)} kbps"
+    return _cell(fmt.get("format_note"))
+
+
+def _sort_key(fmt: dict[str, Any]) -> tuple[int, float, float]:
+    order = {"Video + audio": 0, "Video only": 1, "Audio only": 2, "Other": 3}
+    height = fmt.get("height") if _is_number(fmt.get("height")) else 0
+    rate = fmt.get("tbr") if _is_number(fmt.get("tbr")) else 0
+    return (order[format_kind(fmt)], -float(height or 0), -float(rate or 0))
+
+
+def advanced_rows(raw: Any) -> list[tuple[str, ...]]:
+    """One display row per format the site offers, best first. Never raises on odd input."""
+    usable = [f for f in raw if isinstance(f, dict)] if isinstance(raw, list) else []
+    rows = []
+    for fmt in sorted(usable, key=_sort_key)[:ADVANCED_MAX_ROWS]:
+        codecs = " / ".join(c for c in (_codec(fmt.get("vcodec")), _codec(fmt.get("acodec"))) if c)
+        size = fmt.get("filesize") or fmt.get("filesize_approx")
+        rows.append(
+            (
+                format_kind(fmt),
+                _cell(_quality(fmt)),
+                _cell(fmt.get("ext")).upper(),
+                _cell(codecs),
+                format_bytes(size) if _is_number(size) else "—",
+            )
+        )
+    return rows
+
 
 
 def _page_layout(widget: QWidget) -> QVBoxLayout:
@@ -281,7 +398,7 @@ class DownloadsPage(QWidget):
 
         layout = _page_layout(self)
         layout.addWidget(
-            page_header("Downloads", "Paste a YouTube or YouTube Music link, then pick a format.")
+            page_header("Downloads", "Paste a public video link, then pick a format.")
         )
 
         paste_card = Card()
@@ -289,7 +406,7 @@ class DownloadsPage(QWidget):
         row.setSpacing(8)
         self.url_edit = QLineEdit()
         self.url_edit.setObjectName("urlEdit")
-        self.url_edit.setPlaceholderText("🔗  Paste a YouTube or YouTube Music link…")
+        self.url_edit.setPlaceholderText("🔗  Paste a video link — YouTube or another site…")
         self.url_edit.setClearButtonEnabled(True)
         self.paste_button = QPushButton("Paste")
         self.paste_button.setToolTip("Paste a link from the clipboard")
@@ -319,6 +436,7 @@ class DownloadsPage(QWidget):
         self.preview.preset_combo.setCurrentIndex(
             self.preview.preset_combo.findData(presets.DEFAULT_PRESET_ID)
         )
+        self._build_advanced_section()
         layout.addWidget(self.preview)
 
         self.playlist_card = PlaylistCard()
@@ -376,6 +494,72 @@ class DownloadsPage(QWidget):
         self.pause_all_button.clicked.connect(self.pause_all)
         self.refresh_folder_hint()
         self.restore_unfinished()
+
+    # ── advanced formats ─────────────────────────────────────────────────────────────────
+    def _build_advanced_section(self) -> None:
+        """The "All formats" disclosure, added to the preview card above its buttons.
+
+        It lives here rather than in PreviewCard because it is filled from analyze results and
+        is deliberately read-only: it reports what the site offers, and the download still uses
+        the preset chosen above it.
+        """
+        self.advanced_button = QPushButton("▸  All formats")
+        self.advanced_button.setCheckable(True)
+        self.advanced_button.setToolTip("Show every format this site offers for this video")
+        self.advanced_note = QLabel(
+            "What the site offers. Downloads use the preset above, not a row here."
+        )
+        self.advanced_note.setObjectName("muted")
+        self.advanced_note.setWordWrap(True)
+        self.advanced_table = QTableWidget(0, len(ADVANCED_COLUMNS))
+        self.advanced_table.setHorizontalHeaderLabels(list(ADVANCED_COLUMNS))
+        self.advanced_table.verticalHeader().setVisible(False)
+        self.advanced_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.advanced_table.setSelectionMode(QTableWidget.SelectionMode.NoSelection)
+        self.advanced_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.advanced_table.setMinimumHeight(180)
+        header = self.advanced_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        for column in range(1, len(ADVANCED_COLUMNS)):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+
+        self.advanced_box = QWidget()
+        box = QVBoxLayout(self.advanced_box)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(6)
+        box.addWidget(self.advanced_note)
+        box.addWidget(self.advanced_table)
+        self.advanced_box.hide()
+
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.addWidget(self.advanced_button)
+        row.addStretch(1)
+        # The card's own layout is top / grid / buttons, so the disclosure goes before buttons.
+        self.preview.body.insertLayout(self.preview.body.count() - 1, row)
+        self.preview.body.insertWidget(self.preview.body.count() - 1, self.advanced_box)
+        self.advanced_button.toggled.connect(self._toggle_advanced)
+
+    def _toggle_advanced(self, shown: bool) -> None:
+        self.advanced_box.setVisible(shown and self.advanced_table.rowCount() > 0)
+        self.advanced_button.setText("▾  All formats" if shown else "▸  All formats")
+
+    def _site_label(self, info: dict[str, Any]) -> str:
+        """Which site this came from, for a link that is not YouTube. "" when it is."""
+        if self._route is None or self._route.is_youtube:
+            return ""
+        site = info.get("extractor")
+        return _cell(site, SITE_LIMIT) if isinstance(site, str) and site.strip() else ""
+
+    def _fill_advanced(self, info: dict[str, Any]) -> None:
+        rows = advanced_rows(info.get("formats"))
+        self.advanced_table.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            for column, text in enumerate(row):
+                self.advanced_table.setItem(index, column, QTableWidgetItem(text))
+        self.advanced_button.setVisible(bool(rows))
+        self.advanced_button.setChecked(False)  # every analyze starts collapsed
+        self.advanced_box.hide()
 
     # ── helpers ──────────────────────────────────────────────────────────────────────────
     def refresh_folder_hint(self) -> None:
@@ -471,10 +655,19 @@ class DownloadsPage(QWidget):
     def show_preview(self, info: dict[str, Any]) -> None:
         self._info = info
         card = self.preview
-        card.title_label.setText(str(info.get("title") or "Untitled"))
+        # Title, uploader and site name are written by whoever owns the page. Since M3 that can
+        # be any site, so the labels are pinned to plain text: a title containing markup is
+        # shown as the characters it is, never rendered as rich text.
+        for label in (card.title_label, card.meta_label, card.playlist_label):
+            label.setTextFormat(Qt.TextFormat.PlainText)
+        title = info.get("title")
+        card.title_label.setText(
+            _cell(title, TITLE_LIMIT) if isinstance(title, str) and title.strip() else "Untitled"
+        )
         meta = [
             str(info.get("artist") or info.get("uploader") or ""),
             format_duration(info.get("duration")),
+            self._site_label(info),
         ]
         card.meta_label.setText("  ·  ".join(m for m in meta if m))
         route = self._route
@@ -503,6 +696,7 @@ class DownloadsPage(QWidget):
         )
         if self._route and self._route.music:
             card.preset_combo.setCurrentIndex(card.preset_combo.findData("mp3_music"))
+        self._fill_advanced(info)
         self._update_options()
         card.show()
 
@@ -623,8 +817,13 @@ class DownloadsPage(QWidget):
         return job_card
 
     def _add_job(self, spec: JobSpec, title: str, group_id: str = "") -> QueuedJob:
-        """Create the row and record the job as queued. The scheduler decides when it runs."""
+        """Create the row and record the job as queued. The scheduler decides when it runs.
+
+        Every job that reaches history passes through here, so the title is made safe here
+        rather than at each call site: one of them forgetting is how a token gets written.
+        """
         job_id = spec.job_id
+        title = safe_job_title(title, spec.url)
         job_card = self._new_card(title, job_id)
         job = QueuedJob(spec, title, job_card, state="queued", group_id=group_id)
         self.jobs[job_id] = job
@@ -632,16 +831,29 @@ class DownloadsPage(QWidget):
         job_card.set_state(JOB_CHIPS["queued"], "queued")
         job_card.set_draggable(True)
         job_card.details_label.setText(presets.get(spec.options["preset"]).label)
+        self._record_job(spec, title, group_id)
+        return job
+
+    def _record_job(self, spec: JobSpec, title: str, group_id: str = "") -> None:
+        """Write one job row. The only place a job is allowed to reach the database.
+
+        Both callers — a new job and a retry, which reuses its queue row and so cannot go
+        through _add_job — come here, so the rules about what may be stored exist once. The
+        exact URL stays in the spec, which lives only as long as the app is running; what goes
+        on disk is the durable form, with a generic link's query and fragment removed, and a
+        title that safe_job_title has already refused to let be a link.
+        """
+        durable, redacted = router.durable_url(spec.url)
         self.store.add_job(
-            job_id,
-            spec.url,
+            spec.job_id,
+            durable,
             spec.engine,
             spec.options,
             spec.output_dir,
-            title=title,
+            title=safe_job_title(title, spec.url),
             group_id=group_id,
+            url_redacted=redacted,
         )
-        return job
 
     def _start_run(self, spec: JobSpec) -> None:
         """Called by the scheduler when a slot is free."""
@@ -698,6 +910,14 @@ class DownloadsPage(QWidget):
         self.store.restore_unfinished()
         jobs = []
         for record in self.store.unfinished():
+            if record.url_redacted:
+                # Resuming would fetch the link without the part that made it work. Close the
+                # row honestly instead of queueing something that can only fail, and do not
+                # give it a card: a retry button here would replay the same broken link.
+                self.store.set_state(
+                    record.job_id, "failed", error_message=LINK_REDACTED_REASON
+                )
+                continue
             if not isinstance(record.options.get("preset"), str):
                 continue
             try:
@@ -711,7 +931,7 @@ class DownloadsPage(QWidget):
                 output_dir=record.output_dir,
                 options=record.options,
             )
-            title = record.title or record.url
+            title = safe_job_title(record.title, record.url)
             job = QueuedJob(
                 spec,
                 title,
@@ -747,8 +967,7 @@ class DownloadsPage(QWidget):
             output_dir=str(self._settings.effective_download_dir()),
             options=options,
         )
-        title = str(self._info.get("title") or self._route.url)
-        job = self._add_job(spec, title)
+        job = self._add_job(spec, safe_job_title(self._info.get("title"), self._route.url))
         self.empty_state.hide()
         self.scheduler.submit(spec)
         return job
@@ -762,6 +981,13 @@ class DownloadsPage(QWidget):
         preset_id = record.options.get("preset")
         if not record.url or not isinstance(preset_id, str):
             return None
+        if record.url_redacted:
+            # The stored link names the page but not the video. Hand it back as a starting
+            # point and let the owner paste the real one; do not silently download the wrong
+            # thing or fail with something they cannot act on.
+            self.url_edit.setText(record.url)
+            self._show_message(LINK_REDACTED_REASON, error=True)
+            return None
         try:
             presets.get(preset_id)
         except ValueError:
@@ -773,7 +999,7 @@ class DownloadsPage(QWidget):
             output_dir=record.output_dir or str(self._settings.effective_download_dir()),
             options=dict(record.options),
         )
-        job = self._add_job(spec, record.title or record.url)
+        job = self._add_job(spec, safe_job_title(record.title, record.url))
         self.empty_state.hide()
         self.scheduler.submit(spec)
         self._update_summary()
@@ -830,15 +1056,9 @@ class DownloadsPage(QWidget):
         self.scheduler.reset_retries(job_id)
         old = job.spec
         job.spec = JobSpec(uuid.uuid4().hex, old.engine, old.url, old.output_dir, old.options)
-        self.store.add_job(
-            job.spec.job_id,
-            job.spec.url,
-            job.spec.engine,
-            job.spec.options,
-            job.spec.output_dir,
-            title=job.title,
-            group_id=job.group_id,
-        )
+        # The queue row and its card are reused, so this cannot go through _add_job — but the
+        # rules for what may be written are shared with it rather than repeated here.
+        self._record_job(job.spec, job.title, job.group_id)
         # Through the scheduler, not straight to _launch: otherwise the retried run is invisible
         # to it and a later cancel would leave the worker process running.
         self.jobs[job.spec.job_id] = job
@@ -990,7 +1210,7 @@ class DownloadsPage(QWidget):
             job.spec.job_id,
             state,
             error_code=error_code,
-            error_message=details if state == "failed" else "",
+            error_message=safe_error_message(details) if state == "failed" else "",
             total_bytes=total_bytes,
             files=[str(f) for f in job.files],
         )
@@ -1113,7 +1333,9 @@ class DownloadsPage(QWidget):
             elif intent == scheduling.CANCEL or code == "cancelled":
                 self._finish_job(job, "cancelled", "Cancelled by you")
             else:
-                message = errors.friendly_message(code, event.data.get("message"))
+                message = safe_error_message(
+                    errors.friendly_message(code, event.data.get("message"))
+                )
                 raw = event.data.get("message")
                 if not is_retryable(raw) or not self._start_backoff(
                     job, message, str(code or "")

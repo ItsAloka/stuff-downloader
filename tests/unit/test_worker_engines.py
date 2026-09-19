@@ -253,3 +253,57 @@ def test_ytdlp_missing_engine_is_a_clean_error(monkeypatch):
     with pytest.raises(EngineError) as info:
         get_engine("ytdlp").download(_spec("ytdlp"), lambda *_: None)
     assert info.value.code == "engine_missing"
+
+
+# --- M3: failures from sites we do not control ----------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("message", "code"),
+    [
+        ("ERROR: Unsupported URL: https://example.test/page", "unsupported"),
+        ("ERROR: [generic] page: No video formats found!", "unsupported"),
+        ("ERROR: 'x' is not a valid URL", "unsupported"),
+        ("ERROR: [youtube] abc: Private video. Sign in", "download_error"),
+        ("HTTP Error 429: Too Many Requests", "download_error"),
+    ],
+)
+def test_engine_failures_are_classified(message, code):
+    from stuff_downloader_worker.engines import ytdlp
+
+    assert ytdlp.describe_download_error(message)[0] == code
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "ERROR: Unsupported URL: https://example.test/v?sig=SECRET&token=abc",
+        "ERROR: unable to download https://rr1.googlevideo.com/videoplayback?sig=SECRET",
+        "ERROR: giving up after http://user:SECRET@example.test/x and rtmp://example.test/SECRET",
+    ],
+)
+def test_engine_failure_text_never_carries_a_url(message):
+    from stuff_downloader_worker.engines import ytdlp
+
+    _, safe = ytdlp.describe_download_error(message)
+    assert "SECRET" not in safe and "://" not in safe
+    assert "[link]" in safe
+
+
+def test_engine_failure_text_is_bounded_and_never_empty():
+    from stuff_downloader_worker.engines import ytdlp
+
+    code, safe = ytdlp.describe_download_error("https://example.test/" + "a" * 5000)
+    assert code == "download_error" and safe == "[link]"
+    code, safe = ytdlp.describe_download_error("x" * 5000)
+    assert len(safe) == ytdlp.MAX_ERROR_TEXT
+    assert ytdlp.describe_download_error("   ")[1] == "the download failed"
+
+
+def test_a_failing_analyze_raises_a_classified_engine_error(fake_ytdlp):
+    fake_ytdlp["raise"] = "ERROR: Unsupported URL: https://example.test/x?token=SECRET"
+    events, emit = _collect()
+    with pytest.raises(EngineError) as excinfo:
+        get_engine("ytdlp").download(_spec("ytdlp", mode="analyze"), emit)
+    assert excinfo.value.code == "unsupported"
+    assert "SECRET" not in excinfo.value.message and "://" not in excinfo.value.message

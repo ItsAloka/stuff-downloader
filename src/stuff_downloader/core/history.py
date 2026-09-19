@@ -22,9 +22,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import paths
+from . import paths, router
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # A job in one of these states was still going when the app stopped, so it comes back paused.
 UNFINISHED_STATES = ("queued", "active", "paused")
@@ -83,6 +83,9 @@ class JobRecord:
     queue_position: int = 0
     error_code: str = ""
     error_message: str = ""
+    # True when the stored url had a query or fragment removed before it was written, so it
+    # identifies the page but cannot be replayed. See Store._migrate and DownloadsPage.
+    url_redacted: bool = False
     total_bytes: int = 0
     files: list[str] = field(default_factory=list)
     created_at: float = 0.0
@@ -134,8 +137,39 @@ class Store:
                 )
                 # Existing rows keep the order they already had.
                 self._conn.execute("UPDATE jobs SET queue_position = rowid")
+        if version < 3:
+            # A generic (non-YouTube) source URL keeps its query, and on many sites that query
+            # is the signed token that makes the link work. It must not sit in a file, so the
+            # column records the loss and every existing row is rewritten in place.
+            columns = {r["name"] for r in self._conn.execute("PRAGMA table_info(jobs)")}
+            if "url_redacted" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE jobs ADD COLUMN url_redacted INTEGER NOT NULL DEFAULT 0"
+                )
+                self._redact_existing_urls()
         self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._conn.commit()
+
+    def _redact_existing_urls(self) -> None:
+        """Strip tokens out of URLs written before this app version knew not to store them.
+
+        Runs once, inside the v3 migration, on a connection that is already ours. A row that
+        cannot be parsed is left exactly as it is rather than guessed at: losing a link is a
+        smaller harm than rewriting one into something that no longer names the same video.
+        """
+        rewrites = []
+        for row in self._conn.execute("SELECT job_id, url FROM jobs").fetchall():
+            url = row["url"]
+            if not isinstance(url, str) or not url:
+                continue
+            safe, redacted = router.durable_url(url)
+            if redacted and safe:
+                rewrites.append((safe, row["job_id"]))
+        if rewrites:
+            self._conn.executemany(
+                "UPDATE jobs SET url = ?, url_redacted = 1 WHERE job_id = ?", rewrites
+            )
+            log.info("history: redacted %d stored source URLs", len(rewrites))
 
     def close(self) -> None:
         with self._lock:
@@ -167,6 +201,7 @@ class Store:
         title: str = "",
         group_id: str = "",
         state: str = "queued",
+        url_redacted: bool = False,
     ) -> None:
         now = time.time()
         with self._lock:
@@ -176,7 +211,8 @@ class Store:
             self._conn.execute(
                 "INSERT OR REPLACE INTO jobs (job_id, group_id, url, engine, preset,"
                 " options_json, output_dir, title, playlist_index, state, queue_position,"
-                " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                " url_redacted, created_at, updated_at)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     job_id,
                     group_id or None,
@@ -189,6 +225,7 @@ class Store:
                     options.get("playlist_index"),
                     state,
                     position,
+                    int(url_redacted),
                     now,
                     now,
                 ),
@@ -292,6 +329,7 @@ class Store:
                     queue_position=row["queue_position"],
                     error_code=row["error_code"],
                     error_message=row["error_message"],
+                    url_redacted=bool(row["url_redacted"]),
                     total_bytes=row["total_bytes"],
                     created_at=row["created_at"],
                     updated_at=row["updated_at"],

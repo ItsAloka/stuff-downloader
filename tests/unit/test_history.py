@@ -203,3 +203,90 @@ def test_a_version_1_database_gains_queue_positions_in_row_order(tmp_path):
         assert [r.job_id for r in store.unfinished()] == ["old0", "old1", "old2"]
         assert store.set_queue_order(["old2", "old0"]) == 2
         assert [r.job_id for r in store.unfinished()] == ["old2", "old1", "old0"]
+
+
+# --- Security rework: a stored source URL must not carry a token ----------------------------
+
+
+TOKEN_URL = "https://videos.example.com/v/9?sig=SECRET&exp=1"
+TOKEN_SAFE = "https://videos.example.com/v/9"
+
+
+def test_a_redacted_url_round_trips_with_its_flag(store):
+    store.add_job("j1", TOKEN_SAFE, "ytdlp", OPTIONS, "C:/dl", url_redacted=True)
+    record = store.get("j1")
+    assert record.url == TOKEN_SAFE and record.url_redacted is True
+
+
+def test_an_ordinary_url_is_not_marked_redacted(store):
+    add(store)
+    record = store.get("j1")
+    assert record.url_redacted is False
+    assert record.url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+
+def _v2_database(path, rows):
+    """A history database as the previous app version would have left it."""
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.executescript(history._SCHEMA)
+    conn.execute("ALTER TABLE jobs ADD COLUMN queue_position INTEGER NOT NULL DEFAULT 0")
+    for job_id, url in rows:
+        conn.execute(
+            "INSERT INTO jobs (job_id, url, engine, state, created_at, updated_at)"
+            " VALUES (?, ?, 'ytdlp', 'completed', 1.0, 1.0)",
+            (job_id, url),
+        )
+    conn.execute("PRAGMA user_version=2")
+    conn.commit()
+    conn.close()
+
+
+def test_migration_strips_tokens_from_urls_written_before_this_version(tmp_path):
+    path = tmp_path / "old.sqlite3"
+    _v2_database(
+        path,
+        [
+            ("tokened", TOKEN_URL),
+            ("fragment", "https://vimeo.com/5#t=30"),
+            ("clean", "https://vimeo.com/5"),
+            ("youtube", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+            ("empty", ""),
+            ("junk", "https://example.com:99999/x"),
+        ],
+    )
+    with history.Store(path) as store:
+        rows = {r.job_id: r for r in store.search(limit=50)}
+        assert rows["tokened"].url == TOKEN_SAFE and rows["tokened"].url_redacted is True
+        assert "SECRET" not in rows["tokened"].url
+        assert rows["fragment"].url == "https://vimeo.com/5"
+        assert rows["fragment"].url_redacted is True
+        # Nothing was removed from these, so nothing is claimed and they stay replayable.
+        assert rows["clean"].url == "https://vimeo.com/5"
+        assert rows["clean"].url_redacted is False
+        assert rows["youtube"].url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        assert rows["youtube"].url_redacted is False
+        # A row we cannot parse is left alone rather than rewritten into a different video.
+        assert rows["junk"].url == "https://example.com:99999/x"
+        assert rows["junk"].url_redacted is False
+        assert rows["empty"].url == ""
+
+
+def test_migration_is_idempotent_and_leaves_no_token_behind(tmp_path):
+    path = tmp_path / "old.sqlite3"
+    _v2_database(path, [("tokened", TOKEN_URL)])
+    for _ in range(2):
+        with history.Store(path) as store:
+            record = store.get("tokened")
+            assert record.url == TOKEN_SAFE and record.url_redacted is True
+    raw = path.read_bytes()
+    assert b"SECRET" not in raw  # not in a live row, and not left in a WAL page either
+
+
+def test_the_database_version_moves_to_three(tmp_path):
+    path = tmp_path / "db.sqlite3"
+    with history.Store(path):
+        pass
+    conn = sqlite3.connect(path)
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
+    conn.close()

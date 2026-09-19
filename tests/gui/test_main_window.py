@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 import pytest
+from PyQt6.QtCore import Qt
 
 from stuff_downloader.core import router, settings, tools
 from stuff_downloader.core.protocol import Event
@@ -168,7 +169,10 @@ def test_downloads_initial_empty_state(window):
     [
         ("", "paste a link"),
         ("file:///C:/Windows/notepad.exe", "http"),
-        ("https://vimeo.com/1", "youtube"),
+        # Since M3 another site is not a reason to refuse. These still are.
+        ("http://127.0.0.1:8080/watch/1", "private network"),
+        ("https://user:pass@vimeo.com/1", "username or password"),
+        ("https://open.spotify.com/track/abc", "spotify"),
     ],
 )
 def test_analyze_rejects_bad_links_without_starting_a_worker(window, runs, url, needle):
@@ -178,6 +182,16 @@ def test_analyze_rejects_bad_links_without_starting_a_worker(window, runs, url, 
     assert runs == []
     assert needle in page.message_label.text().lower()
     assert not page.message_label.isHidden() and page.preview.isHidden()
+
+
+def test_analyze_accepts_a_public_link_from_another_site(window, runs):
+    page = window.downloads_page
+    page.url_edit.setText("https://vimeo.com/123456789?quality=1080p#t=30")
+    page.analyze()
+    (run,) = runs
+    assert run.started and run.spec.engine == "ytdlp"
+    assert run.spec.url == "https://vimeo.com/123456789?quality=1080p"  # fragment dropped
+    assert run.spec.options == {"mode": "analyze"}
 
 
 def test_analyze_sends_normalized_url_and_no_engine_options(window, runs, qtbot):
@@ -874,3 +888,389 @@ def test_an_untrusted_site_title_is_sanitized_before_it_is_emitted(window, runs,
     assert "Mix" in message
     assert "C:" not in message and "https://" not in message and "k=v" not in message
     page.shutdown()
+
+
+# --- M3: the Advanced all-formats view ------------------------------------------------------
+
+
+SITE_URL = "https://vimeo.com/123456789"
+
+
+def test_advanced_view_lists_every_format_and_starts_collapsed(window, runs, qtbot):
+    page = _analyzed(window, runs, qtbot)
+    table = page.advanced_table
+    assert not page.advanced_button.isHidden()
+    assert page.advanced_box.isHidden() and not page.advanced_button.isChecked()
+    assert table.rowCount() == 49  # every format in the fixture, not only the pickable heights
+    assert [table.horizontalHeaderItem(c).text() for c in range(table.columnCount())] == [
+        "Kind",
+        "Quality",
+        "File",
+        "Codecs",
+        "Size",
+    ]
+    page.advanced_button.setChecked(True)
+    assert not page.advanced_box.isHidden()
+    assert page.advanced_button.text().startswith("▾")
+
+
+def test_advanced_view_groups_by_kind_and_never_shows_a_url(window, runs, qtbot):
+    page = _analyzed(
+        window,
+        runs,
+        qtbot,
+        formats=[
+            {"format_id": "a", "ext": "m4a", "acodec": "mp4a.40.2", "abr": 128, "filesize": 1024},
+            {"format_id": "v", "ext": "mp4", "vcodec": "avc1.64", "height": 1080, "fps": 60},
+            {
+                "format_id": "b",
+                "ext": "mp4",
+                "vcodec": "avc1.64",
+                "acodec": "mp4a.40.2",
+                "height": 720,
+                "url": "https://rr1.googlevideo.com/videoplayback?sig=SECRET",
+                "http_headers": {"Cookie": "SID=secret"},
+            },
+        ],
+    )
+    table = page.advanced_table
+    rows = [
+        [table.item(r, c).text() for c in range(table.columnCount())]
+        for r in range(table.rowCount())
+    ]
+    assert [r[0] for r in rows] == ["Video + audio", "Video only", "Audio only"]
+    assert rows[0][1:] == ["720p", "MP4", "avc1 / mp4a", "—"]
+    assert rows[1][1] == "1080p60"
+    assert rows[2][1] == "128 kbps" and rows[2][4] == "1.0 KB"
+    flat = " ".join(cell for row in rows for cell in row)
+    assert "SECRET" not in flat and "http" not in flat and "Cookie" not in flat
+
+
+def test_advanced_view_is_read_only_and_says_so(window, runs, qtbot):
+    page = _analyzed(window, runs, qtbot)
+    table = page.advanced_table
+    assert table.editTriggers() == table.EditTrigger.NoEditTriggers
+    assert table.selectionMode() == table.SelectionMode.NoSelection
+    assert "preset above" in page.advanced_note.text()
+
+
+def test_advanced_view_is_hidden_when_the_site_offers_no_formats(window, runs, qtbot):
+    page = _analyzed(window, runs, qtbot, formats=[])
+    assert page.advanced_button.isHidden() and page.advanced_box.isHidden()
+    page.advanced_button.setChecked(True)
+    assert page.advanced_box.isHidden()  # nothing to reveal
+
+
+def test_advanced_view_survives_junk_format_metadata(window, runs, qtbot):
+    page = _analyzed(
+        window,
+        runs,
+        qtbot,
+        formats=[
+            "not a dict",
+            {"format_id": "x", "vcodec": "none", "acodec": "none"},
+            {"format_id": "y", "ext": None, "height": True, "acodec": "opus", "abr": "loud"},
+        ],
+    )
+    table = page.advanced_table
+    assert table.rowCount() == 2
+    assert all(table.item(r, c).text() for r in range(2) for c in range(table.columnCount()))
+
+
+def test_a_site_title_with_markup_is_shown_as_text_not_rendered(window, runs, qtbot):
+    page = _analyzed(
+        window,
+        runs,
+        qtbot,
+        url=SITE_URL,
+        title="<b>bold</b> <img src=x>",
+        extractor="Vimeo",
+    )
+    card = page.preview
+    assert card.title_label.text() == "<b>bold</b> <img src=x>"
+    assert card.title_label.textFormat() == Qt.TextFormat.PlainText
+    assert "Vimeo" in card.meta_label.text()
+
+
+def test_the_site_name_is_only_shown_for_links_that_are_not_youtube(window, runs, qtbot):
+    page = _analyzed(window, runs, qtbot, extractor="Youtube")
+    assert "Youtube" not in page.preview.meta_label.text()
+
+
+def test_another_sites_video_downloads_through_the_preset_flow(window, runs, qtbot, tmp_path):
+    page = _analyzed(window, runs, qtbot, url=SITE_URL, extractor="Vimeo")
+    page.preview.preset_combo.setCurrentIndex(page.preview.preset_combo.findData("video_1080"))
+    page.start_download()
+    spec = runs[-1].spec
+    assert spec.engine == "ytdlp" and spec.url == SITE_URL
+    assert spec.options["mode"] == "download" and spec.options["preset"] == "video_1080"
+    assert "format_id" not in spec.options and "url" not in spec.options
+
+
+def test_a_title_containing_an_em_dash_is_not_mistaken_for_a_missing_title(window, runs, qtbot):
+    page = _analyzed(window, runs, qtbot, title="Song — Live at the Hall")
+    assert page.preview.title_label.text() == "Song — Live at the Hall"
+    page = _analyzed(window, runs, qtbot, title="   ")
+    assert page.preview.title_label.text() == "Untitled"
+
+
+def test_a_site_that_reports_no_name_simply_shows_no_name(window, runs, qtbot):
+    page = _analyzed(window, runs, qtbot, url=SITE_URL, extractor=None, uploader="", duration=None)
+    assert page.preview.meta_label.text() == ""
+
+
+# --- Security rework: a tokenized generic link must not reach the database -------------------
+
+
+TOKEN_URL = "https://videos.example.com/v/9?sig=SECRET&exp=1"
+TOKEN_SAFE = "https://videos.example.com/v/9"
+
+
+def _downloads_page(qtbot, tmp_path, store=None):
+    from stuff_downloader.core import history
+    from stuff_downloader.gui.pages import DownloadsPage
+
+    page = DownloadsPage(
+        settings.Settings(), store if store is not None else history.Store(tmp_path / "h.sqlite3")
+    )
+    qtbot.addWidget(page)
+    return page
+
+
+def test_a_generic_links_token_is_never_written_to_history(window, runs, qtbot, tmp_path):
+    page = _analyzed(window, runs, qtbot, url=TOKEN_URL, extractor="Generic")
+    job = page.start_download()
+    # The live job still has the exact link — that is what the download needs.
+    assert job.spec.url == TOKEN_URL
+    record = page.store.get(job.spec.job_id)
+    # What went to disk does not.
+    assert record.url == TOKEN_SAFE and record.url_redacted is True
+    assert "SECRET" not in record.url
+    page.shutdown()
+
+
+def test_a_youtube_link_is_stored_whole_and_stays_replayable(window, runs, qtbot):
+    page = _analyzed(window, runs, qtbot)
+    job = page.start_download()
+    record = page.store.get(job.spec.job_id)
+    assert record.url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    assert record.url_redacted is False
+    page.shutdown()
+
+
+def test_download_again_asks_for_the_link_instead_of_replaying_a_redacted_one(window, runs):
+    from stuff_downloader.core import history
+
+    page = window.downloads_page
+    record = history.JobRecord(
+        "j",
+        TOKEN_SAFE,
+        "ytdlp",
+        "completed",
+        options={"preset": "video_1080"},
+        url_redacted=True,
+    )
+    assert page.download_again(record) is None
+    assert runs == []  # nothing was downloaded with the wrong link
+    assert page.jobs == {}
+    assert TOKEN_SAFE in page.url_edit.text()  # handed back as a starting point
+    assert "paste" in page.message_label.text().lower()
+
+
+def test_a_redacted_unfinished_job_is_closed_rather_than_resumed(qtbot, runs, tmp_path):
+    from stuff_downloader.core import history
+
+    store = history.Store(tmp_path / "h.sqlite3")
+    store.add_job(
+        "stale",
+        TOKEN_SAFE,
+        "ytdlp",
+        {"mode": "download", "preset": "video_1080"},
+        str(tmp_path),
+        title="Half-done",
+        state="active",
+        url_redacted=True,
+    )
+    page = _downloads_page(qtbot, tmp_path, store)
+    # No card, so there is no retry button that would replay the broken link.
+    assert page.jobs == {}
+    assert runs == []
+    record = store.get("stale")
+    assert record.state == "failed"
+    assert "paste the original link" in record.error_message.lower()
+    page.shutdown()
+
+
+def test_an_ordinary_unfinished_job_still_comes_back_paused(qtbot, runs, tmp_path):
+    from stuff_downloader.core import history
+
+    store = history.Store(tmp_path / "h.sqlite3")
+    store.add_job(
+        "fine",
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        "ytdlp",
+        {"mode": "download", "preset": "video_1080"},
+        str(tmp_path),
+        title="Half-done",
+        state="active",
+    )
+    page = _downloads_page(qtbot, tmp_path, store)
+    assert page.jobs["fine"].state == "paused"
+    assert runs == []
+    page.shutdown()
+
+
+# --- Security rework round 2: a blank title must not become the tokenized link ---------------
+
+
+@pytest.mark.parametrize(
+    ("title", "expected"),
+    [
+        (None, TOKEN_SAFE),
+        ("", TOKEN_SAFE),
+        ("   ", TOKEN_SAFE),
+        (TOKEN_URL, TOKEN_SAFE),  # a title that IS the link is not trusted as a title
+        (f"Watch at {TOKEN_URL}", TOKEN_SAFE),  # nor one that merely carries it
+        ("Real Title", "Real Title"),
+    ],
+)
+def test_safe_job_title_never_returns_a_link_with_a_token(title, expected):
+    assert pages.safe_job_title(title, TOKEN_URL) == expected
+
+
+def test_safe_job_title_falls_back_to_untitled_when_there_is_no_usable_link():
+    assert pages.safe_job_title(None, "") == "Untitled"
+    assert pages.safe_job_title(None, "https://example.com:99999/x") == "Untitled"
+
+
+def test_safe_job_title_bounds_and_cleans_a_hostile_title():
+    assert pages.safe_job_title("a" * 5000, TOKEN_URL) == "a" * pages.TITLE_LIMIT
+    assert pages.safe_job_title("line\u2028one\ttwo", TOKEN_URL) == "line one two"
+
+
+def test_a_blank_title_generic_download_puts_no_token_in_history(window, runs, qtbot):
+    page = _analyzed(window, runs, qtbot, url=TOKEN_URL, extractor="Generic", title=None)
+    job = page.start_download()
+    record = page.store.get(job.spec.job_id)
+    assert record.title == TOKEN_SAFE and "SECRET" not in record.title
+    assert record.url == TOKEN_SAFE and "SECRET" not in record.url
+    # ...and not in the queue card or the in-memory job either.
+    assert "SECRET" not in job.title
+    assert "SECRET" not in job.card.title_label.text()
+    # The live spec still has the real link, which is what the download needs.
+    assert job.spec.url == TOKEN_URL
+    page.shutdown()
+
+
+def test_no_token_survives_a_blank_title_job_anywhere_the_owner_can_read_it(window, runs, qtbot):
+    page = _analyzed(window, runs, qtbot, url=TOKEN_URL, extractor="Generic", title=None)
+    job = page.start_download()
+    runs[-1].emit("result", files=[], total_bytes=7)
+
+    found = page.store.search(limit=50)
+    assert found and all("SECRET" not in (r.title + r.url) for r in found)
+    # Searching for the token finds nothing, because nothing stored it.
+    assert page.store.search("SECRET") == []
+    # The History page renders the same rows.
+    window.history_page.refresh()
+    table = window.history_page.table
+    cells = [
+        table.item(row, col).text()
+        for row in range(table.rowCount())
+        for col in range(table.columnCount())
+        if table.item(row, col) is not None
+    ]
+    assert cells and all("SECRET" not in c for c in cells)
+    # And the tray line built from that title carries nothing either.
+    assert "SECRET" not in pages.safe_notification_line(job.title)
+    page.shutdown()
+
+
+def test_a_worker_crash_message_does_not_carry_a_token_into_history(window, runs, qtbot):
+    """An unexpected worker exception reports str(exc), which can name the URL it was fetching.
+
+    The engine redacts yt-dlp's own DownloadError, but not this path — and the message urllib3
+    produces carries the query with no scheme in front of it, so matching "scheme://" misses it.
+    """
+    page = _analyzed(window, runs, qtbot, url=TOKEN_URL, extractor="Generic", title=None)
+    job = page.start_download()
+    runs[-1].emit(
+        "error",
+        code="engine_crashed",
+        message=(
+            "HTTPSConnectionPool(host='videos.example.com', port=443): "
+            "Max retries exceeded with url: /v/9?sig=SECRET&exp=1"
+        ),
+    )
+    record = page.store.get(job.spec.job_id)
+    assert "SECRET" not in record.error_message, record.error_message
+    assert "videos.example.com" not in record.error_message
+    assert record.error_message  # redacted, not emptied
+    assert "SECRET" not in job.card.details_label.text()
+    page.shutdown()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "HTTPSConnectionPool(host='h.example.com', port=443): url: /v/9?sig=SECRET",
+        "ERROR: Unsupported URL: https://h.example.com/v/9?token=SECRET",
+        "failed fetching h.example.com/v/9?k=SECRET",
+        "giving up on user:SECRET@h.example.com/x",
+    ],
+)
+def test_safe_error_message_redacts_anything_that_names_a_location(message):
+    cleaned = pages.safe_error_message(message)
+    assert "SECRET" not in cleaned and "example.com" not in cleaned
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "The site refused the download (HTTP 403). Updating engines may help.",
+        "The site is rate-limiting requests. Wait a bit and retry.",
+        "This video is blocked in your region.",
+        "FFmpeg is needed for this download. Check the Tools page.",
+        "HTTP Error 429: Too Many Requests",
+    ],
+)
+def test_safe_error_message_leaves_an_ordinary_explanation_readable(message):
+    # Redaction that eats the explanation would just move the harm onto the owner.
+    assert pages.safe_error_message(message) == message
+
+
+def test_safe_error_message_is_bounded_and_survives_junk():
+    assert pages.safe_error_message(None) == ""
+    assert len(pages.safe_error_message("word " * 5000)) <= pages.ERROR_MESSAGE_LIMIT
+    assert pages.safe_error_message("line two") == "line two"
+
+
+def test_a_retried_generic_job_is_recorded_under_the_same_rules(window, runs, qtbot):
+    """Retry reuses its queue row, so it cannot go through _add_job — but the row it writes
+    must be indistinguishable from one _add_job would have written."""
+    page = _analyzed(window, runs, qtbot, url=TOKEN_URL, extractor="Generic", title=None)
+    job = page.start_download()
+    first_id = job.spec.job_id
+    runs[-1].emit("error", code="download_error", message="HTTP Error 403: Forbidden")
+
+    page.retry_job(first_id)
+    retried = page.store.get(job.spec.job_id)
+    assert job.spec.job_id != first_id
+    assert retried.url == TOKEN_SAFE and retried.url_redacted is True
+    assert retried.title == TOKEN_SAFE and "SECRET" not in retried.title
+    # The live spec keeps the real link, exactly as the first attempt did.
+    assert job.spec.url == TOKEN_URL
+    page.shutdown()
+
+
+def test_every_job_row_is_written_by_one_function(window, runs, qtbot):
+    """The chokepoint claim, enforced rather than asserted in a comment.
+
+    If a new path to store.add_job appears, this fails and whoever added it has to decide
+    deliberately whether the redaction rules apply — which is the whole point.
+    """
+    import inspect
+
+    source = inspect.getsource(pages.DownloadsPage)
+    callers = [line.strip() for line in source.splitlines() if "store.add_job(" in line]
+    assert callers == ["self.store.add_job("], callers
