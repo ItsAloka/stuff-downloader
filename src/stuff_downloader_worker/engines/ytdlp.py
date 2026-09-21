@@ -8,7 +8,8 @@ yt-dlp is imported lazily so this module loads in envs without it and fails with
 
 Options: ``mode`` "analyze" (default), "playlist" or "download". Download also takes
 ``preset``, ``height``, ``compatible``, ``crop_cover``, ``playlist_index``/``playlist_title``/
-``playlist_count`` and ``archive``, validated by ``presets.parse_request``. Deno and ffmpeg
+``playlist_count`` and ``archive``, validated by ``presets.parse_request``. Any mode may also
+carry ``site_login`` (plan §6.4), validated by ``site_login.ydl_options``. Deno and ffmpeg
 come only from ``STUFF_DOWNLOADER_TOOLS_DIR``, which the runner sets.
 """
 
@@ -21,7 +22,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from .. import presets, tagging
+from .. import presets, site_login, tagging
 from ..protocol import JobSpec
 from .base import Emit, EngineError
 
@@ -55,6 +56,13 @@ MAX_PLAYLIST_ENTRIES = 500
 MAX_ENTRY_TEXT = 300
 MAX_ERROR_TEXT = 500
 
+# The "All formats" table also lists subtitle and thumbnail tracks (plan §5.5). Only the facts a
+# row needs survive: a language code, the file types and a size — never a track URL.
+_LANG = re.compile(r"[A-Za-z0-9-]{1,20}")
+_SUB_EXT = re.compile(r"[a-z0-9]{1,8}")
+MAX_SUBTITLE_TRACKS = 60
+MAX_THUMBNAIL_ROWS = 20
+
 # yt-dlp puts the failing URL in most of its messages, and for a generic site that URL can carry
 # a signature or a session token. Every one is replaced before the message leaves the worker.
 _URL_IN_TEXT = re.compile(r"[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
@@ -65,6 +73,10 @@ _ERROR_CODES: tuple[tuple[str, str], ...] = (
     ("unsupported url", "unsupported"),
     ("no video formats found", "unsupported"),
     ("is not a valid url", "unsupported"),
+    # A photo-only post on a site yt-dlp knows: not an error, a job for gallery-dl.
+    ("no video could be found", "unsupported"),
+    ("there is no video in this post", "unsupported"),
+    ("no video in this", "unsupported"),
 )
 
 _UNAVAILABLE_REASONS = {
@@ -142,7 +154,47 @@ def sanitize_info(info: dict[str, Any]) -> dict[str, Any]:
             result[key] = value
     result["extractor"] = info.get("extractor_key") or info.get("extractor")
     result["formats"] = formats
+    result["subtitles"] = sanitize_subtitles(info.get("subtitles"), auto=False)
+    result["automatic_captions"] = sanitize_subtitles(info.get("automatic_captions"), auto=True)
+    result["thumbnails"] = sanitize_thumbnails(info.get("thumbnails"))
     return result
+
+
+def sanitize_subtitles(raw: Any, auto: bool) -> list[dict[str, Any]]:
+    """Subtitle tracks as {lang, exts, auto}. Languages are validated codes, nothing else."""
+    tracks: list[dict[str, Any]] = []
+    if not isinstance(raw, dict):
+        return tracks
+    for lang, entries in raw.items():
+        if len(tracks) >= MAX_SUBTITLE_TRACKS:
+            break
+        if not isinstance(lang, str) or not _LANG.fullmatch(lang) or lang == "live_chat":
+            continue
+        exts = []
+        for entry in entries if isinstance(entries, list) else []:
+            ext = entry.get("ext") if isinstance(entry, dict) else None
+            if isinstance(ext, str) and _SUB_EXT.fullmatch(ext) and ext not in exts:
+                exts.append(ext)
+        if exts:
+            tracks.append({"lang": lang, "exts": exts[:6], "auto": auto})
+    return tracks
+
+
+def _is_dimension(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 < value < 20000
+
+
+def sanitize_thumbnails(raw: Any) -> list[dict[str, int]]:
+    """Thumbnail sizes, largest first. The image URLs stay in the worker."""
+    sizes: set[tuple[int, int]] = set()
+    for thumb in raw if isinstance(raw, list) else []:
+        if not isinstance(thumb, dict):
+            continue
+        width, height = thumb.get("width"), thumb.get("height")
+        if all(_is_dimension(v) for v in (width, height)):
+            sizes.add((width, height))
+    ordered = sorted(sizes, key=lambda s: s[0] * s[1], reverse=True)[:MAX_THUMBNAIL_ROWS]
+    return [{"width": w, "height": h} for w, h in ordered]
 
 
 def redact_urls(text: str) -> str:
@@ -152,7 +204,8 @@ def redact_urls(text: str) -> str:
 
 def describe_download_error(message: str) -> tuple[str, str]:
     """An engine failure as (code, message the app may show), with URLs removed."""
-    safe = redact_urls(message).strip()[:MAX_ERROR_TEXT] or "the download failed"
+    safe = site_login.redact_secrets(redact_urls(message)).strip()[:MAX_ERROR_TEXT]
+    safe = safe or "the download failed"
     lowered = safe.lower()
     for needle, code in _ERROR_CODES:
         if needle in lowered:
@@ -243,7 +296,9 @@ class YtDlpEngine:
         except ImportError as exc:
             raise EngineError("engine_missing", f"yt-dlp is not installed here: {exc}") from exc
 
-        opts = job.options
+        opts = dict(job.options)
+        login = opts.pop("site_login", None)
+        login_opts = site_login.ydl_options(login) if login is not None else {}
         mode = opts.get("mode", "analyze")
         if mode not in ("analyze", "playlist", "download"):
             raise EngineError("bad_options", f"unknown mode {mode!r}")
@@ -322,13 +377,17 @@ class YtDlpEngine:
         ffmpeg = trusted_tool("ffmpeg")
         if ffmpeg:
             ydl_opts["ffmpeg_location"] = str(ffmpeg)
+        if login_opts:
+            ydl_opts.update(login_opts)
+            ydl_opts["logger"] = site_login.SilentLogger()
 
         # See _rearm_archive: extraction must not see the archive, or an already-downloaded
         # id makes yt-dlp return None and the job is reported as failed instead of skipped.
         archive_path = ydl_opts.pop("download_archive", None)
         emit("stage", {"stage": "analyzing"})
+        ydl = self._open(yt_dlp, ydl_opts, bool(login_opts))
         try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with ydl:
                 info = ydl.extract_info(job.url, download=False)
                 if not isinstance(info, dict):
                     raise EngineError("download_error", "no media information found")
@@ -352,6 +411,25 @@ class YtDlpEngine:
                 return self._download(ydl, info, request, summary, files, stage, emit)
         except yt_dlp.utils.DownloadError as exc:
             raise EngineError(*describe_download_error(str(exc))) from exc
+
+    @staticmethod
+    def _open(yt_dlp: Any, ydl_opts: dict[str, Any], with_login: bool) -> Any:
+        """A YoutubeDL instance; with a login, its cookies loaded now and the file detached.
+
+        yt-dlp loads cookies lazily (possibly in its constructor) and, on close, writes the jar
+        back to ``cookiefile`` — which would rewrite the owner's cookies.txt with whatever the
+        site set during this job. So the jar is forced to load here, where a failure can be
+        reported with fixed text, and ``cookiefile`` is then cleared so nothing is saved back.
+        """
+        if not with_login:
+            return yt_dlp.YoutubeDL(ydl_opts)
+        try:
+            ydl = yt_dlp.YoutubeDL(ydl_opts)
+            ydl.cookiejar  # noqa: B018 - force the load inside this try
+        except Exception:
+            raise EngineError("cookies_unavailable", site_login.COOKIES_FAILED) from None
+        ydl.params["cookiefile"] = None
+        return ydl
 
     @staticmethod
     def _thumbnail_preview(ydl: Any, info: dict[str, Any], emit: Emit) -> dict[str, Any] | None:

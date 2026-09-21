@@ -17,7 +17,7 @@ HEIGHTS = (4320, 2160, 1440, 1080, 720, 480, 360, 240, 144)
 class Preset:
     id: str
     label: str
-    kind: str  # "video" | "audio" | "thumbnail"
+    kind: str  # "video" | "audio" | "thumbnail" | "file" | "gallery"
     max_height: int | None = None  # a cap the resolution picker cannot exceed
     description: str = ""
 
@@ -50,7 +50,26 @@ PRESETS: tuple[Preset, ...] = (
     Preset("thumbnail", "Thumbnail only", "thumbnail", None, "The cover image as JPG"),
 )
 
-PRESETS_BY_ID = {p.id: p for p in PRESETS}
+# The direct HTTP engine saves the file as the site serves it, so it has exactly one preset. It
+# is kept out of PRESETS, which are the yt-dlp choices a video page offers.
+FILE_PRESET = Preset(
+    "original_file",
+    "Original file (as served)",
+    "file",
+    None,
+    "The file exactly as the site sends it",
+)
+
+# gallery-dl saves each selected item as the site's original file; it too has one preset.
+GALLERY_PRESET = Preset(
+    "gallery_original",
+    "Original images and videos",
+    "gallery",
+    None,
+    "Each selected item at the site's original quality",
+)
+
+PRESETS_BY_ID = {p.id: p for p in (*PRESETS, FILE_PRESET, GALLERY_PRESET)}
 DEFAULT_PRESET_ID = "video_1080"
 
 
@@ -104,6 +123,25 @@ def download_options(
             options["playlist_title"] = str(playlist_title)[:300]
         if playlist_count is not None:
             options["playlist_count"] = max(int(playlist_count), int(playlist_index))
+    return options
+
+
+def file_download_options() -> dict[str, Any]:
+    """The job ``options`` for the direct HTTP engine. Mirrors its validation exactly."""
+    return {"mode": "download", "preset": FILE_PRESET.id}
+
+
+MAX_GALLERY_ITEMS = 500
+
+
+def gallery_download_options(items: list[int], archive: bool = False) -> dict[str, Any]:
+    """The job ``options`` for gallery-dl: exactly the chosen 1-based item positions."""
+    clean = sorted({int(i) for i in items if isinstance(i, int) and not isinstance(i, bool)})
+    if not clean or clean[0] < 1 or clean[-1] > MAX_GALLERY_ITEMS:
+        raise ValueError("choose between 1 and 500 gallery items")
+    options: dict[str, Any] = {"mode": "download", "preset": GALLERY_PRESET.id, "items": clean}
+    if archive:
+        options["archive"] = True
     return options
 
 

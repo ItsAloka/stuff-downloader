@@ -10,7 +10,7 @@ import sys
 import time
 import unicodedata
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLineEdit,
     QMessageBox,
@@ -36,14 +37,17 @@ from PyQt6.QtWidgets import (
 )
 
 from ..core import (
+    cookies,
     errors,
     formats,
+    gallery,
     history,
     paths,
     playlist,
     presets,
     router,
     settings,
+    spotify,
     tools,
 )
 from ..core import (
@@ -56,10 +60,13 @@ from .bridge import EventBridge
 from .widgets import (
     Card,
     Chip,
+    GalleryCard,
     GroupCard,
     JobCard,
     PlaylistCard,
     PreviewCard,
+    SiteLoginDialog,
+    SpotifyCard,
     format_bytes,
     format_duration,
     format_eta,
@@ -94,6 +101,10 @@ RETRYABLE_HINTS = (
     "connection refused",
     "timed out",
     "read timeout",
+    # YouTube refusing a short-lived stream URL mid-download. A fresh attempt extracts a new
+    # one and usually succeeds (seen live). A plain 403 on a page is not retried: that is a
+    # private or blocked page, and retrying it only hammers the site.
+    "unable to download video data: http error 403",
 )
 
 
@@ -209,6 +220,30 @@ STAGE_LABELS = {
     "completed": "Completed",
 }
 ANALYZE_TIMEOUT_MS = 90_000
+# Spotify is read by scraping its web player at ~10 s a call; a long playlist pages through it.
+SPOTIFY_ANALYZE_TIMEOUT_MS = 240_000
+# Match lookups are short jobs, not queue rows. A few at a time: each one is a Spotify read and a
+# YouTube Music search, and both sites throttle bursts.
+MATCH_CONCURRENCY = 2
+MATCH_TIMEOUT_MS = 180_000
+
+# A Spotify download is its own preset (core.spotify.PRESET_ID). Every place that turns a stored
+# preset id back into a label or a kind goes through _preset, so a Spotify job restores, shows
+# and re-downloads like any other.
+SPOTIFY_PRESET = presets.Preset(
+    spotify.PRESET_ID,
+    "MP3 — matched from YouTube, tagged from Spotify",
+    "audio",
+    None,
+    "Spotify's metadata and cover on audio matched from YouTube Music",
+)
+
+
+def _preset(preset_id: Any) -> presets.Preset:
+    """presets.get, plus the Spotify preset. Raises ValueError for anything unknown."""
+    if preset_id == spotify.PRESET_ID:
+        return SPOTIFY_PRESET
+    return presets.get(preset_id)
 
 # A generic link's query can be the signed token that makes it work, so history stores the
 # link without it (see history.Store._migrate). Such a job can name the page but cannot be
@@ -217,6 +252,9 @@ LINK_REDACTED_REASON = (
     "This link had a private part that was not saved. Paste the original link again to download it."
 )
 AUTO_HEIGHT = None
+# Engines that can use the owner's advanced site login (plan §6.4). The direct HTTP engine
+# never gets one: a plain file link has no business needing a session.
+LOGIN_ENGINES = frozenset({"ytdlp", "gallerydl"})
 
 # The Advanced view (plan §M3): what the site actually offers, read from the metadata the worker
 # already sanitized. Every cell is rebuilt here from a known field, never passed through, and the
@@ -253,7 +291,7 @@ ERROR_MESSAGE_LIMIT = 300
 
 def safe_error_message(text: Any) -> str:
     """Failure text safe to store and show: no locations, no control characters, bounded."""
-    cleaned = _CONTROL_CHARS.sub(" ", str(text or ""))
+    cleaned = errors.redact_secrets(_CONTROL_CHARS.sub(" ", str(text or "")))
     kept = [REDACTED if _leaks_location(token) else token for token in cleaned.split()]
     return " ".join(kept).strip()[:ERROR_MESSAGE_LIMIT]
 
@@ -328,6 +366,55 @@ def advanced_rows(raw: Any) -> list[tuple[str, ...]]:
     return rows
 
 
+MAX_SUBTITLE_ROWS = 40
+_LANG_CODE = re.compile(r"[A-Za-z0-9-]{1,20}")
+_EXT_CODE = re.compile(r"[a-z0-9]{1,8}")
+
+
+def _exts(track: dict[str, Any]) -> list[str]:
+    raw = track.get("exts")
+    if not isinstance(raw, list):
+        return []
+    return [e for e in raw if isinstance(e, str) and _EXT_CODE.fullmatch(e)]
+
+
+def track_rows(info: Any) -> list[tuple[str, ...]]:
+    """Subtitle, auto-caption and thumbnail rows for the All formats table (plan §5.5).
+
+    Subtitles get one row per language. Automatic captions are machine translations into
+    every language the site supports — often more than a hundred — so they are one summary row
+    rather than a wall of near-identical ones. Nothing here is downloadable from the table.
+    """
+    if not isinstance(info, dict):
+        return []
+    rows: list[tuple[str, ...]] = []
+    subs = info.get("subtitles")
+    for track in (subs if isinstance(subs, list) else [])[:MAX_SUBTITLE_ROWS]:
+        if not isinstance(track, dict):
+            continue
+        lang, exts = track.get("lang"), _exts(track)
+        if isinstance(lang, str) and _LANG_CODE.fullmatch(lang) and exts:
+            rows.append(("Subtitles", lang, " / ".join(exts).upper(), "—", "—"))
+    auto = info.get("automatic_captions")
+    langs = []
+    auto_exts: list[str] = []
+    for track in auto if isinstance(auto, list) else []:
+        if isinstance(track, dict) and isinstance(track.get("lang"), str):
+            if _LANG_CODE.fullmatch(track["lang"]):
+                langs.append(track["lang"])
+                auto_exts += [e for e in _exts(track) if e not in auto_exts]
+    if langs:
+        label = f"{len(langs)} languages" if len(langs) > 1 else langs[0]
+        rows.append(("Auto captions", label, " / ".join(auto_exts[:4]).upper(), "—", "—"))
+    thumbs = info.get("thumbnails")
+    for thumb in (thumbs if isinstance(thumbs, list) else [])[:20]:
+        if not isinstance(thumb, dict):
+            continue
+        width, height = thumb.get("width"), thumb.get("height")
+        if _is_number(width) and _is_number(height) and width > 0 and height > 0:
+            rows.append(("Thumbnail", f"{int(width)}×{int(height)}", "—", "—", "—"))
+    return rows
+
 
 def _page_layout(widget: QWidget) -> QVBoxLayout:
     widget.setObjectName("page")
@@ -377,7 +464,11 @@ class DownloadsPage(QWidget):
         # only a store this page opened for itself is closed by shutdown().
         self.owns_store = store is None
         self.store = store if store is not None else history.Store()
-        self.scheduler = scheduling.Scheduler(self._start_run, app_settings.max_concurrent)
+        self.scheduler = scheduling.Scheduler(
+            self._start_run,
+            app_settings.max_concurrent,
+            group_of=lambda spec: router.social_group(spec.url),
+        )
         self._groups: dict[str, GroupState] = {}
         self._listing: playlist.Listing | None = None
         self._bridge = EventBridge(self)
@@ -406,7 +497,9 @@ class DownloadsPage(QWidget):
         row.setSpacing(8)
         self.url_edit = QLineEdit()
         self.url_edit.setObjectName("urlEdit")
-        self.url_edit.setPlaceholderText("🔗  Paste a video link — YouTube or another site…")
+        self.url_edit.setPlaceholderText(
+            "🔗  Paste a link — YouTube, a Spotify song or playlist, or another site…"
+        )
         self.url_edit.setClearButtonEnabled(True)
         self.paste_button = QPushButton("Paste")
         self.paste_button.setToolTip("Paste a link from the clipboard")
@@ -424,6 +517,31 @@ class DownloadsPage(QWidget):
         self.message_label.setWordWrap(True)
         self.message_label.hide()
         paste_card.body.addWidget(self.message_label)
+        # Advanced and hidden (plan §6.4): shown only after a failure a site login could fix.
+        self.login_button = QPushButton("Advanced: use a site login…")
+        self.login_button.setToolTip(
+            "Only for media the site shows to signed-in viewers. Public links never need this."
+        )
+        self.login_button.hide()
+        self._login_site = ""
+        # Set when the offer came from a failed queue row: saving a login retries that job
+        # instead of re-analyzing whatever is in the link box.
+        self._login_retry_job_id = ""
+        # Engines still to try when the one a link was routed to says "unsupported" (plan §5.3
+        # steps 3-5): a page yt-dlp cannot read may be a gallery, or the media file itself.
+        self._fallbacks: list[str] = []
+        self._gallery: gallery.Gallery | None = None
+        # Spotify (plan §6.3): the listing, the matches known so far (track id -> Match), and
+        # the match lookups waiting and running. A lookup is a short job, never a queue row.
+        self._spotify: spotify.SpotifyListing | None = None
+        self._spotify_matches: dict[str, spotify.Match] = {}
+        self._match_waiting: list[spotify.SpotifyTrack] = []
+        self._match_runs: dict[str, tuple[Any, spotify.SpotifyTrack, QTimer]] = {}
+        login_row = QHBoxLayout()
+        login_row.setContentsMargins(0, 0, 0, 0)
+        login_row.addWidget(self.login_button)
+        login_row.addStretch(1)
+        paste_card.body.addLayout(login_row)
         self.folder_hint = QLabel()
         self.folder_hint.setObjectName("muted")
         paste_card.body.addWidget(self.folder_hint)
@@ -448,6 +566,14 @@ class DownloadsPage(QWidget):
             self.playlist_card.preset_combo.findData("mp3_music")
         )
         layout.addWidget(self.playlist_card)
+
+        self.gallery_card = GalleryCard()
+        self.gallery_card.hide()
+        layout.addWidget(self.gallery_card)
+
+        self.spotify_card = SpotifyCard()
+        self.spotify_card.hide()
+        layout.addWidget(self.spotify_card)
 
         queue_header = QHBoxLayout()
         queue_header.addWidget(section_title("Queue"))
@@ -479,11 +605,29 @@ class DownloadsPage(QWidget):
         self.url_edit.returnPressed.connect(self.analyze)
         self.paste_button.clicked.connect(self._paste)
         self.analyze_cancel_button.clicked.connect(self.cancel_analyze)
+        self.login_button.clicked.connect(self.offer_site_login)
         self.preview.preset_combo.currentIndexChanged.connect(self._update_options)
         self.preview.crop_check.toggled.connect(self._update_cover)
         self.preview.download_button.clicked.connect(self.start_download)
         self.preview.playlist_button.clicked.connect(self.open_playlist)
         self.playlist_card.download_button.clicked.connect(self.start_playlist_download)
+        self.gallery_card.download_button.clicked.connect(self.start_gallery_download)
+        self.gallery_card.select_all_button.clicked.connect(
+            lambda: self._set_gallery_selection(True)
+        )
+        self.gallery_card.select_none_button.clicked.connect(
+            lambda: self._set_gallery_selection(False)
+        )
+        self.gallery_card.grid.itemChanged.connect(lambda _: self._update_gallery_selection())
+        self.spotify_card.download_button.clicked.connect(self.start_spotify_download)
+        self.spotify_card.match_button.clicked.connect(self.check_spotify_matches)
+        self.spotify_card.change_requested.connect(self.change_spotify_match)
+        self.spotify_card.select_all_button.clicked.connect(
+            lambda: self._set_spotify_selection(True)
+        )
+        self.spotify_card.select_none_button.clicked.connect(
+            lambda: self._set_spotify_selection(False)
+        )
         self.playlist_card.select_all_button.clicked.connect(
             lambda: self._set_playlist_selection(True)
         )
@@ -552,7 +696,7 @@ class DownloadsPage(QWidget):
         return _cell(site, SITE_LIMIT) if isinstance(site, str) and site.strip() else ""
 
     def _fill_advanced(self, info: dict[str, Any]) -> None:
-        rows = advanced_rows(info.get("formats"))
+        rows = advanced_rows(info.get("formats")) + track_rows(info)
         self.advanced_table.setRowCount(len(rows))
         for index, row in enumerate(rows):
             for column, text in enumerate(row):
@@ -576,7 +720,87 @@ class DownloadsPage(QWidget):
         self.message_label.setVisible(bool(text))
 
     def _new_run(self, spec: JobSpec) -> Any:
-        return JobRun(spec, self._bridge.post)
+        return JobRun(self._with_site_login(spec), self._bridge.post)
+
+    def _with_site_login(self, spec: JobSpec) -> JobSpec:
+        """The spec a worker actually receives: plus the owner's site login, if one applies.
+
+        The login is attached here, at launch, and only to the copy handed to the worker. The
+        job's own spec — the one written to the queue database and history — never carries it,
+        so a cookies file path or browser profile cannot end up stored with a job.
+        """
+        if spec.engine not in LOGIN_ENGINES:
+            return spec
+        choice = cookies.choice_for(spec.url, cookies.load_all(self._settings.site_logins))
+        if choice is None:
+            return spec
+        return replace(spec, options={**spec.options, "site_login": choice.to_dict()})
+
+    # ── advanced: site login (plan §6.4) ─────────────────────────────────────────────────
+    def _login_dialog(self, site: str, current: cookies.SiteLogin | None) -> Any:
+        return SiteLoginDialog(site, current, self)
+
+    def offer_site_login(self) -> bool:
+        """Ask for a login for the site that just refused us; retry the analyze if one is set."""
+        site = self._login_site
+        if not site:
+            return False
+        current = cookies.load_all(self._settings.site_logins).get(site)
+        dialog = self._login_dialog(site, current)
+        if not dialog.exec():
+            return False
+        if not self.set_site_login(site, dialog.choice()):
+            return False
+        self.login_button.hide()
+        retry_id, self._login_retry_job_id = self._login_retry_job_id, ""
+        job = self.jobs.get(retry_id)
+        if job is not None and job.state == "failed":
+            self._show_message("")
+            self.retry_job(retry_id)  # relaunched through _new_run, so it picks the login up
+        else:
+            self.analyze()
+        return True
+
+    def _offer_login_after_download(self, job: QueuedJob, code: Any, message: Any) -> None:
+        """A queued download failed with "private on the site": offer the same opt-in login.
+
+        A link can be public when analyzed and private by the time the download runs (an
+        expired share, a post made friends-only). Only the host is remembered here; the job's
+        stored spec stays free of any login, which is attached at launch as usual.
+        """
+        if job.spec.engine not in LOGIN_ENGINES or not errors.needs_site_login(code, message):
+            return
+        site = cookies.site_key(job.spec.url)
+        if not site:
+            return
+        self._login_site = site
+        self._login_retry_job_id = job.spec.job_id
+        self._show_message(
+            f"{safe_error_message(errors.friendly_message(code, message))}"
+            f" A site login may help ({site}).",
+            error=True,
+        )
+        self.login_button.show()
+
+    def set_site_login(self, site: str, choice: cookies.SiteLogin | None) -> bool:
+        """Save (or with None, remove) the choice for one site. Stores the choice only."""
+        site = cookies.site_key(site)
+        if not site:
+            return False
+        choices = cookies.load_all(self._settings.site_logins)
+        if choice is None:
+            choices.pop(site, None)
+        else:
+            choices[site] = choice
+        previous = self._settings.site_logins
+        self._settings.site_logins = cookies.dump_all(choices)
+        try:
+            settings.save(self._settings)
+        except OSError as exc:
+            self._settings.site_logins = previous
+            QMessageBox.warning(self, "Could not save settings", str(exc))
+            return False
+        return True
 
     def selected_preset(self) -> presets.Preset:
         return presets.get(self.preview.preset_combo.currentData())
@@ -591,10 +815,20 @@ class DownloadsPage(QWidget):
             self._show_message(route.reason, error=True)
             return
         self._route = route
+        self._fallbacks = ["gallery", "file"] if route.kind == "video" else []
+        self._start_analyze(route)
+
+    def _start_analyze(self, route: router.Route) -> None:
         self._info = {}
         self._listing = None
         self.preview.hide()
         self.playlist_card.hide()
+        self.gallery_card.hide()
+        self._gallery = None
+        self._reset_spotify()
+        self.login_button.hide()
+        self._login_site = ""
+        self._login_retry_job_id = ""
         spec = JobSpec(
             job_id=uuid.uuid4().hex,
             engine=route.engine,
@@ -612,10 +846,17 @@ class DownloadsPage(QWidget):
         self._analyze_run = run
         self._analyze_job_id = spec.job_id
         self._analyze_timed_out = False
-        self._show_message("Reading the playlist…" if route.is_playlist else "Analyzing link…")
+        if route.is_spotify:
+            self._show_message("Reading Spotify… this can take up to a minute.")
+        else:
+            self._show_message(
+                "Reading the playlist…" if route.is_playlist else "Analyzing link…"
+            )
         self.analyze_button.setEnabled(False)
         self.analyze_cancel_button.show()
-        self._analyze_timer.start(ANALYZE_TIMEOUT_MS)
+        self._analyze_timer.start(
+            SPOTIFY_ANALYZE_TIMEOUT_MS if route.is_spotify else ANALYZE_TIMEOUT_MS
+        )
         run.start()
 
     def cancel_analyze(self) -> None:
@@ -644,11 +885,31 @@ class DownloadsPage(QWidget):
             if code == "cancelled":
                 self._show_message("")
                 return
-            self._show_message(errors.friendly_message(code, event.data.get("message")), error=True)
+            route = self._route
+            if code == "unsupported" and route is not None and self._fallbacks:
+                # Plan §5.3: yt-dlp does not know the page, so gallery-dl gets a turn, then the
+                # direct engine — which checks the Content-Type before treating it as a file.
+                self._route = replace(route, kind=self._fallbacks.pop(0))
+                self._start_analyze(self._route)
+                return
+            message = event.data.get("message")
+            self._show_message(errors.friendly_message(code, message), error=True)
+            if (
+                route is not None
+                and not route.is_file
+                and not route.is_spotify  # public share links only; no Spotify login
+                and errors.needs_site_login(code, message)
+            ):
+                self._login_site = cookies.site_key(route.url)
+                self.login_button.setVisible(bool(self._login_site))
             return
         self._show_message("")
         if event.data.get("kind") == "playlist":
             self.show_playlist(event.data)
+        elif event.data.get("kind") == "gallery":
+            self.show_gallery(event.data)
+        elif event.data.get("kind") == "spotify":
+            self.show_spotify(event.data)
         else:
             self.show_preview(event.data)
 
@@ -690,6 +951,11 @@ class DownloadsPage(QWidget):
             except (binascii.Error, ValueError):
                 pass
 
+        is_file = bool(route and route.is_file)
+        self._fill_presets(file=is_file)
+        if is_file and _is_number(info.get("filesize")):
+            parts = (self._site_label(info), format_bytes(info["filesize"]))
+            card.meta_label.setText("  ·  ".join(m for m in parts if m))
         raw_formats = info.get("formats")
         self._choices = formats.resolution_choices(
             raw_formats if isinstance(raw_formats, list) else []
@@ -699,6 +965,20 @@ class DownloadsPage(QWidget):
         self._fill_advanced(info)
         self._update_options()
         card.show()
+
+    def _fill_presets(self, file: bool) -> None:
+        """A direct file has one preset; a video page has the yt-dlp ones."""
+        combo = self.preview.preset_combo
+        wanted = [presets.FILE_PRESET] if file else list(presets.PRESETS)
+        if [combo.itemData(i) for i in range(combo.count())] == [p.id for p in wanted]:
+            return
+        combo.blockSignals(True)
+        combo.clear()
+        for preset in wanted:
+            combo.addItem(preset.label, preset.id)
+        default = presets.FILE_PRESET.id if file else presets.DEFAULT_PRESET_ID
+        combo.setCurrentIndex(max(0, combo.findData(default)))
+        combo.blockSignals(False)
 
     def _update_options(self) -> None:
         preset = presets.get(self.preview.preset_combo.currentData())
@@ -802,6 +1082,259 @@ class DownloadsPage(QWidget):
         self._update_summary()
         return jobs
 
+    # ── galleries (plan §M4) ─────────────────────────────────────────────────────────────
+    def show_gallery(self, data: dict[str, Any]) -> None:
+        listing = gallery.parse(data)
+        self._gallery = listing
+        card = self.gallery_card
+        card.title_label.setText(listing.title)
+        meta = [listing.uploader, listing.site, f"{len(listing.items)} items"]
+        if listing.truncated:
+            meta.append(f"showing the first {gallery.MAX_ITEMS}")
+        card.meta_label.setText("  ·  ".join(m for m in meta if m))
+        card.grid.blockSignals(True)
+        card.set_items(listing.items)
+        card.grid.blockSignals(False)
+        self._update_gallery_selection()
+        self.preview.hide()
+        self.playlist_card.hide()
+        card.show()
+
+    def _set_gallery_selection(self, checked: bool) -> None:
+        self.gallery_card.grid.blockSignals(True)
+        self.gallery_card.set_all_checked(checked)
+        self.gallery_card.grid.blockSignals(False)
+        self._update_gallery_selection()
+
+    def _update_gallery_selection(self) -> None:
+        count = len(self.gallery_card.selected_indices())
+        self.gallery_card.selection_label.setText(f"{count} selected")
+        self.gallery_card.download_button.setEnabled(count > 0)
+
+    def start_gallery_download(self) -> QueuedJob | None:
+        """One job for the ticked items. It names positions, never the items' URLs."""
+        listing = self._gallery
+        route = self._route
+        chosen = self.gallery_card.selected_indices()
+        known = {item.index for item in listing.items} if listing else set()
+        chosen = [i for i in chosen if i in known]
+        if listing is None or route is None or not route.is_gallery or not chosen:
+            return None
+        options = presets.gallery_download_options(
+            chosen, archive=self.gallery_card.archive_check.isChecked()
+        )
+        spec = JobSpec(
+            job_id=uuid.uuid4().hex,
+            engine=route.engine,
+            url=route.url,
+            output_dir=str(self._settings.effective_download_dir()),
+            options=options,
+        )
+        title = listing.title if len(chosen) == len(known) else f"{listing.title} ({len(chosen)})"
+        job = self._add_job(spec, safe_job_title(title, route.url))
+        self.empty_state.hide()
+        self.scheduler.submit(spec)
+        self._update_summary()
+        return job
+
+    # ── Spotify (plan §6.3, §M5) ─────────────────────────────────────────────────────────
+    def show_spotify(self, data: dict[str, Any]) -> None:
+        listing = spotify.parse_listing(data)
+        self._spotify = listing
+        self._spotify_matches = {}
+        card = self.spotify_card
+        card.title_label.setText(listing.title)
+        kind = {"track": "Song", "album": "Album", "playlist": "Playlist"}.get(listing.kind, "")
+        count = len(listing.tracks)
+        meta = [kind, listing.owner, f"{count} song" if count == 1 else f"{count} songs"]
+        if listing.skipped:
+            meta.append(f"{listing.skipped} not downloadable (local files or podcasts)")
+        if listing.truncated:
+            meta.append(f"showing the first {spotify.MAX_TRACKS}")
+        card.meta_label.setText("  ·  ".join(m for m in meta if m))
+        card.set_tracks(listing.tracks)
+        for row in range(card.table.rowCount()):
+            box = card.checkbox(row)
+            if box is not None:
+                box.toggled.connect(self._update_spotify_selection)
+        self._update_spotify_selection()
+        self.preview.hide()
+        self.playlist_card.hide()
+        self.gallery_card.hide()
+        if not listing.tracks:
+            self._show_message("No downloadable songs were found at that link.", error=True)
+            card.hide()
+            return
+        card.show()
+
+    def _reset_spotify(self) -> None:
+        self._cancel_matches()
+        self._spotify = None
+        self._spotify_matches = {}
+        self.spotify_card.hide()
+
+    def _set_spotify_selection(self, checked: bool) -> None:
+        self.spotify_card.set_all_checked(checked)
+        self._update_spotify_selection()
+
+    def _update_spotify_selection(self) -> None:
+        card = self.spotify_card
+        count = len(card.selected_rows())
+        checking = len(self._match_waiting) + len(self._match_runs)
+        text = f"{count} selected"
+        if checking:
+            text += f"  ·  checking {checking} match{'es' if checking != 1 else ''}…"
+        card.selection_label.setText(text)
+        card.download_button.setEnabled(count > 0)
+        card.match_button.setEnabled(count > 0)
+
+    def selected_spotify_tracks(self) -> list[spotify.SpotifyTrack]:
+        if self._spotify is None:
+            return []
+        tracks = self._spotify.tracks
+        return [tracks[r] for r in self.spotify_card.selected_rows() if r < len(tracks)]
+
+    def _spotify_row(self, track: spotify.SpotifyTrack) -> int:
+        return track.index - 1  # rows are listed in listing order, one per track
+
+    def check_spotify_matches(self) -> int:
+        """Look up the YouTube match for each ticked song that has none yet. Returns how many."""
+        busy = {t.track_id for t in self._match_waiting}
+        busy |= {track.track_id for _, track, _ in self._match_runs.values()}
+        queued = 0
+        for track in self.selected_spotify_tracks():
+            if track.track_id in self._spotify_matches or track.track_id in busy:
+                continue
+            self._match_waiting.append(track)
+            self.spotify_card.set_status(self._spotify_row(track), "Waiting to check…")
+            queued += 1
+        self._pump_matches()
+        self._update_spotify_selection()
+        return queued
+
+    def _pump_matches(self) -> None:
+        while self._match_waiting and len(self._match_runs) < MATCH_CONCURRENCY:
+            track = self._match_waiting.pop(0)
+            spec = spotify.match_spec(track)
+            try:
+                run = self._new_run(spec)
+            except WorkerRuntimeMissing as exc:
+                self._match_waiting.clear()
+                self._show_message(f"Cannot start the downloader: {exc}", error=True)
+                self.spotify_card.set_status(self._spotify_row(track), "Not checked", warn=True)
+                break
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.timeout.connect(lambda job_id=spec.job_id: self._match_timeout(job_id))
+            self._match_runs[spec.job_id] = (run, track, timer)
+            self.spotify_card.set_status(self._spotify_row(track), "Checking…")
+            timer.start(MATCH_TIMEOUT_MS)
+            run.start()
+
+    def _match_timeout(self, job_id: str) -> None:
+        entry = self._match_runs.get(job_id)
+        if entry is not None:
+            entry[0].cancel()
+
+    def _on_match_event(self, event: Event) -> None:
+        if not event.is_terminal:
+            return
+        _, track, timer = self._match_runs.pop(event.job_id)
+        timer.stop()
+        timer.deleteLater()
+        row = self._spotify_row(track)
+        listing = self._spotify
+        # A late answer for a listing that has since been replaced lands nowhere.
+        current = listing is not None and row < len(listing.tracks)
+        current = current and listing.tracks[row].track_id == track.track_id
+        if current:
+            manual = self._spotify_matches.get(track.track_id)
+            if manual is not None and manual.manual:
+                pass  # the owner pasted a link while this was running; theirs wins
+            elif event.type == "result":
+                match = spotify.parse_match(event.data, track)
+                if match is None:
+                    self.spotify_card.set_status(row, "No usable match found", warn=True)
+                else:
+                    self._spotify_matches[track.track_id] = match
+                    self.spotify_card.set_match(row, match)
+            else:
+                code = event.data.get("code")
+                if code == "cancelled":
+                    text = "Not checked"
+                elif code == "no_match":
+                    text = "No match found — paste one with Change…"
+                else:
+                    text = safe_error_message(
+                        errors.friendly_message(code, event.data.get("message"))
+                    )
+                self.spotify_card.set_status(row, text, warn=True)
+        self._pump_matches()
+        self._update_spotify_selection()
+
+    def _cancel_matches(self) -> None:
+        self._match_waiting.clear()
+        for run, _, timer in list(self._match_runs.values()):
+            timer.stop()
+            run.cancel()
+        # Their terminal events still arrive and are dropped: the listing they belong to is gone.
+
+    def _ask_match_link(self, track: spotify.SpotifyTrack) -> str | None:
+        """The owner's replacement link for one song, or None if they cancelled."""
+        text, ok = QInputDialog.getText(
+            self,
+            "Use a different recording",
+            f"Paste a YouTube or YouTube Music link for:\n{track.artist} — {track.title}",
+        )
+        return text if ok else None
+
+    def change_spotify_match(self, row: int) -> spotify.Match | None:
+        listing = self._spotify
+        if listing is None or not 0 <= row < len(listing.tracks):
+            return None
+        track = listing.tracks[row]
+        text = self._ask_match_link(track)
+        if text is None or not text.strip():
+            return None
+        try:
+            match = spotify.override_match(text, track)
+        except ValueError as exc:
+            self._show_message(str(exc), error=True)
+            return None
+        self._spotify_matches[track.track_id] = match
+        self.spotify_card.set_match(row, match)
+        self._show_message("")
+        return match
+
+    def start_spotify_download(self) -> list[QueuedJob]:
+        """One ordinary MP3 job per ticked song, each carrying its reviewed match if any."""
+        listing = self._spotify
+        route = self._route
+        tracks = self.selected_spotify_tracks()
+        if listing is None or route is None or not route.is_spotify or not tracks:
+            return []
+        specs = spotify.batch_specs(
+            tracks,
+            self._spotify_matches,
+            str(self._settings.effective_download_dir()),
+            archive=self.spotify_card.archive_check.isChecked(),
+        )
+        group_id = ""
+        if len(specs) > 1:
+            group_id = uuid.uuid4().hex
+            self.store.add_group(group_id, listing.title, route.url, len(specs))
+            group_card = GroupCard(listing.title, len(specs))
+            self.queue_layout.insertWidget(0, group_card)
+            self._groups[group_id] = GroupState(group_card, len(specs), listing.title)
+        jobs = []
+        for spec, track in zip(specs, tracks, strict=True):
+            title = f"{track.artist} - {track.title}" if track.artist else track.title
+            jobs.append(self._add_job(spec, title, group_id))
+        self.empty_state.hide()
+        self.scheduler.submit_all(specs)
+        self._update_summary()
+        return jobs
+
     # ── queue ────────────────────────────────────────────────────────────────────────────
     def _new_card(self, title: str, job_id: str) -> JobCard:
         """A queue row wired to the actions for one job id."""
@@ -830,7 +1363,7 @@ class DownloadsPage(QWidget):
         self.queue_layout.insertWidget(0, job_card)
         job_card.set_state(JOB_CHIPS["queued"], "queued")
         job_card.set_draggable(True)
-        job_card.details_label.setText(presets.get(spec.options["preset"]).label)
+        job_card.details_label.setText(_preset(spec.options["preset"]).label)
         self._record_job(spec, title, group_id)
         return job
 
@@ -921,7 +1454,7 @@ class DownloadsPage(QWidget):
             if not isinstance(record.options.get("preset"), str):
                 continue
             try:
-                presets.get(record.options["preset"])
+                _preset(record.options["preset"])
             except ValueError:
                 continue
             spec = JobSpec(
@@ -954,12 +1487,15 @@ class DownloadsPage(QWidget):
         if self._route is None or not self._route.ok or not self._info:
             return None
         card = self.preview
-        options = presets.download_options(
-            card.preset_combo.currentData(),
-            card.resolution_combo.currentData(),
-            compatible=card.compatible_check.isChecked(),
-            crop_cover=card.crop_check.isChecked(),
-        )
+        if self._route.is_file:
+            options = presets.file_download_options()
+        else:
+            options = presets.download_options(
+                card.preset_combo.currentData(),
+                card.resolution_combo.currentData(),
+                compatible=card.compatible_check.isChecked(),
+                crop_cover=card.crop_check.isChecked(),
+            )
         spec = JobSpec(
             job_id=uuid.uuid4().hex,
             engine=self._route.engine,
@@ -989,7 +1525,7 @@ class DownloadsPage(QWidget):
             self._show_message(LINK_REDACTED_REASON, error=True)
             return None
         try:
-            presets.get(preset_id)
+            _preset(preset_id)
         except ValueError:
             return None
         spec = JobSpec(
@@ -1024,7 +1560,7 @@ class DownloadsPage(QWidget):
         job.state = "active"
         card.set_draggable(False)
         card.set_state("Starting", "active")
-        card.details_label.setText(presets.get(job.spec.options["preset"]).label)
+        card.details_label.setText(_preset(job.spec.options["preset"]).label)
         card.cancel_button.setEnabled(True)
         card.cancel_button.show()
         self.store.set_state(job.spec.job_id, "active")
@@ -1277,6 +1813,9 @@ class DownloadsPage(QWidget):
         if self._analyze_job_id and event.job_id == self._analyze_job_id:
             self._on_analyze_event(event)
             return
+        if event.job_id in self._match_runs:
+            self._on_match_event(event)
+            return
         job = self.jobs.get(event.job_id)
         if job is None or job.state != "active":
             return
@@ -1341,6 +1880,7 @@ class DownloadsPage(QWidget):
                     job, message, str(code or "")
                 ):
                     self._finish_job(job, "failed", message, error_code=str(code or ""))
+                    self._offer_login_after_download(job, code, raw)
 
     def shutdown(self) -> None:
         self.scheduler.stop()
@@ -1349,6 +1889,7 @@ class DownloadsPage(QWidget):
         self._retry_timers.clear()
         if self._analyze_run is not None:
             self._analyze_run.cancel()
+        self._cancel_matches()
         for job in self.jobs.values():
             if job.state == "active" and job.run is not None:
                 job.run.cancel()
@@ -1474,7 +2015,7 @@ class HistoryPage(QWidget):
     def _record_type(record: history.JobRecord) -> str:
         """Classify a saved job from its persisted preset without trusting arbitrary text."""
         try:
-            return presets.get(record.preset).kind
+            return _preset(record.preset).kind
         except ValueError:
             return ""
 

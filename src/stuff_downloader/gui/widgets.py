@@ -2,27 +2,40 @@
 
 from __future__ import annotations
 
-from PyQt6.QtCore import QMimeData, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QDrag, QPixmap
+import html
+
+from PyQt6.QtCore import QMimeData, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QDrag, QIcon, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListView,
+    QListWidget,
+    QListWidgetItem,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from ..core import cookies
+from ..core.gallery import GalleryItem
+from ..core.spotify import Match, SpotifyTrack
 from .theme import set_state
 
 # Drags carry the job id only: a drop from another application can never be mistaken for a
@@ -445,3 +458,395 @@ class PlaylistCard(Card):
             item = self.table.item(row, 2)
             title = item.text().lower() if item is not None else ""
             self.table.setRowHidden(row, bool(needle) and needle not in title)
+
+
+class SiteLoginDialog(QDialog):
+    """The advanced site-login choice for one site (plan §6.4). Offered only after a failure.
+
+    The dialog returns a choice; it never reads, copies or shows a cookie. ``choice()`` is
+    ``None`` for "No login", which removes any saved choice for the site.
+    """
+
+    def __init__(self, site: str, current: cookies.SiteLogin | None = None, parent=None) -> None:
+        super().__init__(parent)
+        self.site = site
+        self.setWindowTitle("Advanced: site login")
+        layout = QVBoxLayout(self)
+        heading = QLabel(f"Use a login for {site}?")
+        heading.setTextFormat(Qt.TextFormat.PlainText)
+        heading.setStyleSheet("font-weight:600; font-size:11pt;")
+        guidance = QLabel(cookies.GUIDANCE)
+        guidance.setTextFormat(Qt.TextFormat.PlainText)
+        guidance.setWordWrap(True)
+        guidance.setObjectName("muted")
+        layout.addWidget(heading)
+        layout.addWidget(guidance)
+
+        self.none_radio = QRadioButton("No login (default)")
+        self.browser_radio = QRadioButton("Use a browser session")
+        self.file_radio = QRadioButton("Use a cookies.txt file")
+        self.group = QButtonGroup(self)
+        for radio in (self.none_radio, self.browser_radio, self.file_radio):
+            self.group.addButton(radio)
+        self.browser_combo = QComboBox()
+        for browser in cookies.BROWSERS:
+            self.browser_combo.addItem(browser.capitalize(), browser)
+        self.profile_edit = QLineEdit()
+        self.profile_edit.setPlaceholderText("Profile name (optional)")
+        self.file_edit = QLineEdit()
+        self.file_edit.setPlaceholderText(r"C:\path\to\cookies.txt")
+        self.file_button = QPushButton("Browse…")
+        self.error_label = QLabel("")
+        self.error_label.setObjectName("muted")
+        self.error_label.setWordWrap(True)
+        self.error_label.hide()
+
+        browser_row = QHBoxLayout()
+        browser_row.setContentsMargins(24, 0, 0, 0)
+        browser_row.addWidget(self.browser_combo)
+        browser_row.addWidget(self.profile_edit, 1)
+        file_row = QHBoxLayout()
+        file_row.setContentsMargins(24, 0, 0, 0)
+        file_row.addWidget(self.file_edit, 1)
+        file_row.addWidget(self.file_button)
+        layout.addWidget(self.none_radio)
+        layout.addWidget(self.browser_radio)
+        layout.addLayout(browser_row)
+        layout.addWidget(self.file_radio)
+        layout.addLayout(file_row)
+        layout.addWidget(self.error_label)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+        if current is not None and current.source == "browser":
+            self.browser_radio.setChecked(True)
+            self.browser_combo.setCurrentIndex(self.browser_combo.findData(current.browser))
+            self.profile_edit.setText(current.profile)
+        elif current is not None:
+            self.file_radio.setChecked(True)
+            self.file_edit.setText(current.path)
+        else:
+            self.none_radio.setChecked(True)
+        self.file_button.clicked.connect(self._browse)
+
+    def _browse(self) -> None:
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, "Choose a cookies.txt file", "", "Cookies file (*.txt)"
+        )
+        if chosen:
+            self.file_edit.setText(chosen)
+            self.file_radio.setChecked(True)
+
+    def choice(self) -> cookies.SiteLogin | None:
+        """The selected choice, or None for No login. Raises ValueError when it is invalid."""
+        if self.none_radio.isChecked():
+            return None
+        if self.browser_radio.isChecked():
+            raw = {
+                "source": "browser",
+                "browser": self.browser_combo.currentData(),
+                "profile": self.profile_edit.text(),
+            }
+            parsed = cookies.parse(raw)
+            if parsed is None:
+                raise ValueError("A profile is a name only: letters, digits, spaces, . _ -")
+            return parsed
+        path = self.file_edit.text().strip()
+        problem = cookies.check_file(path) if path else "Pick a cookies.txt file."
+        parsed = cookies.parse({"source": "file", "path": path}) if not problem else None
+        if parsed is None:
+            raise ValueError(problem or "Pick a cookies.txt file by its full path.")
+        return parsed
+
+    def _accept(self) -> None:
+        try:
+            self.choice()
+        except ValueError as exc:
+            self.error_label.setText(str(exc))
+            self.error_label.show()
+            return
+        self.accept()
+
+
+GALLERY_ICON = QSize(128, 128)
+_KIND_GLYPH = {"image": "🖼", "video": "🎞", "file": "📄"}
+
+
+class GalleryCard(Card):
+    """An analyzed gallery: a grid of checkable previews, then download the ones ticked.
+
+    Each tile's data is the item's 1-based position. That position is all a download sends,
+    so what is ticked here is exactly what the worker fetches.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.title_label = QLabel("")
+        self.title_label.setStyleSheet("font-weight:600; font-size:12pt;")
+        self.title_label.setWordWrap(True)
+        self.title_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.meta_label = QLabel("")
+        self.meta_label.setObjectName("muted")
+        self.meta_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.body.addWidget(self.title_label)
+        self.body.addWidget(self.meta_label)
+
+        self.grid = QListWidget()
+        self.grid.setViewMode(QListView.ViewMode.IconMode)
+        self.grid.setIconSize(GALLERY_ICON)
+        self.grid.setGridSize(QSize(GALLERY_ICON.width() + 24, GALLERY_ICON.height() + 40))
+        self.grid.setResizeMode(QListView.ResizeMode.Adjust)
+        self.grid.setMovement(QListView.Movement.Static)
+        self.grid.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.grid.setMinimumHeight(300)
+        self.body.addWidget(self.grid)
+
+        controls = QHBoxLayout()
+        self.select_all_button = QPushButton("Select all")
+        self.select_none_button = QPushButton("Select none")
+        self.archive_check = QCheckBox("Skip items already downloaded to this folder")
+        self.archive_check.setChecked(True)
+        controls.addWidget(self.select_all_button)
+        controls.addWidget(self.select_none_button)
+        controls.addWidget(self.archive_check, 1)
+        self.body.addLayout(controls)
+
+        buttons = QHBoxLayout()
+        self.selection_label = QLabel("")
+        self.selection_label.setObjectName("muted")
+        self.download_button = QPushButton("⬇  Download selected (original quality)")
+        self.download_button.setObjectName("primary")
+        buttons.addWidget(self.selection_label, 1)
+        buttons.addWidget(self.download_button)
+        self.body.addLayout(buttons)
+
+    def set_items(self, items: tuple[GalleryItem, ...] | list[GalleryItem]) -> None:
+        self.grid.clear()
+        for item in items:
+            tile = QListWidgetItem(item.label)
+            tile.setData(Qt.ItemDataRole.UserRole, item.index)
+            tile.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            tile.setCheckState(Qt.CheckState.Checked)
+            tile.setToolTip(item.label)
+            pixmap = QPixmap()
+            if item.preview and pixmap.loadFromData(item.preview):
+                tile.setIcon(
+                    QIcon(
+                        pixmap.scaled(
+                            GALLERY_ICON,
+                            Qt.AspectRatioMode.KeepAspectRatio,
+                            Qt.TransformationMode.SmoothTransformation,
+                        )
+                    )
+                )
+            else:
+                tile.setText(f"{_KIND_GLYPH.get(item.kind, '📄')}  {item.label}")
+            self.grid.addItem(tile)
+
+    def set_all_checked(self, checked: bool) -> None:
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for row in range(self.grid.count()):
+            self.grid.item(row).setCheckState(state)
+
+    def selected_indices(self) -> list[int]:
+        chosen = []
+        for row in range(self.grid.count()):
+            tile = self.grid.item(row)
+            if tile.checkState() == Qt.CheckState.Checked:
+                chosen.append(int(tile.data(Qt.ItemDataRole.UserRole)))
+        return chosen
+
+
+def plain_tooltip(text: str) -> str:
+    """A tooltip that shows ``text`` literally.
+
+    Qt renders a tooltip as rich text whenever it looks like HTML, and these carry titles written
+    by whoever uploaded the song. Escaping inside an explicit paragraph keeps them as characters.
+    """
+    return f"<p style='white-space:pre-wrap'>{html.escape(text)}</p>"
+
+
+def format_diff(seconds: float | None) -> str:
+    """A match's duration difference: "+3s", "−12s", "0s", or "—" when unknown."""
+    if not isinstance(seconds, int | float) or isinstance(seconds, bool):
+        return "—"
+    whole = round(seconds)
+    if whole == 0:
+        return "0s"
+    return f"+{whole}s" if whole > 0 else f"−{-whole}s"
+
+
+# A match whose length is further off than this is flagged: it is probably a live cut, a remix,
+# an extended edit or a video with a long intro rather than the recording Spotify lists.
+MATCH_DIFF_WARN = 10
+MATCH_SCORE_WARN = 70.0
+
+
+class SpotifyCard(Card):
+    """A Spotify track/album/playlist: tick tracks, review their YouTube matches, download.
+
+    Spotify's audio is DRM-protected and never downloaded. The card says so up front, because the
+    whole point of the match columns is that the audio comes from somewhere else.
+    """
+
+    COLUMNS = ("", "#", "Title", "Artist", "Length", "YouTube match", "Diff", "Score", "")
+    MATCH_COLUMN, DIFF_COLUMN, SCORE_COLUMN, CHANGE_COLUMN = 5, 6, 7, 8
+    DISCLOSURE = (
+        "Spotify's own audio is protected and is never downloaded. Each song is matched from "
+        "YouTube Music, then tagged with Spotify's title, artist, album and cover. A match can "
+        "be the wrong recording, so check the ones that matter to you."
+    )
+    NOT_CHECKED = "Not checked"
+    NOT_CHECKED_TIP = "No match looked up yet. The best one is picked when the song downloads."
+
+    change_requested = pyqtSignal(int)  # row
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.title_label = QLabel("")
+        self.title_label.setStyleSheet("font-weight:600; font-size:12pt;")
+        self.title_label.setWordWrap(True)
+        self.title_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.meta_label = QLabel("")
+        self.meta_label.setObjectName("muted")
+        self.meta_label.setWordWrap(True)
+        self.meta_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.disclosure_label = QLabel(self.DISCLOSURE)
+        self.disclosure_label.setWordWrap(True)
+        self.disclosure_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.body.addWidget(self.title_label)
+        self.body.addWidget(self.meta_label)
+        self.body.addWidget(self.disclosure_label)
+
+        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table.setHorizontalHeaderLabels(list(self.COLUMNS))
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setMinimumHeight(260)
+        self.table.verticalHeader().setDefaultSectionSize(36)
+        header = self.table.horizontalHeader()
+        for column in range(len(self.COLUMNS)):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        # Title and match share the spare width; a long artist list must not starve them.
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(3, 170)
+        header.setSectionResizeMode(self.MATCH_COLUMN, QHeaderView.ResizeMode.Stretch)
+        # ResizeToContents measures items, not cell widgets, so the button column is sized here.
+        header.setSectionResizeMode(self.CHANGE_COLUMN, QHeaderView.ResizeMode.Fixed)
+        header.resizeSection(self.CHANGE_COLUMN, 104)
+        self.body.addWidget(self.table)
+
+        controls = QHBoxLayout()
+        self.select_all_button = QPushButton("Select all")
+        self.select_none_button = QPushButton("Select none")
+        self.match_button = QPushButton("🔎  Check matches")
+        self.match_button.setToolTip(
+            "Look up the YouTube recording for each selected song (about half a minute each)"
+        )
+        self.archive_check = QCheckBox("Skip songs already downloaded to this folder")
+        self.archive_check.setChecked(True)
+        controls.addWidget(self.select_all_button)
+        controls.addWidget(self.select_none_button)
+        controls.addWidget(self.match_button)
+        controls.addWidget(self.archive_check, 1)
+        self.body.addLayout(controls)
+
+        buttons = QHBoxLayout()
+        self.selection_label = QLabel("")
+        self.selection_label.setObjectName("muted")
+        self.download_button = QPushButton("⬇  Download selected as MP3")
+        self.download_button.setObjectName("primary")
+        buttons.addWidget(self.selection_label, 1)
+        buttons.addWidget(self.download_button)
+        self.body.addLayout(buttons)
+
+    def checkbox(self, row: int) -> QCheckBox | None:
+        widget = self.table.cellWidget(row, 0)
+        return widget if isinstance(widget, QCheckBox) else None
+
+    def change_button(self, row: int) -> QPushButton | None:
+        widget = self.table.cellWidget(row, self.CHANGE_COLUMN)
+        return widget if isinstance(widget, QPushButton) else None
+
+    def set_tracks(self, tracks: tuple[SpotifyTrack, ...] | list[SpotifyTrack]) -> None:
+        self.table.setRowCount(len(tracks))
+        for row, track in enumerate(tracks):
+            box = QCheckBox()
+            box.setChecked(True)
+            self.table.setCellWidget(row, 0, box)
+            title = f"{track.title}  🅴" if track.explicit else track.title
+            cells = (str(track.index), title, track.artist, format_duration(track.duration))
+            for column, text in enumerate(cells, start=1):
+                item = QTableWidgetItem(text)
+                if column in (2, 3):
+                    item.setToolTip(plain_tooltip(text))  # the columns that get cut short
+                self.table.setItem(row, column, item)
+            change = QPushButton("Change…")
+            change.setObjectName("rowButton")
+            change.setToolTip("Paste a different YouTube link for this song")
+            change.clicked.connect(lambda _=False, r=row: self.change_requested.emit(r))
+            self.table.setCellWidget(row, self.CHANGE_COLUMN, change)
+            self.set_status(row, self.NOT_CHECKED, tip=self.NOT_CHECKED_TIP)
+
+    def set_status(self, row: int, text: str, warn: bool = False, tip: str = "") -> None:
+        """A row with no match to show: not checked yet, checking, or why none was found."""
+        self._set_match_cells(row, text, "", "", warn)
+        item = self.table.item(row, self.MATCH_COLUMN)
+        if item is not None:
+            item.setToolTip(plain_tooltip(tip or text))
+
+    def set_match(self, row: int, match: Match) -> None:
+        if match.manual:
+            label = "Your link"
+            score = "—"
+        else:
+            label = match.title or "YouTube Music result"
+            if match.channel:
+                label = f"{label}  ·  {match.channel}"
+            score = f"{match.confidence:.0f}%" if match.confidence is not None else "—"
+        diff = match.duration_diff
+        warn = (diff is not None and abs(diff) > MATCH_DIFF_WARN) or (
+            match.confidence is not None and match.confidence < MATCH_SCORE_WARN
+        )
+        self._set_match_cells(row, label, format_diff(diff), score, warn)
+        item = self.table.item(row, self.MATCH_COLUMN)
+        if item is not None:
+            # The video id, not a link: one more copyable URL is one more way around the router.
+            item.setToolTip(plain_tooltip(f"{label}\nYouTube video {match.video_id}"))
+
+    def _set_match_cells(self, row: int, label: str, diff: str, score: str, warn: bool) -> None:
+        for column, text in (
+            (self.MATCH_COLUMN, label),
+            (self.DIFF_COLUMN, diff),
+            (self.SCORE_COLUMN, score),
+        ):
+            item = QTableWidgetItem(text)
+            if warn:
+                item.setForeground(QColor("#e0a040"))
+            self.table.setItem(row, column, item)
+
+    def cell_text(self, row: int, column: int) -> str:
+        item = self.table.item(row, column)
+        return item.text() if item is not None else ""
+
+    def selected_rows(self) -> list[int]:
+        rows = []
+        for row in range(self.table.rowCount()):
+            box = self.checkbox(row)
+            if box is not None and box.isChecked():
+                rows.append(row)
+        return rows
+
+    def set_all_checked(self, checked: bool) -> None:
+        for row in range(self.table.rowCount()):
+            box = self.checkbox(row)
+            if box is not None:
+                box.setChecked(checked)

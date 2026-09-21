@@ -136,3 +136,18 @@ def test_dev_env_points_at_src(monkeypatch):
     monkeypatch.delattr(sys, "frozen", raising=False)
     src = Path(runner.__file__).resolve().parents[2]
     assert runner._worker_env()["PYTHONPATH"].split(os.pathsep)[0] == str(src)
+
+
+def test_frozen_gallerydl_runs_in_its_own_env_never_the_ytdlp_one(frozen):
+    """gallery-dl is GPLv2-only (plan §8.3): its worker must come from its own env."""
+    expected = _touch(frozen / "envs" / "gallerydl" / "1.32.13-bbbb" / "Scripts" / "python.exe")
+    (frozen / "active.json").write_text(
+        json.dumps(
+            {
+                "ytdlp": {"active": "2026.8.19-aaaa", "previous": None},
+                "gallerydl": {"active": "1.32.13-bbbb", "previous": None},
+            }
+        ),
+        encoding="utf-8",
+    )
+    assert runner.default_worker_command("gallerydl")[0] == str(expected)

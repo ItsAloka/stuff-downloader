@@ -1,4 +1,4 @@
-"""URL router (plan §5.3, §M3): YouTube videos and playlists, plus public video pages elsewhere.
+"""URL router (plan §5.3, §M3, §M5): YouTube, Spotify, and public video pages elsewhere.
 
 Only http/https links are accepted. A YouTube link is rebuilt from the parsed video or playlist
 id, so tracking parameters and anything else in the pasted text never reach the worker. A link
@@ -41,13 +41,22 @@ SITE_PRIVATE_HOST_REASON = (
 SITE_CREDENTIALS_REASON = "Links with a username or password in them are not supported."
 SITE_UNSUPPORTED_REASON = "That site is not supported yet. Paste a link to a public video page."
 
-# Sites a later milestone owns. Handing them to the video engine would half-work or fail with
-# something the owner cannot act on, so they are refused by name instead.
+# Spotify's marketing site holds no tracks. Handing it to the video engine would fail with
+# something the owner cannot act on, so it is refused by name instead.
+SPOTIFY_SITE_REASON = "Open the song, album or playlist in Spotify, then copy its share link."
 _DEFERRED_HOSTS = {
-    "open.spotify.com": "Spotify links are not supported yet.",
-    "spotify.com": "Spotify links are not supported yet.",
-    "www.spotify.com": "Spotify links are not supported yet.",
+    "spotify.com": SPOTIFY_SITE_REASON,
+    "www.spotify.com": SPOTIFY_SITE_REASON,
 }
+
+# Plan §6.3: a Spotify track, album or playlist, rebuilt from its id. Artists, podcasts and
+# user pages are refused by name: an artist is a discography, not a list the owner picked.
+_SPOTIFY_HOSTS = {"open.spotify.com", "play.spotify.com"}
+SPOTIFY_KINDS = ("track", "album", "playlist")
+SPOTIFY_ID = re.compile(r"[A-Za-z0-9]{22}")
+_SPOTIFY_LOCALE = re.compile(r"intl-[a-z]{2}(?:-[a-z]{2})?", re.IGNORECASE)
+SPOTIFY_KIND_REASON = "Only Spotify songs, albums and playlists can be downloaded."
+SPOTIFY_INVALID_REASON = "No Spotify song, album or playlist found in that link."
 _NON_PUBLIC_SUFFIXES = (".local", ".internal", ".localhost", ".home.arpa", ".lan", ".test")
 
 _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com"}
@@ -57,10 +66,23 @@ _PATH_PREFIXES = ("shorts", "live", "embed", "v")
 
 MAX_URL_LENGTH = 2048
 
+# A link whose path ends in one of these is the media file itself, not a page about it, so it
+# goes to the direct HTTP engine. The engine re-checks the Content-Type before saving anything,
+# and a link that only looks like a file but is a page is refused there, not saved.
+DIRECT_FILE_EXTENSIONS = frozenset(
+    {
+        ".mp4", ".m4v", ".webm", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".3gp",
+        ".mp3", ".m4a", ".aac", ".ogg", ".oga", ".opus", ".flac", ".wav", ".wma",
+        ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp",
+    }
+)  # fmt: skip
+
 
 @dataclass(frozen=True)
 class Route:
-    kind: str  # "youtube" | "youtube_playlist" | "video" | "unsupported" | "invalid"
+    # "youtube" | "youtube_playlist" | "video" | "file" | "gallery" | "spotify"
+    # | "unsupported" | "invalid"
+    kind: str
     url: str = ""  # normalized watch or playlist URL (youtube only)
     video_id: str = ""
     playlist_id: str = ""  # set when the link also names a downloadable playlist
@@ -68,10 +90,24 @@ class Route:
     playlist_reason: str = ""  # why a named playlist cannot be downloaded, when it cannot
     music: bool = False
     reason: str = ""
+    spotify_kind: str = ""  # "track" | "album" | "playlist" (spotify only)
+    spotify_id: str = ""
 
     @property
     def ok(self) -> bool:
-        return self.kind in ("youtube", "youtube_playlist", "video")
+        return self.kind in ("youtube", "youtube_playlist", "video", "file", "gallery", "spotify")
+
+    @property
+    def is_file(self) -> bool:
+        return self.kind == "file"
+
+    @property
+    def is_gallery(self) -> bool:
+        return self.kind == "gallery"
+
+    @property
+    def is_spotify(self) -> bool:
+        return self.kind == "spotify"
 
     @property
     def is_youtube(self) -> bool:
@@ -83,7 +119,74 @@ class Route:
 
     @property
     def engine(self) -> str:
-        return "ytdlp" if self.ok else ""
+        if not self.ok:
+            return ""
+        return {"file": "http", "gallery": "gallerydl", "spotify": "spotdl"}.get(self.kind, "ytdlp")
+
+
+# Plan §5.3 step 3: photo posts, carousels, stories, albums and media timelines go to gallery-dl.
+# Video pages on the same sites (reels, TikTok videos, a tweet's video) stay with yt-dlp, which
+# handles them better; if yt-dlp finds no video there, the GUI falls back to gallery-dl.
+_INSTAGRAM_HOSTS = {"instagram.com", "www.instagram.com", "m.instagram.com"}
+_TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com", "m.tiktok.com"}
+_FACEBOOK_HOSTS = {"facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com"}
+_X_HOSTS = {"x.com", "www.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"}
+# Instagram paths that are site pages, not a profile name.
+_INSTAGRAM_RESERVED = frozenset(
+    {"explore", "accounts", "direct", "about", "developer", "legal", "reels", "reel", "tv",
+     "p", "stories", "web", "challenge", "emails", "privacy", "terms"}
+)  # fmt: skip
+_INSTAGRAM_USER = re.compile(r"[A-Za-z0-9._]{1,30}")
+# Hosts where downloads run one at a time with delays (plan §6.1): bulk access to them is what
+# gets an account throttled.
+SOCIAL_HOST_GROUPS = {
+    **{h: "instagram" for h in _INSTAGRAM_HOSTS},
+    **{h: "tiktok" for h in _TIKTOK_HOSTS},
+    **{h: "facebook" for h in _FACEBOOK_HOSTS},
+    **{h: "x" for h in _X_HOSTS},
+    # Spotify metadata is read by scraping its web player, which throttles bursts.
+    **{h: "spotify" for h in _SPOTIFY_HOSTS},
+}
+
+
+def social_group(url: str) -> str:
+    """The rate-limited site a URL belongs to ("instagram", "x", …), or "" for any other."""
+    try:
+        host = (urlsplit(url).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return ""
+    return SOCIAL_HOST_GROUPS.get(host, "")
+
+
+def is_gallery_link(host: str, path: str, query: str) -> bool:
+    """Whether a social-site link names photos rather than a video page."""
+    segments = [s for s in path.split("/") if s]
+    if host in _INSTAGRAM_HOSTS:
+        if segments[:1] == ["p"] and len(segments) >= 2:
+            return True
+        if segments[:1] == ["stories"] and len(segments) >= 2:
+            return True  # a story or a highlight (stories/highlights/<id>)
+        return (
+            len(segments) == 1
+            and segments[0].lower() not in _INSTAGRAM_RESERVED
+            and bool(_INSTAGRAM_USER.fullmatch(segments[0]))
+        )  # a profile's posts
+    if host in _TIKTOK_HOSTS:
+        return "photo" in segments
+    if host in _FACEBOOK_HOSTS:
+        if segments[:1] in (["photo"], ["photo.php"]) or segments[:2] == ["media", "set"]:
+            return True
+        return "photos" in segments or "photos_albums" in segments
+    if host in _X_HOSTS:
+        return (len(segments) == 2 and segments[1] == "media") or "photo" in segments
+    return False
+
+
+def is_direct_file_path(path: str) -> bool:
+    """Whether a URL path names a media file by its extension (case-insensitive)."""
+    last = path.rsplit("/", 1)[-1].lower()
+    dot = last.rfind(".")
+    return dot > 0 and last[dot:] in DIRECT_FILE_EXTENSIONS
 
 
 def playlist_refusal(list_id: str) -> str:
@@ -197,6 +300,28 @@ def durable_url(url: str) -> tuple[str, bool]:
     return safe, safe != url
 
 
+def spotify_url(kind: str, spotify_id: str) -> str:
+    return f"https://open.spotify.com/{kind}/{spotify_id}"
+
+
+def _route_spotify(segments: list[str]) -> Route:
+    """A Spotify link, rebuilt from its kind and id so ?si= and friends never travel."""
+    if segments[:1] and _SPOTIFY_LOCALE.fullmatch(segments[0]):
+        segments = segments[1:]
+    if segments[:1] == ["embed"]:
+        segments = segments[1:]
+    if not segments:
+        return Route("unsupported", reason=SPOTIFY_INVALID_REASON)
+    kind = segments[0].lower()
+    if kind not in SPOTIFY_KINDS:
+        return Route("unsupported", reason=SPOTIFY_KIND_REASON)
+    spotify_id = segments[1] if len(segments) >= 2 else ""
+    if len(segments) > 2 or not SPOTIFY_ID.fullmatch(spotify_id):
+        return Route("invalid", reason=SPOTIFY_INVALID_REASON)
+    url = spotify_url(kind, spotify_id)
+    return Route("spotify", url=url, spotify_kind=kind, spotify_id=spotify_id)
+
+
 def _site_url(parts: Any) -> str:
     """A non-YouTube link reduced to the parts a video page needs.
 
@@ -221,6 +346,10 @@ def _route_site(parts: Any) -> Route:
         return Route("unsupported", reason=SITE_PRIVATE_HOST_REASON)
     if parts.path.strip("/") == "" and not parts.query:
         return Route("unsupported", reason=SITE_UNSUPPORTED_REASON)
+    if is_gallery_link(host, parts.path, parts.query):
+        return Route("gallery", url=_site_url(parts))
+    if is_direct_file_path(parts.path):
+        return Route("file", url=_site_url(parts))
     return Route("video", url=_site_url(parts))
 
 
@@ -278,6 +407,8 @@ def route(text: str) -> Route:
                 playlist_id=uploads_id,
                 playlist_url=playlist_url(uploads_id, False),
             )
+    elif host in _SPOTIFY_HOSTS:
+        return _route_spotify(segments)
     else:
         return _route_site(parts)
 

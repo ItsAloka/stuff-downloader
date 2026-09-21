@@ -46,6 +46,8 @@ PYTHON_VERSION = "3.11.16"
 ENGINES: dict[str, dict[str, object]] = {
     "ytdlp": {"imports": ["yt_dlp", "curl_cffi", "yt_dlp_ejs"], "dist": "yt-dlp"},
     "spotdl": {"imports": ["spotdl"], "dist": "spotdl"},
+    # GPLv2-only (plan §8.3): lives only in its own env, run as a separate worker process.
+    "gallerydl": {"imports": ["gallery_dl", "requests"], "dist": "gallery-dl"},
 }
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -184,7 +186,7 @@ def check_env(root: Path, engine: str, env_dir: Path) -> dict[str, str]:
         f"mods = {modules!r}\n"
         "for m in mods: importlib.import_module(m)\n"
         "names = {'yt_dlp': 'yt-dlp', 'curl_cffi': 'curl_cffi', 'yt_dlp_ejs': 'yt-dlp-ejs',"
-        " 'spotdl': 'spotdl'}\n"
+        " 'spotdl': 'spotdl', 'gallery_dl': 'gallery-dl', 'requests': 'requests'}\n"
         "found = {m: metadata.version(names[m]) for m in mods}\n"
         "print(json.dumps(found | {'prefix': sys.prefix}))\n"
     )

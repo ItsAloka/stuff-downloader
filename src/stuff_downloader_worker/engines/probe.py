@@ -14,7 +14,12 @@ from typing import Any
 from ..protocol import JobSpec
 from .base import Emit, EngineError
 
-DIST_NAMES = {"yt_dlp": "yt-dlp", "yt_dlp_ejs": "yt-dlp-ejs", "curl_cffi": "curl_cffi"}
+DIST_NAMES = {
+    "yt_dlp": "yt-dlp",
+    "yt_dlp_ejs": "yt-dlp-ejs",
+    "curl_cffi": "curl_cffi",
+    "gallery_dl": "gallery-dl",
+}
 
 
 class ProbeEngine:

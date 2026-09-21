@@ -7,6 +7,7 @@ from stuff_downloader.core.router import (
     SITE_PRIVATE_HOST_REASON,
     durable_url,
     route,
+    social_group,
 )
 
 VID = "dQw4w9WgXcQ"
@@ -181,7 +182,7 @@ def test_links_carrying_credentials_are_refused_on_every_host(text):
 @pytest.mark.parametrize(
     "text",
     [
-        "https://open.spotify.com/track/abc",
+        "https://spotify.com/premium",
         "https://vimeo.com",
         "https://vimeo.com/",
     ],
@@ -308,3 +309,59 @@ def test_durable_url_never_raises_on_a_malformed_link():
     assert durable_url("https://example.com:99999/x") == ("", True)
     # An empty link has nothing to remove, so nothing is claimed to have been removed.
     assert durable_url("") == ("", False)
+
+
+# ── Spotify (plan §6.3, §M5) ───────────────────────────────────────────────────────────────
+SPOTIFY_TRACK = "4cOdK2wGLETKBW3PvgPWqT"
+
+
+@pytest.mark.parametrize(
+    ("text", "kind"),
+    [
+        (f"https://open.spotify.com/track/{SPOTIFY_TRACK}?si=abc123&utm_source=x", "track"),
+        (f"https://open.spotify.com/intl-de/track/{SPOTIFY_TRACK}", "track"),
+        (f"https://open.spotify.com/embed/album/{SPOTIFY_TRACK}", "album"),
+        (f"http://OPEN.SPOTIFY.COM/playlist/{SPOTIFY_TRACK}#frag", "playlist"),
+        (f"https://play.spotify.com/album/{SPOTIFY_TRACK}", "album"),
+    ],
+)
+def test_spotify_links_are_rebuilt_from_kind_and_id(text, kind):
+    r = route(text)
+    assert r.kind == "spotify" and r.ok and r.is_spotify and r.engine == "spotdl"
+    assert r.spotify_kind == kind and r.spotify_id == SPOTIFY_TRACK
+    # Nothing from the pasted text survives except the kind and the id.
+    assert r.url == f"https://open.spotify.com/{kind}/{SPOTIFY_TRACK}"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        f"https://open.spotify.com/artist/{SPOTIFY_TRACK}",
+        f"https://open.spotify.com/show/{SPOTIFY_TRACK}",
+        f"https://open.spotify.com/episode/{SPOTIFY_TRACK}",
+        "https://open.spotify.com/user/someone",
+        "https://open.spotify.com/",
+    ],
+)
+def test_spotify_pages_that_are_not_a_chosen_list_are_refused_by_name(text):
+    r = route(text)
+    assert r.kind == "unsupported" and not r.ok and "spotify" in r.reason.lower()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://open.spotify.com/track/abc",
+        f"https://open.spotify.com/track/{SPOTIFY_TRACK}x",
+        f"https://open.spotify.com/track/{SPOTIFY_TRACK[:-1]}!",
+        f"https://open.spotify.com/track/{SPOTIFY_TRACK}/extra",
+        "https://open.spotify.com/track/",
+    ],
+)
+def test_a_malformed_spotify_id_is_invalid(text):
+    r = route(text)
+    assert r.kind == "invalid" and not r.ok and r.url == "" and "spotify" in r.reason.lower()
+
+
+def test_spotify_jobs_share_one_rate_limited_group():
+    assert social_group(f"https://open.spotify.com/track/{SPOTIFY_TRACK}") == "spotify"

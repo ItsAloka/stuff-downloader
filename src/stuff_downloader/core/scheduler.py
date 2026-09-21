@@ -10,6 +10,10 @@ calling in), so it holds no locks.
 so the distinction is kept here: ``pause`` and ``cancel`` record an intent that ``take_intent``
 hands back when that terminal event arrives.
 
+Some sites get one job at a time (plan §6.1): ``group_of`` names a job's rate-limited site, and
+while a job from that site runs, later jobs from it wait — without holding up jobs for any other
+site behind them.
+
 Retry backoff is *decided* here and *timed* by the caller: the scheduler owns no clock and no
 thread, so ``schedule_retry`` parks the job and returns the delay for the caller to arm a timer
 with, and ``release_retry`` puts it back in the queue when that timer fires.
@@ -40,8 +44,11 @@ RETRY_MAX_SECONDS = 60.0
 class Scheduler:
     start_job: Callable[[JobSpec], None]
     max_concurrent: int = DEFAULT_CONCURRENT
+    # A job's rate-limited site ("instagram", "x", …), or "" for no per-site limit.
+    group_of: Callable[[JobSpec], str] = field(default=lambda spec: "")
     _pending: list[JobSpec] = field(default_factory=list)
     _active: set[str] = field(default_factory=set)
+    _active_groups: dict[str, str] = field(default_factory=dict)  # job id -> its site group
     _paused: dict[str, JobSpec] = field(default_factory=dict)
     _intent: dict[str, str] = field(default_factory=dict)
     _retrying: dict[str, JobSpec] = field(default_factory=dict)
@@ -109,15 +116,36 @@ class Scheduler:
         self.pump()
 
     def pump(self) -> None:
-        """Start jobs until the concurrency limit is reached."""
-        while not self._stopped and self._pending and len(self._active) < self.max_concurrent:
-            spec = self._pending.pop(0)
+        """Start jobs until the concurrency limit is reached.
+
+        Jobs start in queue order, except that one whose site already has a job running is
+        passed over (it keeps its place) so the next eligible job can use the slot.
+        """
+        while not self._stopped and len(self._active) < self.max_concurrent:
+            busy = set(self._active_groups.values())
+            index = next(
+                (i for i, spec in enumerate(self._pending) if self._group(spec) not in busy),
+                None,
+            )
+            if index is None:
+                return
+            spec = self._pending.pop(index)
+            group = self._group(spec)
             self._active.add(spec.job_id)
+            if group:
+                self._active_groups[spec.job_id] = group
             try:
                 self.start_job(spec)
             except Exception:
                 self._active.discard(spec.job_id)
+                self._active_groups.pop(spec.job_id, None)
                 raise
+
+    def _group(self, spec: JobSpec) -> str:
+        try:
+            return self.group_of(spec) or ""
+        except Exception:  # a bad classifier must not stall the queue
+            return ""
 
     def reorder(self, job_ids: list[str]) -> bool:
         """Rearrange queued jobs into the given order.
@@ -181,6 +209,7 @@ class Scheduler:
     def finished(self, job_id: str) -> None:
         """A job stopped for any reason; free its slot and start the next one."""
         self._active.discard(job_id)
+        self._active_groups.pop(job_id, None)
         self.pump()
 
     def take_intent(self, job_id: str) -> str:

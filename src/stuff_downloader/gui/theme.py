@@ -66,6 +66,7 @@ QPushButton#primary {{ background: {ACCENT}; color: {ACCENT_TEXT}; border: none;
 QPushButton#primary:hover {{ background: {ACCENT_HOVER}; }}
 QPushButton#primary:disabled {{ background: #2c4a5a; color: #8aa3b0; }}
 QPushButton#iconButton {{ padding: 6px 10px; border-radius: 6px; }}
+QPushButton#rowButton {{ padding: 2px 10px; border-radius: 6px; }}
 QPushButton:focus {{ outline: none; border: 1px solid {ACCENT}; }}
 
 /* Progress */

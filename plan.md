@@ -193,6 +193,14 @@ and makes the GUI swappable.
 6. Otherwise show a clear "Not supported — try Sniffer (M7)" message.
 7. Only `http`/`https` are accepted. `file://` and other schemes are rejected.
 
+> **Decision note (M3 closeout, 2026-09-21):** a link whose last path segment ends in a media
+> extension (`.mp4`, `.mp3`, `.jpg`…) goes straight to the HTTP engine, and step 5 remains as a
+> one-time fallback when yt-dlp reports "unsupported". In both cases the HTTP engine does a
+> one-byte range GET (not HEAD, which many file hosts answer wrongly) and refuses anything whose
+> Content-Type is not video/audio/image (or a generic type with a media file name). It vets every
+> redirect hop the same way the router vets the pasted link, refuses a host if *any* address it
+> resolves to is non-global, and connects only to the address it checked.
+
 ### 5.4 Presets (the ChatGPT recipes, as data)
 
 Presets are plain dataclasses that core converts into yt-dlp options. Users never type raw
@@ -241,6 +249,17 @@ recipe), **Subtitles** (when available), **Images — Original**.
    vanished, fall back to best ≤ the selected height, and say so in the job log.
 7. An **"All formats" advanced table** (9xbuddy parity) lists every video, audio-only, thumbnail
    and subtitle track.
+
+   > **Decision note (M3 closeout, 2026-09-21):** the table lists video, audio-only, subtitle and
+   > thumbnail tracks, and it is **read-only**. Things left out on purpose:
+   > - **No per-row download.** A download still goes through a preset, so no site-supplied
+   >   format id or track reaches the engine from a table click. Subtitle files and a chosen
+   >   thumbnail size become downloadable only if a later milestone adds presets for them.
+   > - **Automatic captions are one summary row** ("N languages"), not one row each. Sites
+   >   machine-translate them into 100+ languages, and a row per language buries the real tracks.
+   >   Uploaded subtitles still get one row per language (capped at 40).
+   > - **Thumbnails are listed by size only**, deduplicated. Image URLs stay in the worker.
+   > - Live-chat "subtitles" are dropped: they are a chat replay, not a caption track.
 
 ### 5.6 Paths & files
 
@@ -586,6 +605,32 @@ later one.
   Facebook photos/albums, X media, plus the other gallery-dl sites.
 - Image grid preview with select/deselect; original-quality files; per-host delays and limits.
 - **Ships:** paste an Instagram carousel or TikTok slideshow → pick images → download originals.
+
+> **Decision note (M4, 2026-09-21):**
+> - **Engine and licence.** gallery-dl **1.32.13** (GPL-2.0-only), with `requests` as its only
+>   dependency. It is hash-pinned in `packaging/engine-requirements/gallerydl.txt` and installed as
+>   its own env (`envs\gallerydl\`) by `build_runtime.py install gallerydl …`. It is imported only
+>   in `stuff_downloader_worker/engines/gallerydl.py`, inside the worker process. `core/` and `gui/`
+>   never import it (enforced by the import-boundary test). The frozen GUI finds it the same way it
+>   finds yt-dlp, through `active.json`. The M6 installer must ship this env.
+> - **Routing.** Instagram `/p/`, `/stories/…` (including highlights) and profiles; TikTok
+>   `/photo/`; Facebook `photo`, `photo.php`, `media/set` and `…/photos`; X `/<user>/media` and
+>   `…/photo/N` all go to gallery-dl. Reels, TikTok videos and single tweets stay with yt-dlp.
+>   When yt-dlp reports "unsupported" (including "no video in this tweet/post"), the GUI tries
+>   gallery-dl once, then the direct HTTP engine once. This is also how "the other gallery-dl
+>   sites" are reached without core knowing gallery-dl's site list.
+> - **Selection.** Analyze returns rows as position, kind, extension, size and a preview (max 60
+>   previews, 2 MB each, https public hosts only). Item URLs never leave the worker. A download
+>   names the ticked **positions**, turned into gallery-dl's `image-range`. If a gallery changes
+>   between analyze and download (a story expires, a post is added to a profile), positions can
+>   shift. Accepted for now, because analyze and download are normally seconds apart.
+> - **Limits.** Instagram, TikTok, X and Facebook jobs run one at a time per site (the scheduler's
+>   `group_of`), without blocking other sites. Inside a job gallery-dl sleeps 2–4 s between
+>   requests and 1–2 s between files. Galleries are capped at 500 items.
+> - **Safety switches.** gallery-dl's own config files are ignored (`config.clear()`), and its
+>   console output is off because stdout is the protocol channel. `cookies-update` is off so the
+>   owner's cookies.txt is never rewritten, and paths are Windows-restricted. The opt-in site
+>   login (§6.4) is loaded up front, so a failure reads as "the site login could not be read".
 
 ### M5 — Spotify (spotisaver parity)
 - Isolated spotDL engine env + adapter.

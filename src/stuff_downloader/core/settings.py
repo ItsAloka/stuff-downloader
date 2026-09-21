@@ -8,7 +8,7 @@ import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
-from . import paths
+from . import cookies, paths
 
 SCHEMA_VERSION = 1
 
@@ -21,6 +21,8 @@ class Settings:
     max_concurrent: int = 3
     notifications: bool = True
     tool_paths: dict[str, str] = field(default_factory=dict)
+    # Advanced, empty by default (plan §6.4): site -> {"source": ...}. Choices only, never cookies.
+    site_logins: dict[str, dict[str, str]] = field(default_factory=dict)
     schema_version: int = SCHEMA_VERSION
 
     def effective_download_dir(self) -> Path:
@@ -57,6 +59,7 @@ def load(path: Path | None = None) -> Settings:
     tools = raw.get("tool_paths")
     if isinstance(tools, dict):
         settings.tool_paths = {k: v for k, v in tools.items() if isinstance(v, str)}
+    settings.site_logins = cookies.dump_all(cookies.load_all(raw.get("site_logins")))
     return settings
 
 
