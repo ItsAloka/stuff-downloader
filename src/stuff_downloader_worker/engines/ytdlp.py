@@ -16,6 +16,7 @@ come only from ``STUFF_DOWNLOADER_TOOLS_DIR``, which the runner sets.
 from __future__ import annotations
 
 import base64
+import glob
 import os
 import re
 from pathlib import Path
@@ -87,6 +88,24 @@ _UNAVAILABLE_REASONS = {
     "unlisted": "",
     "public": "",
 }
+
+CLAIM_SUFFIX = ".sdclaim"
+MAX_NAME_TRIES = 1000
+# yt-dlp's own in-progress files. A paused job left them; they must not push its resume to
+# "name (2)". Running jobs are kept apart by their claim file instead.
+_TRANSIENT = re.compile(r"(\.part|\.ytdl|\.part-Frag\d+|\.f[\w-]+\.\w+|\.temp\.\w+)$")
+
+
+def _release(lock: Path) -> None:
+    try:
+        lock.unlink()
+    except OSError:
+        pass
+
+
+def _taken(pattern: str, own: Path | None = None) -> bool:
+    return any(Path(p) != own and not _TRANSIENT.search(p) for p in glob.glob(pattern))
+
 
 # yt-dlp postprocessor names → protocol stages.
 _PP_STAGES = {
@@ -447,6 +466,52 @@ class YtDlpEngine:
         return {"data": base64.b64encode(data).decode("ascii")}
 
     @staticmethod
+    def _claim_name(ydl: Any, info: dict[str, Any]) -> tuple[str, Path] | None:
+        """Reserve a free output stem, ``name`` then ``name (2)``…, and pin yt-dlp to it.
+
+        yt-dlp skips a download whose final file already exists and reports that old file, so
+        a second track with the same "Artist - Title" (or any earlier file) would be tagged and
+        reported as this job's output. An ``O_EXCL`` lock file makes the reservation atomic
+        against the other jobs running in the same folder. Returns ``(stem, lock)`` or ``None``
+        when the plan cannot be made, in which case yt-dlp's own naming is left alone.
+        """
+        try:
+            planned = Path(ydl.prepare_filename(info))
+        except Exception:
+            return None
+        folder, stem = planned.parent, planned.stem
+        if not stem:
+            return None
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+        for n in range(1, MAX_NAME_TRIES + 1):
+            candidate = stem if n == 1 else f"{stem} ({n})"
+            pattern = glob.escape(str(folder / candidate)) + ".*"
+            if _taken(pattern):
+                continue
+            lock = folder / (candidate + CLAIM_SUFFIX)
+            try:
+                os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+            except FileExistsError:
+                continue
+            except OSError:
+                return None
+            # A job that held this name may have finished between the check and the lock.
+            if _taken(pattern, own=lock):
+                _release(lock)
+                continue
+            literal = presets.literal_outtmpl(candidate)
+            outtmpl = ydl.params.get("outtmpl")
+            if isinstance(outtmpl, dict):
+                outtmpl["default"] = literal
+            else:
+                ydl.params["outtmpl"] = literal
+            return candidate, lock
+        raise EngineError("download_error", "too many files with that name in the folder")
+
+    @staticmethod
     def _download(
         ydl: Any,
         info: dict[str, Any],
@@ -470,8 +535,14 @@ class YtDlpEngine:
             )
             return skipped
         stage("downloading")
-        done = ydl.process_ie_result(info, download=True)
-        existing = [p for p in files if Path(p).is_file()]
+        claim = YtDlpEngine._claim_name(ydl, info)
+        try:
+            done = ydl.process_ie_result(info, download=True)
+        finally:
+            if claim:
+                _release(claim[1])
+        # The final files only: after merge/convert, never a leftover part or stream.
+        existing = [p for p in files if Path(p).is_file() and not _TRANSIENT.search(p)]
         if not existing and isinstance(done, dict):
             path = (done.get("requested_downloads") or [{}])[0].get("filepath")
             if path and Path(path).is_file():
@@ -498,7 +569,12 @@ class YtDlpEngine:
                 )
         if request.preset == "mp3_music":
             stage("tagging")
-            mp3s = [p for p in existing if p.lower().endswith(".mp3")]
+            # Only the file this run wrote; never re-tag someone's existing mp3.
+            mp3s = [
+                p
+                for p in existing
+                if p.lower().endswith(".mp3") and (not claim or Path(p).stem == claim[0])
+            ]
             if mp3s:
                 result["tags"] = tagging.verify_mp3(
                     mp3s[0],

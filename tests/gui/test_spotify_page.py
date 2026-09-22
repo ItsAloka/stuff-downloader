@@ -179,7 +179,9 @@ def test_checking_matches_runs_a_few_lookups_at_a_time_and_fills_rows_as_they_la
     qtbot.waitUntil(lambda: len(_match_runs(runs)) == 3)  # a slot freed, the third started
     assert card.cell_text(0, SpotifyCard.MATCH_COLUMN) == "Pitbull - Global Warming  ·  PitbullVEVO"
     assert card.cell_text(0, SpotifyCard.DIFF_COLUMN) == "+3s"
-    assert card.cell_text(0, SpotifyCard.SCORE_COLUMN) == "96%"
+    # Our own score (title, artist, length 3 s off); spotDL's 96% is kept in the tooltip.
+    assert card.cell_text(0, SpotifyCard.SCORE_COLUMN) == "92%"
+    assert "96%" in card.table.item(0, SpotifyCard.SCORE_COLUMN).toolTip()
     # Match lookups are not downloads: no queue rows, nothing in history.
     assert page.jobs == {}
 
@@ -249,7 +251,7 @@ def test_a_new_link_cancels_lookups_and_late_answers_land_nowhere(page, runs, qt
 def test_a_pasted_youtube_link_replaces_the_match(page, runs, qtbot, monkeypatch):
     _analyzed(page, runs, qtbot)
     monkeypatch.setattr(
-        page, "_ask_match_link", lambda t: f"https://music.youtube.com/watch?v={VID2}&si=x"
+        page, "_ask_match", lambda t, c: f"https://music.youtube.com/watch?v={VID2}&si=x"
     )
     page.spotify_card.change_button(1).click()
     assert page._spotify_matches[T2].video_id == VID2 and page._spotify_matches[T2].manual
@@ -267,7 +269,7 @@ def test_a_pasted_youtube_link_replaces_the_match(page, runs, qtbot, monkeypatch
 )
 def test_anything_but_a_single_youtube_video_is_refused(page, runs, qtbot, monkeypatch, text):
     _analyzed(page, runs, qtbot)
-    monkeypatch.setattr(page, "_ask_match_link", lambda t: text)
+    monkeypatch.setattr(page, "_ask_match", lambda t, c: text)
     assert page.change_spotify_match(0) is None
     assert T1 not in page._spotify_matches
     assert "YouTube" in page.message_label.text()
@@ -276,7 +278,7 @@ def test_anything_but_a_single_youtube_video_is_refused(page, runs, qtbot, monke
 def test_a_cancelled_or_empty_override_changes_nothing(page, runs, qtbot, monkeypatch):
     _analyzed(page, runs, qtbot)
     for answer in (None, "   "):
-        monkeypatch.setattr(page, "_ask_match_link", lambda t, a=answer: a)
+        monkeypatch.setattr(page, "_ask_match", lambda t, c, a=answer: a)
         assert page.change_spotify_match(0) is None
     assert page._spotify_matches == {} and page.message_label.isHidden()
 
@@ -284,7 +286,7 @@ def test_a_cancelled_or_empty_override_changes_nothing(page, runs, qtbot, monkey
 def test_a_pasted_link_wins_over_a_lookup_still_running(page, runs, qtbot, monkeypatch):
     _analyzed(page, runs, qtbot)
     page.check_spotify_matches()
-    monkeypatch.setattr(page, "_ask_match_link", lambda t: f"https://youtu.be/{VID2}")
+    monkeypatch.setattr(page, "_ask_match", lambda t, c: f"https://youtu.be/{VID2}")
     page.change_spotify_match(0)
     _match_runs(runs)[0].emit("result", **match_result(T1))
     qtbot.waitUntil(lambda: len(_match_runs(runs)) == 3)
@@ -300,7 +302,7 @@ def test_ticked_songs_queue_as_one_group_carrying_their_reviewed_matches(
     page.check_spotify_matches()
     _match_runs(runs)[0].emit("result", **match_result(T1))
     qtbot.waitUntil(lambda: T1 in page._spotify_matches)
-    monkeypatch.setattr(page, "_ask_match_link", lambda t: f"https://youtu.be/{VID2}")
+    monkeypatch.setattr(page, "_ask_match", lambda t, c: f"https://youtu.be/{VID2}")
     page.change_spotify_match(2)
 
     jobs = page.start_spotify_download()
@@ -383,6 +385,13 @@ def test_tooltips_show_uploader_text_literally(page, runs, qtbot):
     [
         ("ERROR: unable to download video data: HTTP Error 403: Forbidden", True),
         ("ERROR: [youtube] abc: HTTP Error 403: Forbidden (private video)", False),
+        ("ERROR: [youtube] abc: Unable to download webpage: HTTP Error 403: Forbidden", False),
+        ("ERROR: fragment 3: HTTP Error 403: Forbidden", True),
+        ("ERROR: [generic] page#fragment: Unable to download webpage: HTTP Error 403", False),
+        ("ERROR: HTTP Error 403: Forbidden (fragment of a private page)", False),
+        ("ERROR: fragment 12 not found, unable to continue", True),
+        ("ERROR: Did not get any data blocks", True),
+        ("ERROR: unable to download webpage: HTTP Error 503", True),
         ("http error 404: that track was not found", False),
     ],
 )

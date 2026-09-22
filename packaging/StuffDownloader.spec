@@ -6,7 +6,11 @@
 # Engines (yt-dlp, gallery-dl, spotDL) and the worker package are never frozen in: workers run in
 # the separate engine runtime (core/runner.py), never by re-running this exe.
 
+import importlib.util
+import sys
 from pathlib import Path
+
+from PyInstaller.utils.hooks import copy_metadata
 
 ROOT = Path(SPECPATH).parent
 SRC = ROOT / "src"
@@ -19,18 +23,42 @@ ENTRY.write_text(
 )
 
 # The GUI shells out to ffmpeg/ffprobe (merge, transcode, cover art) and resolves them through
-# core.tools.app_tools_dir(), which is `<exe dir>\tools` when frozen. Without this the build
-# produces an app that launches, self-tests and then cannot finish a single real download --
-# verified: before this was here, a frozen --self-test reported all three tools "not found".
+# core.tools.app_tools_dir(), which is `<exe dir>\tools` when frozen. Without them the build
+# produces an app that launches, self-tests and then cannot finish a single real download.
 #
-# This copies whatever is in the repo's git-ignored tools\ folder. Plan §8 wants them fetched
-# from official URLs pinned by SHA-256 by packaging/fetch_tools.py, which does not exist yet;
-# writing it, and the licence audit in §8.3, are M6 gates before anything is distributed.
+# The repo's git-ignored tools\ folder is filled by packaging/fetch_tools.py from official URLs
+# pinned by SHA-256. The build takes only the pinned files, and only after every one of them
+# matches its pin: a missing or altered tool stops the build instead of shipping it.
 TOOLS_DIR = ROOT / "tools"
-TOOL_FILES = sorted(TOOLS_DIR.glob("*.exe")) if TOOLS_DIR.is_dir() else []
-if not TOOL_FILES:
-    # Loud, not silent: a toolless build is the failure mode this block exists to prevent.
-    print("WARNING: no tools found in tools\\ -- the built app will not be able to convert media")
+_fetch_spec = importlib.util.spec_from_file_location("fetch_tools", ROOT / "packaging" / "fetch_tools.py")
+fetch_tools = importlib.util.module_from_spec(_fetch_spec)
+sys.modules["fetch_tools"] = fetch_tools  # dataclasses look their module up here
+_fetch_spec.loader.exec_module(fetch_tools)
+try:
+    fetch_tools.verify_staged(TOOLS_DIR)
+except fetch_tools.ToolError as exc:
+    raise SystemExit(f"ERROR: {exc}") from None
+# The licence texts go with them (tools\licenses), as FFmpeg's GPLv3 requires (§8.3 F3).
+TOOL_DATAS = [
+    (str(TOOLS_DIR / relative), str(Path("tools", relative).parent))
+    for relative in fetch_tools.STAGED
+]
+
+# The app icon, and the licence texts the About dialog opens (stuff_downloader.data_root()).
+RESOURCES = SRC / "stuff_downloader" / "resources"
+ICON = RESOURCES / "app.ico"
+# The app icon plus the theme's PNGs (combo arrow, check mark), which gui/theme.py loads.
+APP_DATAS = [
+    (str(path), "resources")
+    for path in sorted({*RESOURCES.glob("app.*"), *RESOURCES.glob("*.png")})
+    if path.is_file()
+]
+for name in ("LICENSE", "THIRD_PARTY_LICENSES.txt"):
+    if not (ROOT / name).is_file():
+        raise SystemExit(f"{name} is missing: a build must ship its licence texts")
+    APP_DATAS.append((str(ROOT / name), "."))
+# dist-info, so the About dialog reads the release version from metadata rather than a fallback.
+APP_DATAS += copy_metadata("stuff-downloader")
 
 ENGINE_EXCLUDES = [
     "stuff_downloader_worker",
@@ -46,7 +74,7 @@ a = Analysis(
     [str(ENTRY)],
     pathex=[str(SRC)],
     binaries=[],
-    datas=[(str(path), "tools") for path in TOOL_FILES],
+    datas=TOOL_DATAS + APP_DATAS,
     hiddenimports=["stuff_downloader.app"],
     hookspath=[],
     runtime_hooks=[],
@@ -65,6 +93,7 @@ exe = EXE(
     debug=False,
     strip=False,
     upx=False,
+    icon=str(ICON),
 )
 
 coll = COLLECT(

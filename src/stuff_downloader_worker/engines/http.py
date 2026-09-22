@@ -22,6 +22,7 @@ code and a fixed vocabulary, so a signed link cannot reach the log or history.
 
 from __future__ import annotations
 
+import base64
 import http.client
 import ipaddress
 import json
@@ -38,6 +39,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urljoin, urlsplit
 
+from ..names import safe_output_name
 from ..protocol import JobSpec
 from .base import Emit, EngineError
 
@@ -58,6 +60,9 @@ MEDIA_EXTENSIONS = frozenset(
         ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp",
     }
 )  # fmt: skip
+IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp"})
+MAX_PREVIEW_BYTES = 5 * 1024 * 1024
+PREVIEW_SECONDS = 15.0
 _GENERIC_TYPES = frozenset({"application/octet-stream", "binary/octet-stream", ""})
 _NON_PUBLIC_SUFFIXES = (".local", ".internal", ".localhost", ".home.arpa", ".lan", ".test")
 
@@ -336,6 +341,34 @@ def _range_start(resp: http.client.HTTPResponse) -> int | None:
 
 
 # ── engine ─────────────────────────────────────────────────────────────────────────────────
+
+def _image_preview(url: str, emit: Emit) -> bytes | None:
+    """The image itself for the analyze preview: same URL checks, ≤5 MB, ≤15 s, or nothing.
+
+    The GUI decodes it with its own pixel cap; a failure here only costs the preview.
+    """
+    deadline = time.monotonic() + PREVIEW_SECONDS
+    try:
+        conn, resp, _ = open_url(url)
+        try:
+            if resp.status != 200:
+                return None
+            chunks, size = [], 0
+            while size <= MAX_PREVIEW_BYTES:
+                if time.monotonic() > deadline:
+                    return None
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+        finally:
+            conn.close()
+    except (EngineError, OSError, http.client.HTTPException) as exc:
+        emit("log", {"level": "warning", "message": f"image preview failed: {type(exc).__name__}"})
+        return None
+    return b"".join(chunks) if 0 < size <= MAX_PREVIEW_BYTES else None
+
 class HttpEngine:
     name = "http"
 
@@ -348,8 +381,14 @@ class HttpEngine:
             return self._analyze(job.url, emit)
         if mode != "download":
             raise EngineError("bad_options", f"unknown mode {mode!r}")
-        if set(opts) - {"mode", "preset"} or opts.get("preset") != PRESET_ID:
+        from ..image_convert import IMAGE_OPTION_KEYS, parse_image_options  # (import cycle)
+
+        allowed = {"mode", "preset", "output_name"} | IMAGE_OPTION_KEYS
+        if set(opts) - allowed or opts.get("preset") != PRESET_ID:
             raise EngineError("bad_options", "the direct engine takes only preset=original_file")
+        if "output_name" in opts and not isinstance(opts["output_name"], str):
+            raise EngineError("bad_options", "'output_name' must be a string")
+        parse_image_options(opts)  # refused before any request
         return self._download(job, emit)
 
     def _analyze(self, url: str, emit: Emit) -> dict[str, Any]:
@@ -380,6 +419,11 @@ class HttpEngine:
         }
         if total is not None:
             info["filesize"] = total
+        is_image = ext.lower() in IMAGE_EXTENSIONS or ctype.startswith("image/")
+        if is_image and (total is None or total <= MAX_PREVIEW_BYTES):
+            preview = _image_preview(url, emit)
+            if preview is not None:
+                info["thumbnail"] = {"data": base64.b64encode(preview).decode("ascii")}
         return info
 
     def _download(self, job: JobSpec, emit: Emit) -> dict[str, Any]:
@@ -392,6 +436,9 @@ class HttpEngine:
             if resp.status not in (200, 206):
                 raise http_error(resp.status, resp.reason)
             name = file_name(final, resp)
+            chosen = safe_output_name(job.options.get("output_name"))
+            if chosen:
+                name = chosen + Path(name).suffix
             if not is_media(name, _content_type(resp)):
                 raise EngineError("unsupported", "unsupported url: that link is not a media file")
         finally:
@@ -420,7 +467,7 @@ class HttpEngine:
                 # The part may already be the whole file; otherwise start clean next time.
                 match = re.search(r"/(\d+)$", resp.getheader("Content-Range") or "")
                 if match and int(match.group(1)) == offset:
-                    return self._finish(folder, name, part, meta_path, offset, emit)
+                    return self._finish(folder, name, part, meta_path, emit, job.options)
                 part.unlink(missing_ok=True)
                 raise EngineError("download_error", "the partial file no longer matches; retry")
             if resp.status not in (200, 206):
@@ -440,7 +487,7 @@ class HttpEngine:
         size = part.stat().st_size
         if total is not None and size != total:
             raise EngineError("download_error", "connection reset: the file arrived incomplete")
-        return self._finish(folder, name, part, meta_path, size, emit)
+        return self._finish(folder, name, part, meta_path, emit, job.options)
 
     @staticmethod
     def _stream(
@@ -466,19 +513,32 @@ class HttpEngine:
 
     @staticmethod
     def _finish(
-        folder: Path, name: str, part: Path, meta_path: Path, size: int, emit: Emit
+        folder: Path,
+        name: str,
+        part: Path,
+        meta_path: Path,
+        emit: Emit,
+        options: dict[str, Any],
     ) -> dict[str, Any]:
         final = move_into_place(part, folder, name)
         meta_path.unlink(missing_ok=True)
+        from ..image_convert import finish_images, parse_image_options  # (import cycle)
+
+        fmt, background = parse_image_options(options)
+        (final_name,), notes = finish_images([str(final)], fmt, background, emit)
+        final = Path(final_name)  # the converted file when there was a conversion
         emit("stage", {"stage": "completed"})
         stem = os.path.splitext(final.name)[0]
-        return {
+        result: dict[str, Any] = {
             "title": stem,
             "extractor": "Direct file",
             "preset": PRESET_ID,
             "files": [str(final)],
-            "total_bytes": size,
+            "total_bytes": final.stat().st_size,
         }
+        if notes:
+            result["notes"] = notes
+        return result
 
 
 def progress(done: int, total: int | None, offset: int, elapsed: float) -> dict[str, Any]:

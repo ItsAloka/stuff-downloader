@@ -19,7 +19,8 @@ from __future__ import annotations
 
 import re
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from difflib import SequenceMatcher
 from typing import Any
 
 from .protocol import JobSpec
@@ -32,6 +33,18 @@ MAX_TEXT = 300
 MAX_ARTISTS = 20
 MAX_DURATION = 24 * 3600  # seconds; anything longer is not a song
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+
+MAX_CANDIDATES = 8
+
+# A match is "uncertain" (item 9) when our score is under UNCERTAIN_SCORE or the recording's
+# length is off by more than UNCERTAIN_DIFF seconds. Both are shown to the owner, verbatim.
+UNCERTAIN_SCORE = 70.0
+UNCERTAIN_DIFF = 10.0
+UNCERTAIN_RULE = (
+    f"score under {UNCERTAIN_SCORE:.0f}% or length off by more than {UNCERTAIN_DIFF:.0f} s"
+)
+_FEAT = re.compile(r"[\(\[]\s*(feat|ft|with)\.?\s[^\)\]]*[\)\]]|\s(feat|ft)\.?\s.*$", re.I)
+_NON_WORD = re.compile(r"[^\w]+")
 
 OVERRIDE_INVALID_REASON = "Paste a YouTube or YouTube Music link to a single song."
 
@@ -92,11 +105,96 @@ class Match:
     duration: float | None = None
     duration_diff: float | None = None  # match minus Spotify, seconds; None when either is unknown
     confidence: float | None = None  # spotDL's score, 0-100; None when it gave none
-    manual: bool = False  # the owner pasted this link
+    manual: bool = False  # the owner chose this one (pasted, or picked from the candidates)
+    score: float | None = None  # our own score (match_score); None for a pasted link
+    candidates: tuple[Candidate, ...] = ()
 
     @property
     def url(self) -> str:
         return f"https://music.youtube.com/watch?v={self.video_id}"
+
+
+@dataclass(frozen=True)
+class Candidate:
+    """One YouTube Music result the owner may pick instead of the automatic match."""
+
+    video_id: str
+    title: str = ""
+    channel: str = ""
+    duration: float | None = None
+
+
+def _norm(text: str) -> str:
+    """Lower-case words only, without a "(feat. X)" part: what two titles are compared on."""
+    return " ".join(_NON_WORD.sub(" ", _FEAT.sub(" ", text or "").casefold()).split())
+
+
+def match_score(track: SpotifyTrack, title: str, channel: str, duration: float | None) -> float:
+    """How sure we are that a YouTube result is ``track``: 0-100.
+
+    50 for the title (similarity after ignoring "feat." parts and punctuation), 25 when one of
+    Spotify's artists appears in the channel or the title, 25 for the length (full at 0 s off,
+    nothing at 30 s or more; half when a length is unknown).
+    """
+    want = _norm(track.title)
+    got = _norm(title)
+    title_part = SequenceMatcher(None, want, got).ratio() if want and got else 0.0
+    if want and got and (f" {want} " in f" {got} "):
+        title_part = max(title_part, 0.9)  # "Song (Official Audio)" is still the song
+    where = f" {_norm(channel)} {got} "
+    artists = [_norm(a) for a in track.artists if _norm(a)]
+    artist_part = 1.0 if any(f" {a} " in where for a in artists) else 0.0
+    diff = duration_diff(duration, track.duration)
+    length_part = 0.5 if diff is None else max(0.0, 1 - min(abs(diff), 30.0) / 30.0)
+    return round(50 * title_part + 25 * artist_part + 25 * length_part, 1)
+
+
+def is_uncertain(match: Match) -> bool:
+    """A match to check before downloading. A link the owner chose is never flagged."""
+    if match.manual:
+        return False
+    if match.duration_diff is not None and abs(match.duration_diff) > UNCERTAIN_DIFF:
+        return True
+    return match.score is not None and match.score < UNCERTAIN_SCORE
+
+
+def parse_candidates(data: Any, track: SpotifyTrack) -> tuple[Candidate, ...]:
+    """The worker's alternatives, validated; hostile or malformed rows are dropped."""
+    raw = data.get("candidates") if isinstance(data, dict) else None
+    out: list[Candidate] = []
+    seen: set[str] = set()
+    for row in raw if isinstance(raw, list) else []:
+        if len(out) >= MAX_CANDIDATES:
+            break
+        if not isinstance(row, dict):
+            continue
+        video_id = row.get("video_id")
+        if not isinstance(video_id, str) or not VIDEO_ID.fullmatch(video_id) or video_id in seen:
+            continue
+        seen.add(video_id)
+        out.append(
+            Candidate(
+                video_id=video_id,
+                title=_text(row.get("title")),
+                channel=_text(row.get("channel")),
+                duration=_seconds(row.get("duration")),
+            )
+        )
+    return tuple(out)
+
+
+def candidate_match(candidate: Candidate, track: SpotifyTrack) -> Match:
+    """The owner picked this alternative: it becomes the row's match, scored like any other."""
+    return Match(
+        track_id=track.track_id,
+        video_id=candidate.video_id,
+        title=candidate.title,
+        channel=candidate.channel,
+        duration=candidate.duration,
+        duration_diff=duration_diff(candidate.duration, track.duration),
+        score=match_score(track, candidate.title, candidate.channel, candidate.duration),
+        manual=True,
+    )
 
 
 def parse_track(raw: Any, index: int) -> SpotifyTrack | None:
@@ -172,15 +270,20 @@ def parse_match(data: Any, track: SpotifyTrack) -> Match | None:
         confidence = None
     else:
         confidence = round(max(0.0, min(float(confidence), 100.0)), 1)
+    title = _text(data.get("title"))
+    channel = _text(data.get("channel"))
     return Match(
         track_id=track.track_id,
         video_id=video_id,
-        title=_text(data.get("title")),
-        channel=_text(data.get("channel")),
+        title=title,
+        channel=channel,
         duration=duration,
         # Recomputed here from the two durations core trusts, never taken from the payload.
         duration_diff=duration_diff(duration, track.duration),
         confidence=confidence,
+        # Our own score, computed here too: the worker's number is never the verdict.
+        score=match_score(track, title, channel, duration),
+        candidates=parse_candidates(data, track),
     )
 
 
@@ -199,6 +302,11 @@ def override_match(text: str, track: SpotifyTrack) -> Match:
     if r.kind != "youtube" or not VIDEO_ID.fullmatch(r.video_id):
         raise ValueError(OVERRIDE_INVALID_REASON)
     return Match(track_id=track.track_id, video_id=r.video_id, manual=True)
+
+
+def with_candidates(match: Match, candidates: tuple[Candidate, ...]) -> Match:
+    """Keep the looked-up alternatives when the owner overrides the match."""
+    return replace(match, candidates=candidates) if candidates else match
 
 
 # ── job specs ─────────────────────────────────────────────────────────────────────────────

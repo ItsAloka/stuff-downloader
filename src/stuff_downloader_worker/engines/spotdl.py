@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import os
 import re
+import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
@@ -125,7 +126,13 @@ def safe_text(value: Any) -> str:
     """Bounded, single-line, URL-free text from Spotify or YouTube metadata."""
     if not isinstance(value, str):
         return ""
-    return _URL.sub("[link]", " ".join(value.split()))[:MAX_TEXT]
+    # Control and format characters (NUL, bidi overrides that reorder what the owner reads)
+    # are dropped before anything else.
+    # Whitespace controls (tab, newline) are kept here; split() below turns them into spaces.
+    visible = "".join(
+        c for c in value if c.isspace() or unicodedata.category(c) not in ("Cc", "Cf")
+    )
+    return _URL.sub("[link]", " ".join(visible.split()))[:MAX_TEXT]
 
 
 def describe_error(exc: BaseException) -> tuple[str, str]:
@@ -290,6 +297,37 @@ def pick_song(results: Any, fields: dict[str, Any]) -> dict[str, Any] | None:
                 },
             )
     return best[1] if best else None
+
+
+MAX_CANDIDATES = 8
+
+
+def candidate_rows(results: Any) -> list[dict[str, Any]]:
+    """Up to MAX_CANDIDATES song results for the owner to choose from: ids and plain text only."""
+    rows: list[dict[str, Any]] = []
+    for raw in results[:50] if isinstance(results, list) else []:
+        if len(rows) >= MAX_CANDIDATES:
+            break
+        if not isinstance(raw, dict) or raw.get("resultType") not in (None, "song"):
+            continue
+        video_id = raw.get("videoId")
+        if not isinstance(video_id, str) or not VIDEO_ID.fullmatch(video_id):
+            continue
+        if any(row["video_id"] == video_id for row in rows):
+            continue
+        length = raw.get("duration_seconds")
+        artists = [a.get("name") for a in raw.get("artists") or [] if isinstance(a, dict)]
+        rows.append(
+            {
+                "video_id": video_id,
+                "title": safe_text(raw.get("title")),
+                "channel": ", ".join(safe_text(a) for a in artists if a),
+                "duration": float(length)
+                if isinstance(length, int | float) and not isinstance(length, bool) and length > 0
+                else None,
+            }
+        )
+    return rows
 
 
 def search_songs(fields: dict[str, Any]) -> list[Any]:
@@ -529,13 +567,19 @@ class SpotDlEngine:
         return Song.from_missing_data(**fields), fields
 
     @staticmethod
-    def _search(song: Any, fields: dict[str, Any], emit: Emit) -> dict[str, Any] | None:
+    def _search(
+        song: Any, fields: dict[str, Any], emit: Emit, candidates: list | None = None
+    ) -> dict[str, Any] | None:
         """The match: a YouTube Music song first, spotDL's own pick only when no song fits.
 
         Returns {video_id, title, channel, duration, score}, or None when nothing was found.
+        The song search's results are also appended to ``candidates`` when one is given.
         """
         try:
-            picked = pick_song(search_songs(fields), fields)
+            results = search_songs(fields)
+            if candidates is not None:
+                candidates.extend(candidate_rows(results))
+            picked = pick_song(results, fields)
         except Exception:  # the fallback below still gets its turn
             emit("log", {"level": "warning", "message": "YouTube Music song search failed"})
             picked = None
@@ -583,7 +627,8 @@ class SpotDlEngine:
     def _match(self, client: Any, track_id: str, emit: Emit) -> dict[str, Any]:
         emit("stage", {"stage": "analyzing"})
         song, fields = self._song(client, track_id)
-        found = self._search(song, fields, emit)
+        candidates: list[dict[str, Any]] = []
+        found = self._search(song, fields, emit, candidates)
         if found is None:
             raise EngineError("no_match", "No matching song was found on YouTube Music.")
         emit("stage", {"stage": "completed"})
@@ -596,6 +641,8 @@ class SpotDlEngine:
             "duration": found["duration"],
             "confidence": found["score"],
             "spotify_duration": fields["duration"],
+            # The other results, so a wrong pick can be swapped without a pasted link.
+            "candidates": [c for c in candidates if c["video_id"] != found["video_id"]],
         }
 
     # ── download ──────────────────────────────────────────────────────────────────────────

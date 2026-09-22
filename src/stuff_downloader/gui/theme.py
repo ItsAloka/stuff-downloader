@@ -8,6 +8,14 @@ from __future__ import annotations
 
 from PyQt6.QtWidgets import QWidget
 
+from .. import resource_path
+
+
+def _image(name: str) -> str:
+    # QSS url() wants forward slashes, also on Windows.
+    return resource_path(name).as_posix()
+
+
 BG = "#1c1c1f"
 SIDEBAR = "#161618"
 SURFACE = "#26262a"
@@ -24,7 +32,11 @@ DANGER = "#ff8a80"
 
 STYLE = f"""
 * {{ font-family: "Segoe UI Variable Text", "Segoe UI", sans-serif; font-size: 10pt; }}
-QMainWindow, QWidget#central, QStackedWidget, QWidget#page {{ background: {BG}; color: {TEXT}; }}
+QMainWindow, QWidget#central, QStackedWidget, QWidget#page, QDialog {{
+    background: {BG}; color: {TEXT}; }}
+/* The scrolling page body: without this its viewport paints Qt's light default palette. */
+QScrollArea#pageScroll, QScrollArea#pageScroll > QWidget#qt_scrollarea_viewport,
+QWidget#pageContent {{ background: {BG}; border: none; }}
 QLabel {{ color: {TEXT}; background: transparent; }}
 
 /* Sidebar */
@@ -44,6 +56,7 @@ QLabel#pageTitle {{ font-family: "Segoe UI Variable Display", "Segoe UI", sans-s
 QLabel#pageSubtitle {{ color: {TEXT_DIM}; font-size: 10pt; }}
 QLabel#sectionTitle {{ font-size: 11pt; font-weight: 600; padding-top: 6px; }}
 QLabel#muted {{ color: {TEXT_DIM}; }}
+QLabel#warning {{ color: {WARNING}; }}
 QFrame#card {{ background: {SURFACE}; border: 1px solid {BORDER}; border-radius: 10px; }}
 QFrame#emptyState {{ background: transparent; border: 1px dashed {BORDER}; border-radius: 10px; }}
 
@@ -51,6 +64,7 @@ QFrame#emptyState {{ background: transparent; border: 1px dashed {BORDER}; borde
 QLineEdit {{ background: {BG}; color: {TEXT}; border: 1px solid {BORDER}; border-radius: 8px;
              padding: 8px 12px; selection-background-color: {ACCENT};
              selection-color: {ACCENT_TEXT}; }}
+QLineEdit#cellEdit {{ padding: 2px 6px; border-radius: 4px; }}
 QLineEdit:focus {{ border: 1px solid {ACCENT}; border-bottom: 2px solid {ACCENT}; }}
 QLineEdit#urlEdit {{ font-size: 11pt; padding: 11px 14px; }}
 QLineEdit[readOnly="true"] {{ color: {TEXT_DIM}; }}
@@ -92,12 +106,44 @@ QLabel#chip[state="skipped"] {{ background: #1c3a1a; color: {SUCCESS}; }}
 QLabel#chip[state="ok"] {{ background: #1c3a1a; color: {SUCCESS}; }}
 QLabel#chip[state="missing"] {{ background: #45201e; color: {DANGER}; }}
 
+/* Pickers: without these, Windows' light defaults show white boxes and black text here. */
+QCheckBox {{ color: {TEXT}; background: transparent; spacing: 6px; }}
+QComboBox {{ background: {BG}; color: {TEXT}; border: 1px solid {BORDER}; border-radius: 6px;
+             padding: 5px 10px; }}
+QComboBox:disabled {{ color: #7a7a82; background: {SURFACE}; border-color: {SURFACE}; }}
+QComboBox::drop-down {{ border: none; width: 22px; }}
+QComboBox::down-arrow {{ image: url({_image("chevron-down.png")}); width: 10px; height: 6px; }}
+QComboBox::down-arrow:disabled {{ image: url({_image("chevron-down-disabled.png")}); }}
+QCheckBox::indicator, QTableWidget::indicator {{ width: 14px; height: 14px; border-radius: 3px;
+                                                 border: 1px solid {TEXT_DIM};
+                                                 background: {BG}; }}
+QCheckBox::indicator:checked, QTableWidget::indicator:checked {{
+    background: {ACCENT}; border-color: {ACCENT}; image: url({_image("check.png")}); }}
+QCheckBox::indicator:disabled {{ border-color: {BORDER}; background: {SURFACE}; }}
+QComboBox QAbstractItemView {{ background: {SURFACE}; color: {TEXT}; border: 1px solid {BORDER};
+                               selection-background-color: {SURFACE_HOVER};
+                               selection-color: {TEXT}; outline: none; }}
+
+/* Gallery tiles */
+QListWidget#galleryGrid {{ background: {SURFACE}; color: {TEXT}; border: 1px solid {BORDER};
+                          border-radius: 10px; outline: none; }}
+QListWidget#galleryGrid::item {{ color: {TEXT}; border-radius: 6px; padding: 4px; }}
+QListWidget#galleryGrid::item:hover {{ background: {SURFACE_HOVER}; }}
+QListWidget#galleryGrid::item:selected {{ background: {SURFACE_HOVER}; color: {TEXT}; }}
+QListWidget#galleryGrid::indicator {{ width: 14px; height: 14px; border-radius: 3px;
+                                      border: 1px solid {TEXT_DIM}; background: {BG}; }}
+QListWidget#galleryGrid::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT};
+                                              image: url({_image("check.png")}); }}
+
 /* Tables */
 QTableWidget {{ background: {SURFACE}; color: {TEXT}; border: 1px solid {BORDER};
                 border-radius: 10px;
                 gridline-color: transparent; selection-background-color: {SURFACE_HOVER};
                 selection-color: {TEXT}; }}
 QTableWidget::item {{ padding: 8px; border-bottom: 1px solid {BORDER}; }}
+/* Item padding also shrinks cell widgets; keep only the horizontal part where rows hold editors. */
+QTableWidget#playlistTable::item, QTableWidget#spotifyTable::item {{ padding: 0px 8px; }}
+QTableWidget#matchTable::item:selected {{ background: #133247; color: {TEXT}; }}
 QHeaderView::section {{ background: {SURFACE}; color: {TEXT_DIM}; border: none;
                         border-bottom: 1px solid {BORDER}; padding: 8px; font-weight: 600; }}
 

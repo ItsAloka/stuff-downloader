@@ -67,14 +67,18 @@ def test_a_playlist_title_alone_is_refused_and_a_huge_one_is_rejected():
 
 
 # ── paths ────────────────────────────────────────────────────────────────────────────────
-def test_track_numbers_are_padded_to_the_playlist_size():
+def test_playlist_music_names_have_no_track_number_prefix():
     assert presets.track_prefix(7, 24) == "07 - "
     assert presets.track_prefix(7, 500) == "007 - "
     assert presets.track_prefix(7, None) == "07 - "
     request = presets.parse_request(
         options(playlist_index=7, playlist_count=24, playlist_title="Chill")
     )
-    assert presets.build_ydl_opts(request, "C:/dl")["outtmpl"].startswith("07 - ")
+    opts = presets.build_ydl_opts(request, "C:/dl")
+    assert opts["outtmpl"] == presets.MUSIC_OUTTMPL
+    assert not opts["outtmpl"].startswith("07 - ")
+    assert request.playlist_index == 7 and request.playlist_count == 24
+    assert any(pp["key"] == "FFmpegMetadata" for pp in opts["postprocessors"])
 
 
 @pytest.mark.parametrize(

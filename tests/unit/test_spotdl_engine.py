@@ -595,3 +595,36 @@ print(json.dumps({
     assert got["APIC"] == [cover.hex()]  # YouTube's cover is gone, not kept alongside
     assert got["TSRC"] is False  # the free client gives no ISRC, so none is invented
     assert got["report"]["cover"] == {"width": 1, "height": 1}
+
+
+# ── candidates for the owner's Change… dialog (item 9) ────────────────────────────────────
+def test_a_match_lists_the_other_song_results_as_candidates(fake_spotdl):
+    fake_spotdl["songs"] = [
+        ytm_song("qjgnkysCPm4", "Global Warming (feat. Sensato)", ["Pitbull", "Sensato"], 85),
+        ytm_song("otherVideo1", "Global Warming (Live)", ["Pitbull"], 190),
+        ytm_song("otherVideo1", "duplicate", ["Pitbull"], 190),
+        {"resultType": "video", "videoId": "videoOnly11", "title": "MV"},
+        {"resultType": "song", "videoId": "bad id!", "title": "x"},
+    ]
+    result, _ = _run({"mode": "match"})
+    assert result["video_id"] == "qjgnkysCPm4"
+    assert result["candidates"] == [
+        {"video_id": "otherVideo1", "title": "Global Warming (Live)", "channel": "Pitbull",
+         "duration": 190.0},
+    ]  # the pick itself, videos, duplicates and bad ids are not repeated
+
+
+def test_candidates_survive_the_spotdl_fallback(fake_spotdl):
+    fake_spotdl["songs"] = [ytm_song("otherVideo1", "Some Other Song", ["Pitbull"], 85)]
+    result, _ = _run({"mode": "match"})
+    assert result["video_id"] == VID  # spotDL's pick
+    assert [c["video_id"] for c in result["candidates"]] == ["otherVideo1"]
+
+
+def test_candidate_rows_are_capped_and_plain():
+    rows = engine.candidate_rows(
+        [ytm_song(f"{i:011d}", f"Song {i}\x00‮", ["A"], 100) for i in range(30)]
+    )
+    assert len(rows) == engine.MAX_CANDIDATES
+    assert "\x00" not in rows[0]["title"] and "‮" not in rows[0]["title"]
+    assert engine.candidate_rows("not a list") == []

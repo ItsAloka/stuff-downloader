@@ -1,0 +1,250 @@
+Stuff Downloader - third-party licences
+=======================================
+
+Licence audit for plan.md section 8.3. Audited 2026-09-22 from the installed package metadata
+of every pinned environment, the bundled tool builds (tools/SOURCES.txt) and the frozen onedir
+build (dist/StuffDownloader). Nothing has been distributed. This file records what would apply
+if the app ever is.
+
+tests/unit/test_third_party_licenses.py keeps the package sections below in step with the lock
+files: a package added, removed or re-pinned without updating this file fails the suite.
+
+
+1. How the pieces are combined (the licensing boundary)
+--------------------------------------------------------
+
+There are three separate kinds of program. None is linked into another.
+
+  a. The GUI: StuffDownloader.exe, a PyInstaller onedir build of src/stuff_downloader with
+     PyQt6. PyInstaller excludes every engine package (packaging/StuffDownloader.spec,
+     ENGINE_EXCLUDES), and tests/unit/test_third_party_licenses.py fails if the GUI package imports
+     one. Checked 2026-09-22: dist/StuffDownloader/_internal contains no yt_dlp, gallery_dl,
+     spotdl, mutagen or curl_cffi.
+
+  b. The engine workers: one virtualenv per engine under the app-managed CPython runtime
+     (%LOCALAPPDATA%\StuffDownloader\runtime). The GUI starts each worker as a child process and
+     talks to it only through JSON lines on stdin and stdout (core/runner.py). Each worker imports
+     its own engine and the project's stuff_downloader_worker package.
+
+  c. The command-line tools: ffmpeg.exe, ffprobe.exe and deno.exe, run as child processes.
+
+Conclusions:
+  - Keeping the processes separate means PyQt6 (GPL-3.0-only) never has to share one program with
+    gallery-dl (GPL-2.0-only). That is the incompatible pair plan 8.3 warned about, and the design
+    avoids it.
+  - Each worker environment, however, is one combined program: the engine plus
+    stuff_downloader_worker plus its dependencies. See section 5 for the obligations this creates.
+
+
+2. GUI application (requirements.lock, frozen into StuffDownloader.exe)
+------------------------------------------------------------------------
+
+[requirements.lock]
+psutil==7.2.2              BSD-3-Clause
+pyqt6==6.11.0              GPL-3.0-only (Riverbank Computing; commercial licence also offered)
+pyqt6-qt6==6.11.2          LGPL-3.0 (Qt 6 libraries, dynamically linked DLLs in the onedir build)
+pyqt6-sip==13.12.0         BSD-2-Clause
+[end]
+
+Also frozen into the onedir build:
+  CPython 3.11.9 (python311.dll, stdlib)   PSF-2.0
+  OpenSSL 3.0.13 (libcrypto-3.dll)         Apache-2.0
+  SQLite 3.45.1 (sqlite3.dll)              Public domain
+  libffi (libffi-8.dll)                    MIT
+  bzip2 / xz (in _bz2.pyd / _lzma.pyd)     bzip2-1.0.6 / public domain (0BSD)
+  Microsoft VC++ runtime (VCRUNTIME140*)   Microsoft Visual C++ Redistributable licence
+  PyInstaller 6.22.3 bootloader            GPL-2.0-or-later with the bootloader exception, which
+                                           allows distributing the built exe under any licence
+
+
+3. Engine runtime
+-----------------
+
+Base interpreter: CPython 3.11.16 (app-managed runtime\python)   PSF-2.0
+
+[packaging/engine-requirements/ytdlp.txt]
+brotli==1.2.0              MIT
+certifi==2026.7.22         MPL-2.0
+cffi==2.1.1                MIT-0
+charset-normalizer==3.5.1  MIT
+curl-cffi==0.16.3          MIT (bundles libcurl-impersonate: curl licence, MIT-style)
+idna==3.19                 BSD-3-Clause
+mutagen==1.48.1            GPL-2.0-or-later
+pycparser==3.0             BSD-3-Clause
+pycryptodomex==3.23.0      BSD-2-Clause and public domain
+requests==2.34.2           Apache-2.0
+urllib3==2.7.0             MIT
+websockets==17.1           BSD-3-Clause
+yt-dlp==2026.8.19          Unlicense
+yt-dlp-ejs==0.8.0          Unlicense AND MIT AND ISC
+[end]
+
+[packaging/engine-requirements/ytdlp-previous.txt]
+brotli==1.2.0              MIT
+certifi==2026.7.22         MPL-2.0
+cffi==2.1.1                MIT-0
+charset-normalizer==3.5.1  MIT
+curl-cffi==0.15.0          MIT (bundles libcurl-impersonate: curl licence, MIT-style)
+idna==3.19                 BSD-3-Clause
+markdown-it-py==4.2.0      MIT
+mdurl==0.1.2               MIT
+mutagen==1.48.1            GPL-2.0-or-later
+pycparser==3.0             BSD-3-Clause
+pycryptodomex==3.23.0      BSD-2-Clause and public domain
+pygments==2.21.0           BSD-2-Clause
+requests==2.34.2           Apache-2.0
+rich==15.0.0               MIT
+urllib3==2.7.0             MIT
+websockets==17.1           BSD-3-Clause
+yt-dlp==2026.7.4           Unlicense
+yt-dlp-ejs==0.8.0          Unlicense AND MIT AND ISC
+[end]
+
+[packaging/engine-requirements/gallerydl.txt]
+certifi==2026.7.22         MPL-2.0
+charset-normalizer==3.5.1  MIT
+gallery-dl==1.32.13        GPL-2.0-only
+idna==3.20                 BSD-3-Clause
+requests==2.34.2           Apache-2.0
+urllib3==2.8.0             MIT
+[end]
+
+[packaging/engine-requirements/spotdl.txt]
+annotated-types==0.8.0     MIT
+anyio==3.7.1               MIT
+async-timeout==5.0.1       Apache-2.0
+beautifulsoup4==4.15.0     MIT
+brotli==1.2.0              MIT
+certifi==2026.7.22         MPL-2.0
+cffi==2.1.1                MIT-0
+charset-normalizer==3.5.1  MIT
+click==8.5.0               BSD-3-Clause
+colorama==0.4.6            BSD-3-Clause
+curl-cffi==0.15.0          MIT
+dacite==1.9.2              MIT
+datastar-py==1.0.2         MIT
+deprecated==1.3.1          MIT
+dnspython==2.8.0           ISC
+fastapi==0.103.2           MIT
+h11==0.16.0                MIT
+idna==3.19                 BSD-3-Clause
+jaconv==0.5.0              MIT
+jinja2==3.1.6              BSD-3-Clause
+markdown-it-py==4.2.0      MIT
+markupsafe==3.0.3          BSD-3-Clause
+mdurl==0.1.2               MIT
+mutagen==1.48.1            GPL-2.0-or-later
+pillow==12.3.0             MIT-CMU
+platformdirs==4.11.8       MIT
+pycparser==3.0             BSD-3-Clause
+pycryptodomex==3.23.0      BSD-2-Clause and public domain
+pydantic==2.13.5           MIT
+pydantic-core==2.46.5      MIT
+pygments==2.21.0           BSD-2-Clause
+pykakasi==2.3.0            GPL-3.0-or-later
+pymongo==4.18.1            Apache-2.0
+pyotp==2.10.0              MIT
+python-dateutil==2.9.0.post0  Apache-2.0 OR BSD-3-Clause
+python-multipart==0.0.32   Apache-2.0
+python-slugify==8.0.4      MIT
+rapidfuzz==3.14.6          MIT
+readerwriterlock==1.0.9    MIT
+redis==8.1.0               MIT
+requests==2.34.2           Apache-2.0
+rich==13.9.4               MIT
+six==1.17.0                MIT
+sniffio==1.3.1             MIT OR Apache-2.0
+soundcloud-v2==1.7.0       MIT
+soupsieve==2.9.2           MIT
+spotapi==1.2.8             GPL-3.0 (LICENSE file in the wheel; see F2)
+spotdl==4.5.2              MIT
+spotipy==2.26.0            MIT
+spotipyfree==1.9.14        MIT (LICENSE file in the wheel; see F2)
+starlette==0.27.0          BSD-3-Clause
+syncedlyrics==1.0.1        MIT
+text-unidecode==1.3        Artistic-1.0 OR GPL-1.0-or-later
+typing-extensions==4.16.0  PSF-2.0
+typing-inspection==0.4.4   MIT
+unidecode==1.4.0           GPL-2.0-or-later
+urllib3==2.7.0             MIT
+uvicorn==0.23.2            BSD-3-Clause
+validators==0.35.0         MIT
+websockets==14.2           BSD-3-Clause
+wrapt==2.4.1               BSD-2-Clause
+yt-dlp==2026.8.19          Unlicense
+yt-dlp-ejs==0.8.0          Unlicense AND MIT AND ISC
+ytmusicapi==1.12.2         MIT
+[end]
+
+Every environment also contains the pip 24.0 (MIT) and setuptools 79.0.1 (MIT) that created it.
+
+
+4. Bundled command-line tools (tools/, copied into the build)
+-------------------------------------------------------------
+
+FFmpeg 9.0.1 "essentials" (gyan.dev build)   GPL-3.0-or-later
+  The build is configured with --enable-gpl --enable-version3 and links libx264, libx265,
+  libxvid and others statically, so the binary as a whole is under GPLv3.
+  Full text: tools/licenses/FFmpeg-LICENSE.txt. Source: https://ffmpeg.org and the gyan.dev
+  build page. The download URL and SHA-256 are in tools/SOURCES.txt.
+  ffprobe.exe comes from the same build and has the same licence.
+
+Deno 2.9.6 (x86_64-pc-windows-msvc)           MIT
+  Downloaded from github.com/denoland/deno. SHA-256 is in tools/SOURCES.txt.
+
+
+5. Findings - to resolve before any distribution
+-------------------------------------------------
+
+F1  RESOLVED - the project's own code is under the MIT License.
+    The owner chose MIT for the repository's original source code. The text is in LICENSE,
+    and pyproject.toml declares license = {text = "MIT"} with the MIT classifier. MIT is
+    compatible with the GPLv2-only gallery-dl worker process and lets the PyQt6-linked
+    StuffDownloader.exe be conveyed under GPLv3 as a whole, with its source.
+    This does not clear any obligation below.
+
+F2  RESOLVED - the spotDL dependencies spotapi and spotipyfree do ship licences.
+    An earlier audit read only the METADATA License field and missed the licence files.
+    The pinned wheels each contain dist-info/licenses/LICENSE:
+      spotapi 1.2.8       GNU General Public License version 3 (full text). METADATA has no
+                          License field and names no "or later" option, so treat it as GPL-3.0.
+      spotipyfree 1.9.14  MIT License, "Copyright (c) <2026> <Tzur Soffer>". The METADATA
+                          License field carries only that copyright line.
+    Obligation: spotapi adds to F5. Distributing the spotDL environment means conveying spotapi
+    under GPLv3: ship its licence text and its corresponding source (or a written offer). The
+    MIT notice for spotipyfree must ship with it (F6). Both LICENSE files are staged by the
+    payload builder into licences\spotapi-1.2.8 and licences\spotipyfree-1.9.14.
+    Current build scope: personal use on the owner's machine only; the installer is not shared.
+
+F3  OBLIGATION - FFmpeg is GPLv3.
+    Shipping ffmpeg.exe or ffprobe.exe requires shipping this licence text and offering the
+    complete corresponding source for that exact build (FFmpeg plus every statically linked
+    library) for three years, or shipping the source alongside.
+    Alternative: switch to an LGPL build (gyan.dev or BtbN "lgpl" builds) and check that no
+    preset needs x264 or x265.
+
+F4  NOTE - gallery-dl is GPL-2.0-only and requests is Apache-2.0.
+    The FSF considers Apache-2.0 incompatible with GPLv2-only. This combination is upstream's
+    own, since gallery-dl depends on requests itself, and this project does not create it.
+    Shipping the gallery-dl environment still means shipping that combination.
+    The M6 installer does ship it: the payload carries the hash-pinned gallery-dl and requests
+    wheels in runtime-setup\, and setup-runtime installs them offline into the gallerydl
+    environment on the user's machine. That is distribution of both packages, not a fetch from
+    PyPI, so the GPLv2/Apache-2.0 incompatibility applies to the installer as a whole.
+    Resolution: acceptable only for the owner's personal, local build. Before the installer is
+    shared, either get legal advice on this combination or stop bundling the gallery-dl wheels
+    and have the installer fetch them by hash from PyPI instead.
+
+F5  OBLIGATION - the spotDL environment is effectively GPLv3.
+    pykakasi (GPL-3.0-or-later), spotapi (GPL-3.0), mutagen and unidecode (GPL-2.0-or-later)
+    load into one process with spotDL (MIT) and the worker code, so that process is governed by
+    GPLv3. This is compatible with F1's permissive choice. Any distribution of that environment must include
+    the licence texts and a source offer.
+
+F6  OBLIGATION - notices for every other component.
+    MIT, BSD, ISC, Apache-2.0, MPL-2.0 and PSF all require their licence text and copyright
+    notices to ship with the binaries. The M6 installer should copy each package's
+    dist-info/licenses files into a licenses\ folder next to this file.
+
+The boundary claim in plan 8.3 holds. PyQt6 and gallery-dl never share a process. It was
+checked against the build output above and is guarded by test_third_party_licenses.py.

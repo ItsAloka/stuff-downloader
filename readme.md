@@ -37,6 +37,35 @@ uv pip compile pyproject.toml --extra dev --generate-hashes --python-version 3.1
 .\.venv\Scripts\python.exe -m pytest
 ```
 
+## Build the installer
+
+Personal use only: the installer includes the spotDL environment (`THIRD_PARTY_LICENSES.txt`
+F2, F5). Do not sign, publish or share what this builds.
+
+Needs [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`ISCC.exe` on PATH, in its default
+install folder, or named by the `ISCC` environment variable).
+
+```powershell
+.\.venv\Scripts\python.exe packaging\fetch_tools.py fetch      # once: ffmpeg, ffprobe, deno (SHA-256 pinned)
+.\.venv\Scripts\python.exe packaging\build_installer.py installer
+```
+
+The second command rebuilds `dist\payload\` from scratch, then compiles
+`packaging\installer.iss` into `dist\StuffDownloader-Setup-<version>.exe`
+(`--skip-payload` reuses an existing payload; `payload` alone builds only the payload).
+The payload holds the frozen GUI (`StuffDownloader\`), the pinned CPython with every
+hash-checked engine wheel (`runtime-setup\`), `licences\` and `PAYLOAD.txt`. It stops with an
+error if any input is missing or fails its hash.
+
+The installer needs no administrator rights. It installs to
+`%LOCALAPPDATA%\Programs\Stuff Downloader`, adds a Start-menu shortcut (desktop shortcut
+optional), then runs `runtime-setup\python\python.exe runtime-setup\packaging\build_installer.py
+setup-runtime`, which builds the engine environments offline under
+`%LOCALAPPDATA%\StuffDownloader\runtime` (a venv cannot be moved after it is created). If that
+step fails, Setup says so and leaves its output in `setup-runtime.log` in the install folder;
+running Setup again retries it. Uninstalling removes only the program files: settings, the
+engine runtime and downloads stay.
+
 ## Layout
 
 - `src/stuff_downloader/core` — no Qt, no engine imports.

@@ -98,6 +98,7 @@ def batch_specs(
     preset_id: str,
     archive: bool = True,
     crop_cover: bool = True,
+    output_names: dict[int, str] | None = None,
 ) -> list[JobSpec]:
     """One JobSpec per selected entry. Each is an ordinary single-video job."""
     count = len(listing.entries)
@@ -110,6 +111,7 @@ def batch_specs(
             playlist_title=listing.title,
             playlist_count=count,
             archive=archive,
+            output_name=(output_names or {}).get(entry.index),
         )
         specs.append(
             JobSpec(

@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from PyQt6.QtCore import Qt
 
-from stuff_downloader.core import router, settings, tools
+from stuff_downloader.core import presets, router, settings, tools
 from stuff_downloader.core.protocol import Event
 from stuff_downloader.gui import pages, theme
 from stuff_downloader.gui.main_window import MainWindow, tool_health_text
@@ -243,6 +243,36 @@ def test_playlist_and_music_links(window, runs, qtbot):
     assert runs[0].spec.url == "https://music.youtube.com/watch?v=dQw4w9WgXcQ"
 
 
+def test_each_analyzed_route_gets_a_fresh_preset_default(window, runs, qtbot):
+    page = _analyzed(
+        window, runs, qtbot, url="https://music.youtube.com/watch?v=dQw4w9WgXcQ"
+    )
+    assert page.preview.preset_combo.currentData() == "mp3_music"
+
+    # A new ordinary YouTube video must not inherit the previous music choice.
+    page.url_edit.setText(VID_URL)
+    page.analyze()
+    runs[-1].emit("result", **json.loads(FIXTURE.read_text(encoding="utf-8")))
+    assert page.preview.preset_combo.currentData() == presets.DEFAULT_PRESET_ID
+
+
+def test_youtube_music_playlist_resets_to_mp3(window):
+    page = window.downloads_page
+    page.playlist_card.preset_combo.setCurrentIndex(
+        page.playlist_card.preset_combo.findData("audio_original")
+    )
+    page._route = router.route("https://music.youtube.com/playlist?list=PL1234567890")
+    page.show_playlist(
+        {
+            "kind": "playlist",
+            "id": "PL1234567890",
+            "title": "Music playlist",
+            "entries": [{"id": "dQw4w9WgXcQ", "title": "Song"}],
+        }
+    )
+    assert page.playlist_card.preset_combo.currentData() == "mp3_music"
+
+
 def test_analyze_error_timeout_and_cancel(window, runs, qtbot):
     page = window.downloads_page
     page.url_edit.setText(VID_URL)
@@ -304,7 +334,8 @@ def test_download_job_progress_completion_and_file_actions(
     assert page.open_file(run.spec.job_id)
     assert page.show_in_folder(run.spec.job_id)
     assert opened[0].toLocalFile().lower() == str(out).replace("\\", "/").lower()
-    assert opened[1] == ["explorer.exe", f"/select,{out.resolve()}"]
+    # Separate arguments: one quoted "/select,<path with spaces>" is mis-parsed by explorer.
+    assert opened[1] == ["explorer.exe", "/select,", str(out.resolve())]
 
 
 def test_file_actions_refuse_paths_outside_output_folder(window, runs, qtbot, tmp_path):
@@ -316,7 +347,7 @@ def test_file_actions_refuse_paths_outside_output_folder(window, runs, qtbot, tm
     outside = tmp_path / "elsewhere.exe"
     outside.write_bytes(b"MZ")
     runs[-1].emit("result", files=[str(outside), 5, None], total_bytes=2)
-    assert job.card.open_button.isHidden()
+    assert not job.card.open_button.isEnabled() and not job.card.folder_button.isEnabled()
     assert not page.open_file(job.spec.job_id) and not page.show_in_folder(job.spec.job_id)
 
 
@@ -406,6 +437,46 @@ def test_a_transient_failure_is_retried_after_a_backoff(window, runs, qtbot):
     assert not timer.isActive() and job_id not in page._retry_timers
     assert len(runs) == before + 1 and job.state == "active"
     assert runs[-1].spec.job_id == job_id  # same job, not a new one
+    page.shutdown()
+
+
+STREAM_403 = {
+    "code": "download_error",
+    "message": "ERROR: unable to download video data: HTTP Error 403: Forbidden",
+}
+
+
+def test_a_stream_403_is_retried_and_the_next_run_completes(window, runs, qtbot):
+    """The live failure: the stream URL expired partway, and the job must not just die."""
+    page = _analyzed(window, runs, qtbot)
+    job = page.start_download()
+    job_id = job.spec.job_id
+    runs[-1].emit("stage", stage="downloading")
+    runs[-1].emit("error", **STREAM_403)
+    assert job.state == "retrying" and page.store.get(job_id).state == "queued"
+
+    before = len(runs)
+    page._release_retry(job_id)
+    assert len(runs) == before + 1 and job.state == "active"
+    assert runs[-1].spec.job_id == job_id and runs[-1].started
+
+    runs[-1].emit("result", files=[], total_bytes=1)
+    assert job.state == "completed" and job.card.chip.text() != "Failed"
+    assert page.scheduler.retrying_count == 0
+    page.shutdown()
+
+
+def test_a_page_403_fails_without_an_automatic_retry(window, runs, qtbot):
+    page = _analyzed(window, runs, qtbot)
+    job = page.start_download()
+    before = len(runs)
+    runs[-1].emit(
+        "error",
+        code="download_error",
+        message="ERROR: [youtube] abc: Unable to download webpage: HTTP Error 403: Forbidden",
+    )
+    assert job.state == "failed" and job.card.chip.text() == "Failed"
+    assert job.spec.job_id not in page._retry_timers and len(runs) == before
     page.shutdown()
 
 

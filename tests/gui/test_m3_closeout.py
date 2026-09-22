@@ -85,6 +85,8 @@ def test_a_direct_file_is_analyzed_and_downloaded_by_the_http_engine(page, runs,
     assert "2.0 KB" in page.preview.meta_label.text()
     job = page.start_download()
     assert job.spec.engine == "http"
+    # The untouched name field is only a hint: the worker keeps the file's own name.
+    assert page.preview.name_edit.placeholderText() == "clip"
     assert job.spec.options == {"mode": "download", "preset": "original_file"}
     ((options, url),) = _stored_options(page)
     assert url == "https://cdn.example.com/v/clip.mp4"  # the token never reaches disk
@@ -331,3 +333,11 @@ def test_a_new_analyze_forgets_a_pending_job_retry(page, runs, monkeypatch, qtbo
     run.emit("error", code="download_error", message=PRIVATE)
     _analyze(page, "https://www.instagram.com/reel/other/")
     assert page._login_retry_job_id == "" and page.login_button.isHidden()
+
+
+def test_a_typed_direct_file_name_reaches_the_job_spec(page, runs, qtbot):
+    _analyze(page, "https://cdn.example.com/v/clip.mp4")
+    runs[-1].emit("result", **FILE_INFO)
+    qtbot.waitUntil(lambda: not page.preview.isHidden())
+    page.preview.name_edit.setText("  holiday  ")
+    assert page.start_download().spec.options["output_name"] == "holiday"

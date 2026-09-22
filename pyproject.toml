@@ -4,9 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stuff-downloader"
-version = "0.0.1"
+version = "1.0.0"
 description = "Private local Windows desktop downloader (M0 foundation)."
 readme = "readme.md"
+license = {text = "MIT"}
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+]
 requires-python = ">=3.11,<3.12"
 dependencies = [
     "PyQt6==6.11.0",

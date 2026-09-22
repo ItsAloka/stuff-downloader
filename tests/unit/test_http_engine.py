@@ -7,12 +7,14 @@ If-Range, naming, collisions, progress — is the real code path.
 
 from __future__ import annotations
 
+import base64
 import io
 import json
 import socket
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 import pytest
 
@@ -468,3 +470,128 @@ def test_move_into_place_without_hard_links_still_never_overwrites(tmp_path, mon
     (tmp_path / "clip.mp4").write_bytes(b"theirs")
     final = http_engine.move_into_place(part, tmp_path, "clip.mp4")
     assert final.name == "clip (2).mp4" and (tmp_path / "clip.mp4").read_bytes() == b"theirs"
+
+
+@pytest.mark.parametrize(
+    ("chosen", "expected"),
+    [
+        ("holiday", "holiday.mp4"),
+        (r"..\..\evil", "____evil.mp4"),
+        ("%(title)s", "%(title)s.mp4"),
+        ("CON .txt", "clip.mp4"),  # a device name keeps the server's name, never "download"
+        ("   ", "clip.mp4"),
+    ],
+)
+def test_a_chosen_name_is_sanitized_and_blank_keeps_the_file_name(
+    server, tmp_path, chosen, expected
+):
+    Handler.routes["/v/clip.mp4"] = serve_file()
+    result, _ = _download(
+        server, "/v/clip.mp4", tmp_path, preset="original_file", output_name=chosen
+    )
+    assert result["files"] == [str(tmp_path / expected)]
+
+
+# ── direct image preview (item 4) ─────────────────────────────────────────────────────────
+PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 500
+
+
+def test_analyzing_an_image_returns_the_image_as_its_preview(server):
+    Handler.routes["/p/photo.png"] = serve_file(body=PNG, ctype="image/png")
+    info, _ = _analyze(server, "/p/photo.png")
+    assert base64.b64decode(info["thumbnail"]["data"]) == PNG
+
+
+def test_a_video_gets_no_image_preview(server):
+    Handler.routes["/v/clip.mp4"] = serve_file()
+    info, _ = _analyze(server, "/v/clip.mp4")
+    assert "thumbnail" not in info
+
+
+def test_an_image_over_five_megabytes_gets_no_preview(server, monkeypatch):
+    monkeypatch.setattr(http_engine, "MAX_PREVIEW_BYTES", 400)
+    Handler.routes["/p/big.png"] = serve_file(body=PNG, ctype="image/png")
+    info, _ = _analyze(server, "/p/big.png")
+    assert "thumbnail" not in info and info["filesize"] == len(PNG)
+
+
+def test_a_failed_preview_still_analyzes_the_image(server, monkeypatch):
+    Handler.routes["/p/photo.png"] = serve_file(body=PNG, ctype="image/png")
+    calls = []
+    real = http_engine.open_url
+
+    def second_call_fails(url, headers=None, method="GET"):
+        calls.append(url)
+        if len(calls) > 1:
+            raise OSError("connection reset")
+        return real(url, headers, method)
+
+    monkeypatch.setattr(http_engine, "open_url", second_call_fails)
+    info, events = _analyze(server, "/p/photo.png")
+    assert info["kind"] == "file" and "thumbnail" not in info
+    assert any(k == "log" and "preview failed" in d["message"] for k, d in events)
+
+
+# ── image format (item 6B) ────────────────────────────────────────────────────────────────
+FFMPEG = Path(__file__).resolve().parents[2] / "tools" / "ffmpeg.exe"
+needs_ffmpeg = pytest.mark.skipif(not FFMPEG.is_file(), reason="bundled ffmpeg not fetched")
+
+
+def _png(width=4, height=3) -> bytes:
+    import struct
+    import zlib
+
+    def chunk(kind, data):
+        body = kind + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    rows = b"".join(b"\x00" + b"\xff\x00\x00\x80" * width for _ in range(height))  # RGBA
+    header = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(rows))
+        + chunk(b"IEND", b"")
+    )
+
+
+@needs_ffmpeg
+def test_a_direct_png_is_converted_and_the_jpg_is_reported(server, tmp_path, monkeypatch):
+    monkeypatch.setenv("STUFF_DOWNLOADER_TOOLS_DIR", str(FFMPEG.parent))
+    Handler.routes["/p/photo.png"] = serve_file(body=_png(), ctype="image/png")
+    result, events = _download(
+        server, "/p/photo.png", tmp_path, preset="original_file", image_format="jpg"
+    )
+    final = tmp_path / "photo.jpg"
+    assert result["files"] == [str(final)]
+    assert final.read_bytes()[:3] == b"\xff\xd8\xff"
+    assert not (tmp_path / "photo.png").exists()
+    assert result["total_bytes"] == final.stat().st_size
+    assert "converting" in [d["stage"] for k, d in events if k == "stage"]
+
+
+def test_a_video_ignores_the_image_format(server, tmp_path):
+    Handler.routes["/v/clip.mp4"] = serve_file()
+    result, _ = _download(server, "/v/clip.mp4", tmp_path, preset="original_file",
+                          image_format="png")
+    assert result["files"] == [str(tmp_path / "clip.mp4")] and "notes" not in result
+
+
+def test_without_ffmpeg_the_original_image_is_kept_with_a_note(server, tmp_path, monkeypatch):
+    monkeypatch.delenv("STUFF_DOWNLOADER_TOOLS_DIR", raising=False)
+    Handler.routes["/p/photo.png"] = serve_file(body=_png(), ctype="image/png")
+    result, _ = _download(
+        server, "/p/photo.png", tmp_path, preset="original_file", image_format="jpg"
+    )
+    assert result["files"] == [str(tmp_path / "photo.png")]
+    assert result["notes"] == ["Could not convert to JPG; kept the original."]
+
+
+@pytest.mark.parametrize(
+    "extra", [{"image_format": "tiff"}, {"image_background": "red"}, {"image_format": 1}]
+)
+def test_bad_image_options_are_refused_before_any_request(server, tmp_path, extra):
+    Handler.seen.clear()
+    with pytest.raises(EngineError) as info:
+        _download(server, "/p/photo.png", tmp_path, preset="original_file", **extra)
+    assert info.value.code == "bad_options" and Handler.seen == []

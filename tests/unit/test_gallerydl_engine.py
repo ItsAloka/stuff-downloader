@@ -453,3 +453,76 @@ def test_missing_gallery_dl_is_engine_missing(monkeypatch):
     with pytest.raises(EngineError) as info:
         _run({"mode": "analyze"})
     assert info.value.code == "engine_missing"
+
+
+# ── image format (item 6B) ────────────────────────────────────────────────────────────────
+def test_each_gallery_image_is_converted_and_reported_by_its_final_path(
+    fake_gdl, tmp_path, monkeypatch
+):
+    from stuff_downloader_worker import image_convert
+
+    calls = []
+
+    def fake_convert(source, fmt, background="#ffffff", **_):
+        calls.append((Path(source).name, fmt, background))
+        if Path(source).suffix == ".jpg":
+            return image_convert.ConvertResult(Path(source), converted=False)
+        out = Path(source).with_suffix(".jpg")
+        out.write_bytes(b"jpg")
+        Path(source).unlink()
+        return image_convert.ConvertResult(out, True, image_convert.FIRST_FRAME_NOTE)
+
+    monkeypatch.setattr(image_convert, "convert_image", fake_convert)
+    result, events = _run(
+        {
+            "mode": "download",
+            "preset": "gallery_original",
+            "items": [1, 2, 4],
+            "image_format": "jpg",
+            "image_background": "#000000",
+        },
+        out=tmp_path,
+    )
+    names = [Path(f).name for f in result["files"]]
+    # The video is untouched; the PNG is now a JPG and the old path is gone.
+    assert names == ["instagram_ABC123_1.jpg", "instagram_ABC123_2.mp4", "instagram_ABC123_4.jpg"]
+    assert all(Path(f).is_file() for f in result["files"])
+    assert calls == [
+        ("instagram_ABC123_1.jpg", "jpg", "#000000"),
+        ("instagram_ABC123_4.png", "jpg", "#000000"),
+    ]
+    assert result["notes"] == [image_convert.FIRST_FRAME_NOTE]
+    stages = [d["stage"] for k, d in events if k == "stage"]
+    assert stages[-2:] == ["converting", "completed"]
+
+
+def test_a_failed_conversion_keeps_the_original_and_says_so(fake_gdl, tmp_path, monkeypatch):
+    from stuff_downloader_worker import image_convert
+    from stuff_downloader_worker.engines.base import EngineError as Err
+
+    def broken(source, fmt, **_):
+        raise Err("convert_error", "FFmpeg is needed to convert images")
+
+    monkeypatch.setattr(image_convert, "convert_image", broken)
+    result, _ = _run(
+        {"mode": "download", "preset": "gallery_original", "items": [4], "image_format": "png"},
+        out=tmp_path,
+    )
+    assert [Path(f).name for f in result["files"]] == ["instagram_ABC123_4.png"]
+    assert result["notes"] == ["Could not convert to PNG; kept the original."]
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"image_format": "gif"},
+        {"image_format": ["jpg"]},
+        {"image_background": "white"},
+        {"image_background": "#fff"},
+        {"image_background": "#ffffff;rm -rf"},
+    ],
+)
+def test_bad_image_options_are_refused(fake_gdl, extra):
+    with pytest.raises(EngineError) as info:
+        _run({"mode": "download", "preset": "gallery_original", "items": [1], **extra})
+    assert info.value.code == "bad_options"

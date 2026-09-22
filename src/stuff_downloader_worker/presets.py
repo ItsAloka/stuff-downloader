@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .engines.base import EngineError
+from .names import safe_output_name
 
 PRESET_IDS = frozenset(
     {"video_best", "video_1080", "video_720", "mp3_music", "audio_original", "thumbnail"}
@@ -79,6 +80,7 @@ class DownloadRequest:
     playlist_title: str | None = None
     playlist_count: int | None = None
     archive: bool = False
+    output_name: str | None = None
 
     @property
     def in_playlist(self) -> bool:
@@ -107,6 +109,7 @@ def parse_request(options: dict[str, Any]) -> DownloadRequest:
         "playlist_title",
         "playlist_count",
         "archive",
+        "output_name",
     }
     unknown = set(options) - allowed
     if unknown:
@@ -124,6 +127,9 @@ def parse_request(options: dict[str, Any]) -> DownloadRequest:
             raise EngineError("bad_options", f"{key!r} must be true or false")
     if not isinstance(options.get("archive", False), bool):
         raise EngineError("bad_options", "'archive' must be true or false")
+    output_name = options.get("output_name")
+    if output_name is not None and not isinstance(output_name, str):
+        raise EngineError("bad_options", "'output_name' must be a string")
     playlist_index = _optional_index(options, "playlist_index")
     playlist_count = _optional_index(options, "playlist_count")
     playlist_title = options.get("playlist_title")
@@ -148,6 +154,7 @@ def parse_request(options: dict[str, Any]) -> DownloadRequest:
         playlist_title=playlist_title,
         playlist_count=playlist_count,
         archive=options.get("archive", False),
+        output_name=safe_output_name(output_name),
     )
 
 
@@ -176,11 +183,15 @@ def job_home(request: DownloadRequest, output_dir: str) -> str:
     return output_dir
 
 
+def literal_outtmpl(stem: str) -> str:
+    """A template that names the file ``stem`` exactly: ``%`` is escaped, so a chosen name
+    like ``%(uploader)s`` stays text and is never expanded by yt-dlp."""
+    return stem.replace("%", "%%") + ".%(ext)s"
+
+
 def music_outtmpl(request: DownloadRequest) -> str:
-    """Audio filename, prefixed with the track number when the job is one item of a playlist."""
-    if request.playlist_index is None:
-        return MUSIC_OUTTMPL
-    return track_prefix(request.playlist_index, request.playlist_count) + MUSIC_OUTTMPL
+    """Audio filename; playlist ordering belongs in metadata, not the visible name."""
+    return literal_outtmpl(request.output_name) if request.output_name else MUSIC_OUTTMPL
 
 
 def build_ydl_opts(request: DownloadRequest, output_dir: str) -> dict[str, Any]:
@@ -198,7 +209,9 @@ def build_ydl_opts(request: DownloadRequest, output_dir: str) -> dict[str, Any]:
             {
                 "format": video_format(request.height, request.compatible),
                 "merge_output_format": "mp4" if request.compatible else "mkv",
-                "outtmpl": VIDEO_OUTTMPL,
+                "outtmpl": (
+                    literal_outtmpl(request.output_name) if request.output_name else VIDEO_OUTTMPL
+                ),
             }
         )
     elif request.preset == "mp3_music":

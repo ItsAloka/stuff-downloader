@@ -196,13 +196,16 @@ class GalleryDlEngine:
                 raise EngineError("bad_options", "analyze takes no options")
             items: list[int] = []
         elif mode == "download":
+            from ..image_convert import IMAGE_OPTION_KEYS, parse_image_options
+
             if (
-                set(opts) - {"mode", "preset", "items", "archive"}
+                set(opts) - ({"mode", "preset", "items", "archive"} | IMAGE_OPTION_KEYS)
                 or opts.get("preset") != PRESET_ID
             ):
                 raise EngineError("bad_options", "gallery download takes preset=gallery_original")
             if not isinstance(opts.get("archive", False), bool):
                 raise EngineError("bad_options", "'archive' must be true or false")
+            parse_image_options(opts)
             items = parse_items(opts)
         else:
             raise EngineError("bad_options", f"unknown mode {mode!r}")
@@ -413,8 +416,8 @@ class GalleryDlEngine:
             emit(
                 "log", {"level": "warning", "message": "some gallery items could not be downloaded"}
             )
-        emit("stage", {"stage": "completed"})
         if not existing:
+            emit("stage", {"stage": "completed"})
             return {
                 "title": "Gallery",
                 "preset": PRESET_ID,
@@ -423,10 +426,18 @@ class GalleryDlEngine:
                 "skipped": True,
                 "skipped_reason": "Already downloaded",
             }
-        return {
+        from ..image_convert import finish_images, parse_image_options
+
+        fmt, background = parse_image_options(job.options)
+        existing, notes = finish_images(existing, fmt, background, emit)
+        emit("stage", {"stage": "completed"})
+        result = {
             "title": Path(existing[0]).stem,
             "preset": PRESET_ID,
             "files": existing,
             "total_bytes": sum(os.path.getsize(p) for p in existing),
             "item_count": len(existing),
         }
+        if notes:
+            result["notes"] = notes
+        return result

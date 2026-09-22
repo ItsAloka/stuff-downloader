@@ -103,6 +103,7 @@ def download_options(
     playlist_title: str | None = None,
     playlist_count: int | None = None,
     archive: bool = False,
+    output_name: str | None = None,
 ) -> dict[str, Any]:
     """The job ``options`` for a download. Mirrors the worker's validation."""
     preset = get(preset_id)
@@ -115,6 +116,8 @@ def download_options(
     }
     if archive:
         options["archive"] = True
+    if output_name and output_name.strip():
+        options["output_name"] = output_name.strip()
     if playlist_index is not None:
         if not 1 <= playlist_index <= MAX_PLAYLIST_INDEX:
             raise ValueError(f"playlist index out of range: {playlist_index}")
@@ -126,15 +129,36 @@ def download_options(
     return options
 
 
-def file_download_options() -> dict[str, Any]:
+IMAGE_FORMATS = ("original", "jpg", "png")
+IMAGE_EXTENSIONS = frozenset({"jpg", "jpeg", "png", "gif", "webp", "avif", "bmp"})
+
+
+def _image_format(value: str | None) -> str:
+    fmt = value or "original"
+    if fmt not in IMAGE_FORMATS:
+        raise ValueError(f"unknown image format: {fmt!r}")
+    return fmt
+
+
+def file_download_options(
+    output_name: str | None = None, image_format: str | None = None
+) -> dict[str, Any]:
     """The job ``options`` for the direct HTTP engine. Mirrors its validation exactly."""
-    return {"mode": "download", "preset": FILE_PRESET.id}
+    options: dict[str, Any] = {"mode": "download", "preset": FILE_PRESET.id}
+    if output_name and output_name.strip():
+        options["output_name"] = output_name.strip()
+    fmt = _image_format(image_format)
+    if fmt != "original":  # the worker converts images only; a video ignores it
+        options["image_format"] = fmt
+    return options
 
 
 MAX_GALLERY_ITEMS = 500
 
 
-def gallery_download_options(items: list[int], archive: bool = False) -> dict[str, Any]:
+def gallery_download_options(
+    items: list[int], archive: bool = False, image_format: str | None = None
+) -> dict[str, Any]:
     """The job ``options`` for gallery-dl: exactly the chosen 1-based item positions."""
     clean = sorted({int(i) for i in items if isinstance(i, int) and not isinstance(i, bool)})
     if not clean or clean[0] < 1 or clean[-1] > MAX_GALLERY_ITEMS:
@@ -142,6 +166,9 @@ def gallery_download_options(items: list[int], archive: bool = False) -> dict[st
     options: dict[str, Any] = {"mode": "download", "preset": GALLERY_PRESET.id, "items": clean}
     if archive:
         options["archive"] = True
+    fmt = _image_format(image_format)
+    if fmt != "original":
+        options["image_format"] = fmt
     return options
 
 

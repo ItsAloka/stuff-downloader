@@ -367,6 +367,29 @@ def test_history_file_actions_refuse_a_path_outside_the_output_folder(window, ru
     assert not history_page.open_selected() and not history_page.show_selected_in_folder()
 
 
+def test_history_show_in_folder_passes_explorer_separate_arguments(
+    window, runs, tmp_path, monkeypatch
+):
+    from stuff_downloader.gui import pages
+
+    out_dir = tmp_path / "my music"
+    out_dir.mkdir()
+    page = expand(window, runs)
+    page._settings.download_dir = str(out_dir)
+    jobs = page.start_playlist_download()
+    song = out_dir / "A & B.mp3"
+    song.write_bytes(b"x")
+    jobs[0].run.emit("result", files=[str(song)], total_bytes=1)
+    history_page = window.history_page
+    history_page.refresh()
+    history_page.table.setCurrentCell(0, 0)
+    calls = []
+    monkeypatch.setattr(pages.subprocess, "Popen", lambda *a, **k: calls.append((a, k)))
+    monkeypatch.setattr(pages.sys, "platform", "win32")
+    assert history_page.show_selected_in_folder()
+    assert calls == [((["explorer.exe", "/select,", str(song.resolve())],), {})]
+
+
 # ── store ownership ──────────────────────────────────────────────────────────────────────
 def test_downloads_page_never_closes_a_store_it_was_given(window):
     """The window shares one store with both pages, so the page must not close it."""

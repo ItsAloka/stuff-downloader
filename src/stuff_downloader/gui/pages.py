@@ -16,19 +16,22 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QColor, QDesktopServices, QGuiApplication, QPixmap
+from PyQt6.QtGui import QColor, QDesktopServices, QGuiApplication, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
-    QInputDialog,
     QLabel,
+    QLayout,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -53,16 +56,19 @@ from ..core import (
 from ..core import (
     scheduler as scheduling,
 )
+from ..core.names import MAX_STEM, safe_output_name
 from ..core.protocol import Event, JobSpec
 from ..core.runner import JobRun, WorkerRuntimeMissing
 from . import theme
 from .bridge import EventBridge
+from .thumbs import ThumbnailLoader, decode_image, youtube_thumb_url
 from .widgets import (
     Card,
     Chip,
     GalleryCard,
     GroupCard,
     JobCard,
+    MatchDialog,
     PlaylistCard,
     PreviewCard,
     SiteLoginDialog,
@@ -71,6 +77,7 @@ from .widgets import (
     format_duration,
     format_eta,
     page_header,
+    plain_tooltip,
     section_title,
     square_crop,
 )
@@ -101,16 +108,25 @@ RETRYABLE_HINTS = (
     "connection refused",
     "timed out",
     "read timeout",
-    # YouTube refusing a short-lived stream URL mid-download. A fresh attempt extracts a new
-    # one and usually succeeds (seen live). A plain 403 on a page is not retried: that is a
-    # private or blocked page, and retrying it only hammers the site.
-    "unable to download video data: http error 403",
+    # The server closed the stream before sending anything (yt-dlp's http downloader).
+    "did not get any data blocks",
 )
+# A 403 is retried only when it hit the media stream partway through: YouTube's stream URLs
+# are short-lived, and a fresh attempt extracts a new one and usually succeeds (seen live).
+# A 403 anywhere else, "unable to download webpage: HTTP Error 403" included, is a private or
+# blocked page, and retrying it only hammers the site.
+STREAM_403 = re.compile(r"unable to download video data|fragment \d+")
+# yt-dlp's final words when a fragment kept failing (the 403 itself is only in the warnings).
+FRAGMENT_GAVE_UP = re.compile(r"fragment \d+ not found, unable to continue")
 
 
 def is_retryable(message: str | None) -> bool:
     """Whether an engine error looks transient enough to be worth an automatic retry."""
     text = (message or "").lower()
+    if "http error 403" in text:
+        return bool(STREAM_403.search(text))
+    if FRAGMENT_GAVE_UP.search(text):
+        return True
     return any(hint in text for hint in RETRYABLE_HINTS)
 
 
@@ -417,15 +433,46 @@ def track_rows(info: Any) -> list[tuple[str, ...]]:
 
 
 def _page_layout(widget: QWidget) -> QVBoxLayout:
+    """Create a responsive page whose natural contents scroll instead of being compressed."""
     widget.setObjectName("page")
-    layout = QVBoxLayout(widget)
+    outer = QVBoxLayout(widget)
+    outer.setContentsMargins(0, 0, 0, 0)
+    scroll = QScrollArea(widget)
+    scroll.setObjectName("pageScroll")
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+    content = QWidget()
+    content.setObjectName("pageContent")
+    content.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
+    scroll.setWidget(content)
+    outer.addWidget(scroll)
+    # Keep references both for tests and for callers that need to reveal a control later.
+    widget.page_scroll = scroll
+    widget.page_content = content
+    layout = QVBoxLayout(content)
     layout.setContentsMargins(32, 28, 32, 24)
     layout.setSpacing(14)
+    layout.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
     return layout
 
 
 def _is_number(value: Any) -> bool:
     return isinstance(value, int | float) and not isinstance(value, bool)
+
+
+MAX_NOTES = 3
+# The worker's notes are fixed sentences (image_convert); anything else is not shown.
+KNOWN_NOTE = re.compile(
+    r"Animated image: only the first frame was kept\."
+    r"|Could not convert to (JPG|PNG); kept the original\."
+)
+TERMINAL_STATES = frozenset({"completed", "failed", "cancelled", "skipped"})
+# yt-dlp's in-progress and intermediate names: never what "Open" should open.
+_TRANSIENT_FILE = re.compile(
+    r"(\.part|\.ytdl|\.part-Frag\d+|\.temp\.\w+|\.f[\w-]+\.\w+)$", re.IGNORECASE
+)
 
 
 @dataclass
@@ -483,6 +530,12 @@ class DownloadsPage(QWidget):
         # Backoff timers are children of this page, so they die with it rather than firing into
         # a half-torn-down window.
         self._retry_timers: dict[str, QTimer] = {}
+        # Row and queue-card thumbnails. Only URLs built from validated video ids are fetched.
+        self.thumbs = ThumbnailLoader(parent=self)
+        self.thumbs.loaded.connect(self._on_thumbnail)
+        self._playlist_thumb_urls: list[str | None] = []
+        self._spotify_thumb_rows: dict[str, set[int]] = {}
+        self._job_thumbs: dict[str, str] = {}  # job id -> thumbnail url
         self._analyze_timer = QTimer(self)
         self._analyze_timer.setSingleShot(True)
         self._analyze_timer.timeout.connect(self._analyze_timeout)
@@ -565,6 +618,9 @@ class DownloadsPage(QWidget):
         self.playlist_card.preset_combo.setCurrentIndex(
             self.playlist_card.preset_combo.findData("mp3_music")
         )
+        self.playlist_card.table.verticalScrollBar().valueChanged.connect(
+            self._request_visible_playlist_thumbs
+        )
         layout.addWidget(self.playlist_card)
 
         self.gallery_card = GalleryCard()
@@ -582,8 +638,11 @@ class DownloadsPage(QWidget):
         self.queue_summary.setObjectName("muted")
         self.pause_all_button = QPushButton("⏸  Pause all")
         self.pause_all_button.setObjectName("iconButton")
+        self.clear_queue_button = QPushButton("Clear finished")
+        self.clear_queue_button.setEnabled(False)
         queue_header.addWidget(self.queue_summary)
         queue_header.addWidget(self.pause_all_button)
+        queue_header.addWidget(self.clear_queue_button)
         layout.addLayout(queue_header)
 
         self.empty_state = QFrame()
@@ -610,6 +669,7 @@ class DownloadsPage(QWidget):
         self.preview.crop_check.toggled.connect(self._update_cover)
         self.preview.download_button.clicked.connect(self.start_download)
         self.preview.playlist_button.clicked.connect(self.open_playlist)
+        self.clear_queue_button.clicked.connect(self.clear_finished_jobs)
         self.playlist_card.download_button.clicked.connect(self.start_playlist_download)
         self.gallery_card.download_button.clicked.connect(self.start_gallery_download)
         self.gallery_card.select_all_button.clicked.connect(
@@ -805,6 +865,17 @@ class DownloadsPage(QWidget):
     def selected_preset(self) -> presets.Preset:
         return presets.get(self.preview.preset_combo.currentData())
 
+    def _reset_route_preset(self, combo: QComboBox, *, playlist_mode: bool = False) -> None:
+        """Choose a fresh default for this analyzed route; never inherit the previous link's UI."""
+        preset_id = (
+            "mp3_music"
+            if playlist_mode or (self._route is not None and self._route.music)
+            else presets.DEFAULT_PRESET_ID
+        )
+        index = combo.findData(preset_id)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
     # ── analyze ──────────────────────────────────────────────────────────────────────────
     def analyze(self) -> None:
         if self._analyze_run is not None:
@@ -925,6 +996,7 @@ class DownloadsPage(QWidget):
         card.title_label.setText(
             _cell(title, TITLE_LIMIT) if isinstance(title, str) and title.strip() else "Untitled"
         )
+        card.title_label.setToolTip(plain_tooltip(card.title_label.text()))
         meta = [
             str(info.get("artist") or info.get("uploader") or ""),
             format_duration(info.get("duration")),
@@ -944,24 +1016,32 @@ class DownloadsPage(QWidget):
         self._thumb = None
         thumb = info.get("thumbnail")
         if isinstance(thumb, dict) and isinstance(thumb.get("data"), str):
-            pixmap = QPixmap()
             try:
-                if pixmap.loadFromData(base64.b64decode(thumb["data"], validate=True)):
-                    self._thumb = pixmap
+                # Byte- and pixel-capped: a direct image link sends the image itself here.
+                image = decode_image(base64.b64decode(thumb["data"], validate=True))
             except (binascii.Error, ValueError):
-                pass
+                image = None
+            if image is not None:
+                self._thumb = QPixmap.fromImage(image)
 
         is_file = bool(route and route.is_file)
         self._fill_presets(file=is_file)
+        is_image = is_file and str(info.get("ext") or "").lower() in presets.IMAGE_EXTENSIONS
+        card.image_format_label.setVisible(is_image)
+        card.image_format_combo.setVisible(is_image)
+        card.image_format_combo.setCurrentIndex(0)  # each link starts as "Original"
         if is_file and _is_number(info.get("filesize")):
             parts = (self._site_label(info), format_bytes(info["filesize"]))
             card.meta_label.setText("  ·  ".join(m for m in parts if m))
+        route_url = self._route.url if self._route else ""
+        # A hint only: an untouched name field keeps the worker's default file name.
+        card.name_edit.clear()
+        card.name_edit.setPlaceholderText(safe_job_title(info.get("title"), route_url))
         raw_formats = info.get("formats")
         self._choices = formats.resolution_choices(
             raw_formats if isinstance(raw_formats, list) else []
         )
-        if self._route and self._route.music:
-            card.preset_combo.setCurrentIndex(card.preset_combo.findData("mp3_music"))
+        self._reset_route_preset(card.preset_combo)
         self._fill_advanced(info)
         self._update_options()
         card.show()
@@ -1031,6 +1111,9 @@ class DownloadsPage(QWidget):
             meta.append(f"showing the first {playlist.MAX_ENTRIES}")
         card.meta_label.setText("  ·  ".join(m for m in meta if m))
         card.set_entries(listing.entries)
+        self._playlist_thumb_urls = [youtube_thumb_url(e.video_id) for e in listing.entries]
+        self._request_visible_playlist_thumbs()
+        self._reset_route_preset(card.preset_combo, playlist_mode=True)
         card.filter_edit.clear()
         self._update_playlist_selection()
         for row in range(card.table.rowCount()):
@@ -1067,6 +1150,7 @@ class DownloadsPage(QWidget):
             output_dir,
             self.playlist_card.preset_combo.currentData() or "mp3_music",
             archive=self.playlist_card.archive_check.isChecked(),
+            output_names=self._playlist_output_names(entries),
         )
         group_id = uuid.uuid4().hex
         source_url = self._route.playlist_url if self._route else ""
@@ -1076,11 +1160,36 @@ class DownloadsPage(QWidget):
         self._groups[group_id] = GroupState(group_card, len(specs), listing.title)
         jobs = []
         for spec, entry in zip(specs, entries, strict=True):
-            jobs.append(self._add_job(spec, entry.title, group_id))
+            job = self._add_job(spec, entry.title, group_id)
+            self._set_job_thumb(job, youtube_thumb_url(entry.video_id))
+            jobs.append(job)
         self.empty_state.hide()
         self.scheduler.submit_all(specs)
         self._update_summary()
         return jobs
+
+    def _playlist_output_names(self, entries: list[playlist.PlaylistEntry]) -> dict[int, str]:
+        """Only the names the user typed; untouched rows keep the default template.
+
+        Two typed names that sanitize to the same file (``a:b`` and ``a?b``) get ``(2)``…
+        here, so the queue shows what will be written; the worker still never overwrites.
+        """
+        rows = {value.index: i for i, value in enumerate(self._listing.entries)}
+        names: dict[int, str] = {}
+        used: set[str] = set()
+        for entry in entries:
+            row = rows.get(entry.index, -1)
+            base = safe_output_name(self.playlist_card.output_name(row) if row >= 0 else None)
+            if base is None:
+                continue
+            name, n = base, 1
+            while name.casefold() in used:
+                n += 1
+                suffix = f" ({n})"
+                name = base[: MAX_STEM - len(suffix)].rstrip(" .") + suffix
+            used.add(name.casefold())
+            names[entry.index] = name
+        return names
 
     # ── galleries (plan §M4) ─────────────────────────────────────────────────────────────
     def show_gallery(self, data: dict[str, Any]) -> None:
@@ -1121,7 +1230,9 @@ class DownloadsPage(QWidget):
         if listing is None or route is None or not route.is_gallery or not chosen:
             return None
         options = presets.gallery_download_options(
-            chosen, archive=self.gallery_card.archive_check.isChecked()
+            chosen,
+            archive=self.gallery_card.archive_check.isChecked(),
+            image_format=self.gallery_card.image_format_combo.currentData(),
         )
         spec = JobSpec(
             job_id=uuid.uuid4().hex,
@@ -1142,6 +1253,7 @@ class DownloadsPage(QWidget):
         listing = spotify.parse_listing(data)
         self._spotify = listing
         self._spotify_matches = {}
+        self._spotify_thumb_rows = {}
         card = self.spotify_card
         card.title_label.setText(listing.title)
         kind = {"track": "Song", "album": "Album", "playlist": "Playlist"}.get(listing.kind, "")
@@ -1153,6 +1265,7 @@ class DownloadsPage(QWidget):
             meta.append(f"showing the first {spotify.MAX_TRACKS}")
         card.meta_label.setText("  ·  ".join(m for m in meta if m))
         card.set_tracks(listing.tracks)
+        card.set_uncertain_count(0)
         for row in range(card.table.rowCount()):
             box = card.checkbox(row)
             if box is not None:
@@ -1171,6 +1284,7 @@ class DownloadsPage(QWidget):
         self._cancel_matches()
         self._spotify = None
         self._spotify_matches = {}
+        self._spotify_thumb_rows = {}
         self.spotify_card.hide()
 
     def _set_spotify_selection(self, checked: bool) -> None:
@@ -1258,6 +1372,8 @@ class DownloadsPage(QWidget):
                 else:
                     self._spotify_matches[track.track_id] = match
                     self.spotify_card.set_match(row, match)
+                    self._request_spotify_thumb(row, match)
+                    self._update_uncertain()
             else:
                 code = event.data.get("code")
                 if code == "cancelled":
@@ -1279,32 +1395,58 @@ class DownloadsPage(QWidget):
             run.cancel()
         # Their terminal events still arrive and are dropped: the listing they belong to is gone.
 
-    def _ask_match_link(self, track: spotify.SpotifyTrack) -> str | None:
-        """The owner's replacement link for one song, or None if they cancelled."""
-        text, ok = QInputDialog.getText(
-            self,
-            "Use a different recording",
-            f"Paste a YouTube or YouTube Music link for:\n{track.artist} — {track.title}",
-        )
-        return text if ok else None
+    def _ask_match(
+        self, track: spotify.SpotifyTrack, candidates: tuple[spotify.Candidate, ...]
+    ) -> spotify.Candidate | str | None:
+        """The owner's choice for one song: a looked-up result, a pasted link, or None."""
+        dialog = MatchDialog(track, candidates, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.choice()
 
     def change_spotify_match(self, row: int) -> spotify.Match | None:
         listing = self._spotify
         if listing is None or not 0 <= row < len(listing.tracks):
             return None
         track = listing.tracks[row]
-        text = self._ask_match_link(track)
-        if text is None or not text.strip():
+        current = self._spotify_matches.get(track.track_id)
+        candidates = current.candidates if current is not None else ()
+        if current is not None and not current.manual:
+            # The automatic pick stays offered, first, so undoing a change is one click.
+            auto = spotify.Candidate(
+                current.video_id, current.title, current.channel, current.duration
+            )
+            candidates = (auto, *[c for c in candidates if c.video_id != auto.video_id])
+        choice = self._ask_match(track, candidates)
+        if isinstance(choice, spotify.Candidate):
+            match = spotify.candidate_match(choice, track)
+        elif isinstance(choice, str) and choice.strip():
+            try:
+                match = spotify.override_match(choice, track)
+            except ValueError as exc:
+                self._show_message(str(exc), error=True)
+                return None
+        else:
             return None
-        try:
-            match = spotify.override_match(text, track)
-        except ValueError as exc:
-            self._show_message(str(exc), error=True)
-            return None
+        match = spotify.with_candidates(match, candidates)
         self._spotify_matches[track.track_id] = match
         self.spotify_card.set_match(row, match)
+        self._request_spotify_thumb(row, match)
+        self._update_uncertain()
         self._show_message("")
         return match
+
+    def _update_uncertain(self) -> None:
+        """The header count of matches to check, over the songs in the current listing."""
+        listing = self._spotify
+        tracks = listing.tracks if listing is not None else ()
+        count = sum(
+            1
+            for track in tracks
+            if (m := self._spotify_matches.get(track.track_id)) is not None
+            and spotify.is_uncertain(m)
+        )
+        self.spotify_card.set_uncertain_count(count)
 
     def start_spotify_download(self) -> list[QueuedJob]:
         """One ordinary MP3 job per ticked song, each carrying its reviewed match if any."""
@@ -1329,13 +1471,96 @@ class DownloadsPage(QWidget):
         jobs = []
         for spec, track in zip(specs, tracks, strict=True):
             title = f"{track.artist} - {track.title}" if track.artist else track.title
-            jobs.append(self._add_job(spec, title, group_id))
+            job = self._add_job(spec, title, group_id)
+            match = self._spotify_matches.get(track.track_id)
+            self._set_job_thumb(job, youtube_thumb_url(match.video_id) if match else None)
+            jobs.append(job)
         self.empty_state.hide()
         self.scheduler.submit_all(specs)
         self._update_summary()
         return jobs
 
+    # ── thumbnails (item 4) ──────────────────────────────────────────────────────────────
+    def _request_visible_playlist_thumbs(self, *_: Any) -> None:
+        """Lazy: only rows on screen are fetched; scrolling asks for the next ones."""
+        urls = self._playlist_thumb_urls
+        for row in self.playlist_card.visible_rows():
+            url = urls[row] if row < len(urls) else None
+            image = self.thumbs.cached(url)
+            if image is not None:
+                self.playlist_card.set_thumbnail(row, image)
+            else:
+                self.thumbs.request(url)
+
+    def _request_spotify_thumb(self, row: int, match: spotify.Match) -> None:
+        url = youtube_thumb_url(match.video_id)
+        if url is None:
+            return
+        for rows in self._spotify_thumb_rows.values():
+            rows.discard(row)  # a changed match replaces the row's picture
+        self._spotify_thumb_rows.setdefault(url, set()).add(row)
+        image = self.thumbs.cached(url)
+        if image is not None:
+            self.spotify_card.set_thumbnail(row, image)
+        else:
+            self.thumbs.request(url)
+
+    def _set_job_thumb(self, job: QueuedJob, url: str | None) -> None:
+        if url is None:
+            return
+        self._job_thumbs[job.spec.job_id] = url
+        image = self.thumbs.cached(url)
+        if image is not None:
+            job.card.set_thumbnail(image)
+        else:
+            self.thumbs.request(url)
+
+    def _on_thumbnail(self, url: str, image: QImage) -> None:
+        for row, row_url in enumerate(self._playlist_thumb_urls):
+            if row_url == url:
+                self.playlist_card.set_thumbnail(row, image)
+        for row in self._spotify_thumb_rows.get(url, ()):
+            self.spotify_card.set_thumbnail(row, image)
+        for job_id, job_url in self._job_thumbs.items():
+            job = self.jobs.get(job_id)
+            if job_url == url and job is not None:
+                job.card.set_thumbnail(image)
+
     # ── queue ────────────────────────────────────────────────────────────────────────────
+    def _clearable(self) -> list[str]:
+        """Finished cards the queue may drop: done, failed, cancelled or skipped.
+
+        A playlist's rows go only once the whole playlist has finished: its group row and final
+        notification are counted from the jobs still in the queue.
+        """
+        open_groups = {
+            job.group_id
+            for job in self.jobs.values()
+            if job.group_id and job.state not in TERMINAL_STATES
+        }
+        return [
+            job_id
+            for job_id, job in self.jobs.items()
+            if job.state in TERMINAL_STATES and job.group_id not in open_groups
+        ]
+
+    def clear_finished_jobs(self) -> None:
+        """Remove finished queue cards only; durable history is intentionally retained."""
+        for job_id in self._clearable():
+            self._cancel_retry_timer(job_id)
+            self._job_thumbs.pop(job_id, None)
+            job = self.jobs.pop(job_id)
+            self.queue_layout.removeWidget(job.card)
+            job.card.deleteLater()
+        remaining = {job.group_id for job in self.jobs.values()}
+        for group_id in [g for g in self._groups if g not in remaining]:
+            group = self._groups.pop(group_id)
+            self.queue_layout.removeWidget(group.card)
+            group.card.deleteLater()
+        if not self.jobs:
+            self.empty_state.show()
+        self._update_summary()
+
     def _new_card(self, title: str, job_id: str) -> JobCard:
         """A queue row wired to the actions for one job id."""
         job_card = JobCard()
@@ -1488,13 +1713,19 @@ class DownloadsPage(QWidget):
             return None
         card = self.preview
         if self._route.is_file:
-            options = presets.file_download_options()
+            image_format = (
+                card.image_format_combo.currentData()
+                if not card.image_format_combo.isHidden()
+                else None
+            )
+            options = presets.file_download_options(card.name_edit.text(), image_format)
         else:
             options = presets.download_options(
                 card.preset_combo.currentData(),
                 card.resolution_combo.currentData(),
                 compatible=card.compatible_check.isChecked(),
                 crop_cover=card.crop_check.isChecked(),
+                output_name=card.name_edit.text(),
             )
         spec = JobSpec(
             job_id=uuid.uuid4().hex,
@@ -1504,6 +1735,8 @@ class DownloadsPage(QWidget):
             options=options,
         )
         job = self._add_job(spec, safe_job_title(self._info.get("title"), self._route.url))
+        if self._thumb is not None:  # the analyzed cover, or the direct image itself
+            job.card.set_thumbnail(self._thumb.toImage())
         self.empty_state.hide()
         self.scheduler.submit(spec)
         return job
@@ -1693,27 +1926,52 @@ class DownloadsPage(QWidget):
             return
         self._update_summary()
 
-    def _job_file(self, job_id: str) -> Path | None:
+    def _final_file(self, job_id: str) -> tuple[Path | None, str]:
+        """The job's finished file (after merge/convert/tag), or ``None`` and why not.
+
+        Never a folder, a ``.part`` or an intermediate stream, and never outside the job's
+        download folder, whatever the worker reported.
+        """
         job = self.jobs.get(job_id)
         if job is None or job.state != "completed":
-            return None
+            return None, ""
         root = Path(job.spec.output_dir).resolve()
+        candidates = []
         for path in job.files:
             resolved = path.resolve()
-            if resolved.is_file() and resolved.is_relative_to(root):
-                return resolved
-        return None
+            if resolved.is_relative_to(root) and not _TRANSIENT_FILE.search(resolved.name):
+                candidates.append(resolved)
+        if not candidates:
+            return None, "The download did not report a file."
+        for path in candidates:
+            if path.is_file():
+                return path, ""
+        return None, "The file was moved or deleted."
+
+    def _refresh_file_buttons(self, job: QueuedJob) -> Path | None:
+        path, reason = self._final_file(job.spec.job_id)
+        for button in (job.card.open_button, job.card.folder_button):
+            button.setEnabled(path is not None)
+            button.setToolTip(plain_tooltip(reason) if reason else "")
+        details = job.card.details_label.text()
+        if reason and reason not in details:
+            job.card.details_label.setText(f"{details}  ·  {reason}" if details else reason)
+        return path
 
     def open_file(self, job_id: str) -> bool:
-        path = self._job_file(job_id)
+        job = self.jobs.get(job_id)
+        path = self._refresh_file_buttons(job) if job else None
         return bool(path) and QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def show_in_folder(self, job_id: str) -> bool:
-        path = self._job_file(job_id)
+        job = self.jobs.get(job_id)
+        path = self._refresh_file_buttons(job) if job else None
         if path is None:
             return False
         if sys.platform == "win32":
-            subprocess.Popen(["explorer.exe", f"/select,{path}"])  # noqa: S603 (validated path)
+            # "/select," and the path as separate arguments: explorer mis-parses one quoted
+            # "/select,C: b\c.mp3" argument when the path has spaces.
+            subprocess.Popen(["explorer.exe", "/select,", str(path)])  # noqa: S603 (validated path)
             return True
         return QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
 
@@ -1729,9 +1987,12 @@ class DownloadsPage(QWidget):
         card.pause_button.setVisible(state == "paused")
         card.pause_button.setText("▶  Resume")
         card.retry_button.setVisible(state in ("failed", "cancelled"))
-        has_file = state == "completed" and self._job_file(job.spec.job_id) is not None
-        card.open_button.setVisible(has_file)
-        card.folder_button.setVisible(has_file)
+        # A completed job always shows its file actions; they are disabled, with the reason
+        # as a tooltip, when the final file is not there.
+        card.open_button.setVisible(state == "completed")
+        card.folder_button.setVisible(state == "completed")
+        if state == "completed":
+            self._refresh_file_buttons(job)
 
     def _finish_job(
         self,
@@ -1808,6 +2069,7 @@ class DownloadsPage(QWidget):
         self.pause_all_button.setEnabled(
             bool(counts.get("active") or counts.get("queued"))
         )
+        self.clear_queue_button.setEnabled(bool(self._clearable()))
 
     def _on_event(self, event: Event) -> None:
         if self._analyze_job_id and event.job_id == self._analyze_job_id:
@@ -1857,6 +2119,11 @@ class DownloadsPage(QWidget):
             tags = event.data.get("tags")
             if isinstance(tags, dict) and tags.get("checked") and not tags.get("cover"):
                 details += "  ·  no cover embedded"
+            # Worker notes, e.g. "Animated image: only the first frame was kept."
+            notes = event.data.get("notes")
+            for note in (notes if isinstance(notes, list) else [])[:MAX_NOTES]:
+                if isinstance(note, str) and KNOWN_NOTE.fullmatch(note):
+                    details += f"  ·  {note}"
             self._finish_job(
                 job,
                 "completed",
@@ -2046,7 +2313,7 @@ class HistoryPage(QWidget):
         if path is None:
             return False
         if sys.platform == "win32":
-            subprocess.Popen(["explorer.exe", f"/select,{path}"])  # noqa: S603 (validated path)
+            subprocess.Popen(["explorer.exe", "/select,", str(path)])  # noqa: S603 (validated path)
             return True
         return QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
 
