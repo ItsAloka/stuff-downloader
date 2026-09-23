@@ -37,6 +37,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from stuff_downloader_worker import tagging
 from stuff_downloader_worker.engines.base import Emit, EngineError
+from stuff_downloader_worker.names import safe_output_name
 from stuff_downloader_worker.protocol import JobSpec
 
 PRESET_ID = "spotify_mp3"
@@ -95,8 +96,11 @@ def parse_url(url: str) -> tuple[str, str]:
 
 def parse_download_options(opts: dict[str, Any]) -> tuple[str | None, bool]:
     """(video_id or None, archive). Mirrors core.spotify.download_options exactly."""
-    if set(opts) - {"mode", "preset", "video_id", "archive"} or opts.get("preset") != PRESET_ID:
+    allowed = {"mode", "preset", "video_id", "archive", "output_name"}
+    if set(opts) - allowed or opts.get("preset") != PRESET_ID:
         raise EngineError("bad_options", f"a Spotify download takes preset={PRESET_ID}")
+    if "output_name" in opts and not isinstance(opts["output_name"], str):
+        raise EngineError("bad_options", "'output_name' must be a string")
     archive = opts.get("archive", True)
     if not isinstance(archive, bool):
         raise EngineError("bad_options", "'archive' must be true or false")
@@ -159,11 +163,34 @@ def _artists(raw: Any) -> list[str]:
 
 
 def _cover_url(album: dict[str, Any]) -> str | None:
-    images = [i for i in album.get("images") or [] if isinstance(i, dict) and i.get("url")]
+    images = [
+        i for i in album.get("images") or []
+        if isinstance(i, dict) and safe_cover_url(i.get("url"))
+    ]
     if not images:
         return None
     best = max(images, key=lambda i: (i.get("width") or 0) * (i.get("height") or 0))
-    return str(best["url"])
+    return safe_cover_url(best["url"])
+
+
+def safe_cover_url(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parts = urlsplit(value)
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        return None
+    if (
+        parts.scheme != "https"
+        or not host.endswith(COVER_HOST_SUFFIXES)
+        or port not in (None, 443)
+        or parts.username
+        or parts.password
+    ):
+        return None
+    return value
 
 
 def track_row(track: dict[str, Any]) -> dict[str, Any] | None:
@@ -182,6 +209,7 @@ def track_row(track: dict[str, Any]) -> dict[str, Any] | None:
         if isinstance(duration_ms, int | float) and not isinstance(duration_ms, bool)
         else None,
         "explicit": track.get("explicit") is True,
+        "cover_url": _cover_url(album),
     }
 
 
@@ -200,6 +228,7 @@ def song_row(song: Any) -> dict[str, Any] | None:
         if isinstance(duration, int | float) and not isinstance(duration, bool)
         else None,
         "explicit": getattr(song, "explicit", False) is True,
+        "cover_url": safe_cover_url(getattr(song, "cover_url", None)),
     }
 
 
@@ -302,12 +331,10 @@ def pick_song(results: Any, fields: dict[str, Any]) -> dict[str, Any] | None:
 MAX_CANDIDATES = 8
 
 
-def candidate_rows(results: Any) -> list[dict[str, Any]]:
-    """Up to MAX_CANDIDATES song results for the owner to choose from: ids and plain text only."""
+def candidate_rows(results: Any, fields: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """Up to MAX_CANDIDATES songs, with plausible recordings before other versions."""
     rows: list[dict[str, Any]] = []
     for raw in results[:50] if isinstance(results, list) else []:
-        if len(rows) >= MAX_CANDIDATES:
-            break
         if not isinstance(raw, dict) or raw.get("resultType") not in (None, "song"):
             continue
         video_id = raw.get("videoId")
@@ -327,7 +354,12 @@ def candidate_rows(results: Any) -> list[dict[str, Any]]:
                 else None,
             }
         )
-    return rows
+        if fields is not None:
+            picked = pick_song([raw], fields)
+            rows[-1]["_rank"] = picked["score"] if picked is not None else -1.0
+    if fields is not None:
+        rows.sort(key=lambda row: row.pop("_rank"), reverse=True)
+    return rows[:MAX_CANDIDATES]
 
 
 def search_songs(fields: dict[str, Any]) -> list[Any]:
@@ -578,7 +610,7 @@ class SpotDlEngine:
         try:
             results = search_songs(fields)
             if candidates is not None:
-                candidates.extend(candidate_rows(results))
+                candidates.extend(candidate_rows(results, fields))
             picked = pick_song(results, fields)
         except Exception:  # the fallback below still gets its turn
             emit("log", {"level": "warning", "message": "YouTube Music song search failed"})
@@ -589,9 +621,12 @@ class SpotDlEngine:
         if video_id is None:
             return None
         duration = getattr(result, "duration", None) if result is not None else None
+        title = safe_text(getattr(result, "name", "")) if result is not None else ""
+        if title and _variants(title) != _variants(str(fields.get("name") or "")):
+            return None
         return {
             "video_id": video_id,
-            "title": safe_text(getattr(result, "name", "")) if result is not None else "",
+            "title": title,
             "channel": safe_text(getattr(result, "author", "")) if result is not None else "",
             "duration": float(duration)
             if isinstance(duration, int | float) and not isinstance(duration, bool) and duration
@@ -712,7 +747,9 @@ class SpotDlEngine:
         if cover is None:
             emit("log", {"level": "warning", "message": "the Spotify cover could not be loaded"})
         tags = tag_mp3(mp3s[0], fields, cover)
-        stem = file_stem(fields["artists"], fields["name"])
+        stem = safe_output_name(job.options.get("output_name")) or file_stem(
+            fields["artists"], fields["name"]
+        )
         final = move_no_overwrite(mp3s[0], folder, stem, ".mp3")
         if archive:
             ledger.add(track_id)

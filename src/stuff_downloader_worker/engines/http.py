@@ -61,6 +61,10 @@ MEDIA_EXTENSIONS = frozenset(
     }
 )  # fmt: skip
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp"})
+IMAGE_TYPES = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+    "image/gif": ".gif", "image/avif": ".avif", "image/bmp": ".bmp",
+}
 MAX_PREVIEW_BYTES = 5 * 1024 * 1024
 PREVIEW_SECONDS = 15.0
 _GENERIC_TYPES = frozenset({"application/octet-stream", "binary/octet-stream", ""})
@@ -259,6 +263,12 @@ def file_name(url: str, resp: http.client.HTTPResponse) -> str:
     """Content-Disposition, else the last URL path segment; extension from the type if absent."""
     raw = _disposition_name(resp) or unquote(urlsplit(url).path.rsplit("/", 1)[-1])
     name = safe_file_name(raw)
+    image_ext = IMAGE_TYPES.get(_content_type(resp))
+    if image_ext:
+        stem, ext = os.path.splitext(name)
+        valid_exts = {".jpg", ".jpeg"} if image_ext == ".jpg" else {image_ext}
+        if ext.lower() not in valid_exts:
+            name = stem + image_ext if stem else name + image_ext
     if "." not in name:
         guessed = mimetypes.guess_extension(_content_type(resp)) or ""
         if guessed.lower() in MEDIA_EXTENSIONS:
@@ -268,8 +278,10 @@ def file_name(url: str, resp: http.client.HTTPResponse) -> str:
 
 def is_media(name: str, content_type: str) -> bool:
     """Whether a response is a media file: a media type, or a generic one with a media name."""
-    if content_type.split("/")[0] in ("video", "audio", "image"):
-        return content_type not in ("image/svg+xml",)
+    if content_type.startswith("image/"):
+        return content_type in IMAGE_TYPES
+    if content_type.split("/")[0] in ("video", "audio"):
+        return True
     ext = os.path.splitext(name)[1].lower()
     return content_type in _GENERIC_TYPES and ext in MEDIA_EXTENSIONS
 
@@ -419,7 +431,9 @@ class HttpEngine:
         }
         if total is not None:
             info["filesize"] = total
-        is_image = ext.lower() in IMAGE_EXTENSIONS or ctype.startswith("image/")
+        is_image = ctype in IMAGE_TYPES or (
+            ctype in _GENERIC_TYPES and ext.lower() in IMAGE_EXTENSIONS
+        )
         if is_image and (total is None or total <= MAX_PREVIEW_BYTES):
             preview = _image_preview(url, emit)
             if preview is not None:
@@ -436,10 +450,11 @@ class HttpEngine:
             if resp.status not in (200, 206):
                 raise http_error(resp.status, resp.reason)
             name = file_name(final, resp)
+            probe_type = _content_type(resp)
             chosen = safe_output_name(job.options.get("output_name"))
             if chosen:
                 name = chosen + Path(name).suffix
-            if not is_media(name, _content_type(resp)):
+            if not is_media(name, probe_type):
                 raise EngineError("unsupported", "unsupported url: that link is not a media file")
         finally:
             conn.close()
@@ -472,6 +487,11 @@ class HttpEngine:
                 raise EngineError("download_error", "the partial file no longer matches; retry")
             if resp.status not in (200, 206):
                 raise http_error(resp.status, resp.reason)
+            image_probe = probe_type in IMAGE_TYPES or (
+                probe_type in _GENERIC_TYPES and Path(name).suffix.lower() in IMAGE_EXTENSIONS
+            )
+            if image_probe and _content_type(resp) != probe_type:
+                raise EngineError("unsupported", "unsupported url: the image type changed")
             if resp.status == 206 and _range_start(resp) != offset:
                 raise EngineError("download_error", "the site sent the wrong part of the file")
             if resp.status == 200:

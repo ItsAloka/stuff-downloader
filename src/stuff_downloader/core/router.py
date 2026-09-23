@@ -39,7 +39,9 @@ SITE_PRIVATE_HOST_REASON = (
     "That link points at this machine or a private network, not a public website."
 )
 SITE_CREDENTIALS_REASON = "Links with a username or password in them are not supported."
-SITE_UNSUPPORTED_REASON = "That site is not supported yet. Paste a link to a public video page."
+SITE_UNSUPPORTED_REASON = (
+    "Paste a complete direct image or video URL, or a supported social post URL."
+)
 
 # Spotify's marketing site holds no tracks. Handing it to the video engine would fail with
 # something the owner cannot act on, so it is refused by name instead.
@@ -65,6 +67,10 @@ _SHORT_HOSTS = {"youtu.be", "www.youtu.be"}
 _PATH_PREFIXES = ("shorts", "live", "embed", "v")
 
 MAX_URL_LENGTH = 2048
+INCOMPLETE_LINK_REASON = (
+    "Paste a link with a complete http or https URL to a direct image or video, "
+    "or a supported social post."
+)
 
 # A link whose path ends in one of these is the media file itself, not a page about it, so it
 # goes to the direct HTTP engine. The engine re-checks the Content-Type before saving anything,
@@ -356,19 +362,19 @@ def _route_site(parts: Any) -> Route:
 def route(text: str) -> Route:
     raw = (text or "").strip()
     if not raw:
-        return Route("invalid", reason="Paste a link first.")
+        return Route("invalid", reason=INCOMPLETE_LINK_REASON)
     if len(raw) > MAX_URL_LENGTH or any(ch.isspace() for ch in raw):
-        return Route("invalid", reason="That doesn't look like a single link.")
+        return Route("invalid", reason=f"That isn't a single valid link. {INCOMPLETE_LINK_REASON}")
     try:
         parts = urlsplit(raw)
         host = (parts.hostname or "").lower()
         parts.port  # noqa: B018 - raises on a malformed port, which _site_url would otherwise hit
     except ValueError:
-        return Route("invalid", reason="That doesn't look like a valid link.")
+        return Route("invalid", reason=f"That link is malformed. {INCOMPLETE_LINK_REASON}")
     if parts.scheme.lower() not in ("http", "https"):
-        return Route("invalid", reason="Only http and https links are supported.")
+        return Route("invalid", reason=INCOMPLETE_LINK_REASON)
     if not host:
-        return Route("invalid", reason="That doesn't look like a valid link.")
+        return Route("invalid", reason=INCOMPLETE_LINK_REASON)
     if parts.username or parts.password:
         return Route("unsupported", reason=SITE_CREDENTIALS_REASON)
 

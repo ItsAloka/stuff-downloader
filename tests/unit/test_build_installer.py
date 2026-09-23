@@ -145,6 +145,20 @@ def test_the_onedir_check_refuses_frozen_engines_and_missing_tools(bi, monkeypat
         bi.check_onedir(app, tools)
 
 
+def test_frozen_gui_import_must_pass_before_packaging(bi, monkeypatch, tmp_path):
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return type("Result", (), {"returncode": 1})()
+
+    monkeypatch.setattr(bi.subprocess, "run", run)
+    with pytest.raises(bi.PayloadError, match="frozen GUI import check failed"):
+        bi.check_gui_import(tmp_path)
+    assert calls[0][0] == [str(tmp_path / "StuffDownloader.exe"), "--check-gui-import"]
+    assert calls[0][1]["timeout"] == 20
+
+
 def test_setup_runtime_installs_offline_in_order_and_restores_env(bi, monkeypatch, tmp_path):
     setup = tmp_path / "runtime setup"  # a space, as in real install paths
     (setup / "wheels").mkdir(parents=True)

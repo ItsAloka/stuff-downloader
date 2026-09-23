@@ -53,6 +53,18 @@ def test_a_listing_keeps_order_and_rebuilds_each_track_url():
     assert not second.explicit
 
 
+def test_listing_keeps_only_spotify_cover_urls():
+    data = listing_data(
+        tracks=[
+            row(cover_url="https://i.scdn.co/image/abc"),
+            row(T2, cover_url="https://evil.example/x"),
+        ]
+    )
+    first, second = spotify.parse_listing(data).tracks
+    assert first.cover_url == "https://i.scdn.co/image/abc"
+    assert second.cover_url is None
+
+
 @pytest.mark.parametrize(
     "bad",
     [
@@ -163,6 +175,35 @@ def test_an_unknown_duration_gives_no_diff():
     assert spotify.parse_match(match_data(duration=None), track()).duration_diff is None
 
 
+def test_wrong_recording_version_is_uncertain_despite_matching_artist_and_length():
+    match = spotify.parse_match(match_data(title="Global Warming (Live)", duration=85), track())
+    assert match is not None and spotify.is_uncertain(match)
+    assert match.score < spotify.UNCERTAIN_SCORE
+
+
+def test_missing_score_evidence_needs_review():
+    assert spotify.is_uncertain(spotify.Match(T1, VID))
+
+
+def test_unknown_duration_needs_review_even_with_a_high_score():
+    assert spotify.is_uncertain(spotify.Match(T1, VID, score=99))
+
+
+def test_artist_in_title_does_not_verify_a_third_party_channel():
+    track_data = spotify.SpotifyTrack(T1, 1, "告白氣球", ("Jay Chou",), duration=215.1)
+    score = spotify.match_score(
+        track_data, "周杰倫 Jay Chou - 告白氣球【歌詞版】", "EnjoyLife", 216.0
+    )
+    assert score < spotify.UNCERTAIN_SCORE
+    assert spotify.match_score(track_data, "告白氣球", "EnjoyLife", 216.0) < spotify.UNCERTAIN_SCORE
+
+
+def test_artist_vevo_and_topic_channels_remain_high_confidence():
+    original = track()
+    assert spotify.match_score(original, original.title, "PitbullVEVO", original.duration) >= 95
+    assert spotify.match_score(original, original.title, "Pitbull - Topic", original.duration) >= 95
+
+
 @pytest.mark.parametrize(
     "text",
     [
@@ -196,8 +237,11 @@ def test_anything_but_one_youtube_video_is_refused_as_an_override(text):
 def test_batch_specs_are_one_ordinary_job_per_ticked_track():
     listing = spotify.parse_listing(listing_data())
     first, second = listing.tracks
+    other = "dQw4w9WgXcQ"
     specs = spotify.batch_specs(
-        [first, second], {T1: spotify.Match(T1, VID)}, "C:/Music", archive=True
+        [first, second],
+        {T1: spotify.Match(T1, VID, manual=True), T2: spotify.Match(T2, other, manual=True)},
+        "C:/Music", archive=True,
     )
     assert [s.engine for s in specs] == ["spotdl", "spotdl"]
     assert [s.url for s in specs] == [first.url, second.url]
@@ -207,8 +251,7 @@ def test_batch_specs_are_one_ordinary_job_per_ticked_track():
         "archive": True,
         "video_id": VID,
     }
-    # No reviewed match: the worker searches for itself.
-    assert specs[1].options == {"mode": "download", "preset": "spotify_mp3", "archive": True}
+    assert specs[1].options["video_id"] == other
     assert len({s.job_id for s in specs}) == 2
     for spec in specs:  # every spec survives the wire
         assert JobSpec.from_json(spec.to_json()) == spec
@@ -217,6 +260,30 @@ def test_batch_specs_are_one_ordinary_job_per_ticked_track():
 def test_a_bad_video_id_never_reaches_a_spec():
     with pytest.raises(ValueError):
         spotify.download_options(video_id="x; rm -rf")
+
+
+def test_batch_specs_carry_only_chosen_file_names():
+    first, second = spotify.parse_listing(listing_data()).tracks
+    specs = spotify.batch_specs(
+        [first, second],
+        {T1: spotify.Match(T1, VID, manual=True), T2: spotify.Match(T2, VID, manual=True)},
+        "C:/Music", output_names={first.track_id: "My version"},
+    )
+    assert specs[0].options["output_name"] == "My version"
+    assert "output_name" not in specs[1].options
+
+
+def test_batch_specs_reject_missing_or_unconfirmed_matches():
+    first = track()
+    with pytest.raises(ValueError, match="no reviewed match"):
+        spotify.batch_specs([first], {}, "C:/Music")
+    uncertain = spotify.Match(T1, VID, score=60, duration_diff=0)
+    with pytest.raises(ValueError, match="needs match confirmation"):
+        spotify.batch_specs([first], {T1: uncertain}, "C:/Music")
+    specs = spotify.batch_specs(
+        [first], {T1: uncertain}, "C:/Music", confirmed_ids={T1}
+    )
+    assert specs[0].options["video_id"] == VID
 
 
 def test_a_match_spec_is_a_short_job_on_one_track():

@@ -269,7 +269,14 @@ def test_analyzing_a_track_lists_it_with_bounded_text(fake_spotdl):
     (track,) = listing.tracks
     assert track.title == "Title with [link] link"
     assert track.artists == ("Pitbull", "Sensato") and track.duration == 85.0
+    assert track.cover_url == "https://i.scdn.co/image/big"
     assert events[0] == ("stage", {"stage": "analyzing"})
+
+
+def test_spotify_artwork_is_rejected_from_other_hosts():
+    raw = raw_track()
+    raw["album"]["images"] = [{"url": "https://localhost/cover.jpg", "width": 640, "height": 640}]
+    assert engine.track_row(raw)["cover_url"] is None
 
 
 def test_analyzing_an_album_uses_one_listing_pass_and_counts_unusable_rows(fake_spotdl):
@@ -475,6 +482,15 @@ def test_a_download_without_a_match_searches_itself(fake_spotdl, tmp_path):
     assert result["match"] == {"video_id": VID, "manual": False}
 
 
+def test_custom_file_name_does_not_change_spotify_tags(fake_spotdl, tmp_path):
+    options = spotify.download_options(VID)
+    options["output_name"] = "My: Version"
+    result, _ = _run(options, out=tmp_path)
+    assert (tmp_path / "My_ Version.mp3").is_file()
+    assert result["title"] == "My_ Version"
+    assert fake_spotdl["tagged"][0][1]["name"] == "Global Warming (feat. Sensato)"
+
+
 def test_the_archive_skips_a_track_before_spotify_is_asked(fake_spotdl, tmp_path):
     _run(spotify.download_options(VID), out=tmp_path)
     fake_spotdl["track_error"] = AssertionError("must not be read again")
@@ -609,8 +625,12 @@ def test_a_match_lists_the_other_song_results_as_candidates(fake_spotdl):
     result, _ = _run({"mode": "match"})
     assert result["video_id"] == "qjgnkysCPm4"
     assert result["candidates"] == [
-        {"video_id": "otherVideo1", "title": "Global Warming (Live)", "channel": "Pitbull",
-         "duration": 190.0},
+        {
+            "video_id": "otherVideo1",
+            "title": "Global Warming (Live)",
+            "channel": "Pitbull",
+            "duration": 190.0,
+        },
     ]  # the pick itself, videos, duplicates and bad ids are not repeated
 
 
@@ -619,6 +639,30 @@ def test_candidates_survive_the_spotdl_fallback(fake_spotdl):
     result, _ = _run({"mode": "match"})
     assert result["video_id"] == VID  # spotDL's pick
     assert [c["video_id"] for c in result["candidates"]] == ["otherVideo1"]
+
+
+def test_alternatives_rank_matching_recordings_ahead_of_wrong_versions():
+    results = [
+        ytm_song("aaaaaaaaaaa", "10 Things I Hate About You (Live)", ["Leah Kate"], 157),
+        ytm_song("bbbbbbbbbbb", "10 Things I Hate About You", ["Leah Kate"], 157),
+    ]
+    assert [row["video_id"] for row in engine.candidate_rows(results, FIELDS)] == [
+        "bbbbbbbbbbb", "aaaaaaaaaaa"
+    ]
+
+
+def test_spotdl_fallback_rejects_an_obvious_wrong_version(fake_spotdl, monkeypatch):
+    fake_spotdl["songs"] = []
+    monkeypatch.setattr(
+        engine.SpotDlEngine, "_spotdl_search",
+        staticmethod(lambda song: (
+            VID,
+            FakeResult(f"https://music.youtube.com/watch?v={VID}", name="Global Warming (Live)"),
+            99.0,
+        )),
+    )
+    with pytest.raises(EngineError, match="No matching song"):
+        _run({"mode": "match"})
 
 
 def test_candidate_rows_are_capped_and_plain():

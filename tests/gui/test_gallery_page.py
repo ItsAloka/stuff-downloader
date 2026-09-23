@@ -180,6 +180,44 @@ def test_a_photo_only_tweet_falls_back_from_ytdlp_to_gallery_dl(page, runs):
     assert page._route.is_gallery
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://www.instagram.com/p/ABC123/",
+        "https://www.tiktok.com/@person/photo/123",
+        "https://www.facebook.com/photo.php?fbid=123",
+        "https://x.com/person/status/123",
+    ],
+)
+@pytest.mark.parametrize("count", [1, 3])
+def test_social_image_post_selection_downloads_originals(page, runs, qtbot, url, count):
+    page.url_edit.setText(url)
+    page.analyze()
+    first = runs[-1]
+    if first.spec.engine == "ytdlp":
+        first.emit("error", code="unsupported", message="image post requires gallery extraction")
+    assert runs[-1].spec.engine == "gallerydl"
+    result = gallery_result(count)
+    result["items"] = [
+        {"index": i, "kind": "image", "ext": "jpg"} for i in range(1, count + 1)
+    ]
+    runs[-1].emit("result", **result)
+    qtbot.waitUntil(lambda: not page.gallery_card.isHidden())
+    assert page.gallery_card.selected_indices() == list(range(1, count + 1))
+    assert page.gallery_card.grid.item(0).icon().isNull()  # no preview is allowed
+    job = page.start_gallery_download()
+    assert job.spec.options["preset"] == "gallery_original"
+    assert job.spec.options["items"] == list(range(1, count + 1))
+
+
+def test_social_image_analysis_failure_is_shown(page, runs):
+    page.url_edit.setText("https://www.instagram.com/p/ABC123/")
+    page.analyze()
+    runs[-1].emit("error", code="download_error", message="login required")
+    assert page.gallery_card.isHidden()
+    assert not page.login_button.isHidden()
+
+
 def test_restored_gallery_jobs_come_back_paused(qtbot, monkeypatch, runs, tmp_path):
     from stuff_downloader.core import history
 

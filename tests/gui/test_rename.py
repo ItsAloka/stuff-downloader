@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from PyQt6.QtCore import Qt
 from test_main_window import _analyzed
 from test_playlist_queue import expand, listing, runs, window  # noqa: F401  (fixtures)
 
@@ -23,6 +24,20 @@ def test_a_single_item_sends_only_a_typed_name(window, runs, qtbot):  # noqa: F8
     assert "output_name" not in page.start_download().spec.options
     page.preview.name_edit.setText("My clip")
     assert page.start_download().spec.options["output_name"] == "My clip"
+
+
+def test_clicking_single_title_opens_name_editor(window, runs, qtbot):  # noqa: F811
+    page = _analyzed(window, runs, qtbot)
+    page.preview.name_edit.setText("Renamed")
+    qtbot.mouseClick(page.preview.title_label, Qt.MouseButton.LeftButton)
+    assert page.preview.name_edit.selectedText() == "Renamed"
+
+
+def test_clicking_playlist_title_opens_its_name_editor(window, runs):  # noqa: F811
+    page = expand(window, runs, payload=listing(2, unavailable_last=False))
+    _name_edit(page, 0).setText("Renamed")
+    page.playlist_card._focus_name_on_title_click(0, page.playlist_card.TITLE_COLUMN)
+    assert _name_edit(page, 0).selectedText() == "Renamed"
 
 
 def test_untouched_playlist_rows_keep_the_default_template(window, runs):  # noqa: F811

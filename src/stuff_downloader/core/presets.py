@@ -46,7 +46,19 @@ PRESETS: tuple[Preset, ...] = (
         "audio",
         description="MP3 (VBR ~V0, best transcode) with cover art and tags",
     ),
-    Preset("audio_original", "Audio — Original (no re-encode)", "audio", None, "Opus or M4A"),
+    Preset(
+        "audio_original", "Original audio / Opus — recommended", "audio", None,
+        "Preserves the source stream without re-encoding; usually Opus or M4A",
+    ),
+    Preset("audio_m4a", "M4A / AAC — broad compatibility", "audio", None, "Converts to AAC in M4A"),
+    Preset(
+        "audio_flac", "FLAC — format conversion", "audio", None,
+        "Larger file; a lossy YouTube source gains no quality",
+    ),
+    Preset(
+        "audio_wav", "WAV — format conversion", "audio", None,
+        "Larger file; a lossy YouTube source gains no quality",
+    ),
     Preset("thumbnail", "Thumbnail only", "thumbnail", None, "The cover image as JPG"),
 )
 

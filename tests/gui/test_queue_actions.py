@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from PyQt6.QtWidgets import QMessageBox
 from test_main_window import _analyzed
 from test_playlist_queue import expand, listing, runs, window  # noqa: F401  (fixtures)
 
@@ -140,3 +141,75 @@ def test_show_in_folder_passes_explorer_an_argument_list(
     ((args, kwargs),) = calls
     assert args == (["explorer.exe", "/select,", str(out.resolve())],)
     assert "shell" not in kwargs
+
+
+def test_cancel_remaining_covers_active_queued_and_paused(window, runs, qtbot):  # noqa: F811
+    page = _analyzed(window, runs, qtbot)
+    active = page.start_download()
+    queued = page.start_download()
+    paused = page.start_download()
+    page.pause_job(paused.spec.job_id)
+
+    page.cancel_remaining_jobs()
+
+    assert active.state == queued.state == paused.state == "cancelled"
+    assert not page.cancel_all_button.isEnabled()
+    assert "3 cancelled" in page.queue_summary.text()
+
+
+def test_remove_selected_preserves_completed_file_and_other_jobs(
+    window, runs, qtbot, tmp_path  # noqa: F811
+):
+    window.settings_page.set_folder(str(tmp_path))
+    page = _analyzed(window, runs, qtbot)
+    final = tmp_path / "done.mp4"
+    final.write_bytes(b"done")
+    completed = _finish(page, runs, qtbot, "completed", [final])
+    other = page.start_download()
+    completed.card.select_box.setChecked(True)
+    assert page.remove_selected_button.isEnabled()
+
+    page.remove_selected_jobs()
+
+    assert set(page.jobs) == {other.spec.job_id}
+    assert final.read_bytes() == b"done"
+    assert not page.remove_selected_button.isEnabled()
+
+
+def test_clear_non_active_offers_keep_or_discard_for_known_partial(
+    window, runs, qtbot, tmp_path, monkeypatch  # noqa: F811
+):
+    window.settings_page.set_folder(str(tmp_path))
+    page = _analyzed(window, runs, qtbot)
+    paused = page.start_download()
+    page.pause_job(paused.spec.job_id)
+    partial = tmp_path / "song.mp4.part"
+    partial.write_bytes(b"partial")
+    paused.files = [partial]
+    completed_file = tmp_path / "done.mp4"
+    completed_file.write_bytes(b"done")
+    completed = _finish(page, runs, qtbot, "completed", [completed_file])
+    choices = iter((QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.No))
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **kw: next(choices))
+
+    page.clear_non_active_jobs()
+    assert paused.spec.job_id in page.jobs and partial.exists()
+    page.clear_non_active_jobs()
+    assert not page.jobs and not partial.exists()
+    assert completed.spec.job_id not in page.jobs and completed_file.exists()
+
+
+def test_selected_active_row_waits_for_worker_exit(window, runs, qtbot, monkeypatch):  # noqa: F811
+    page = _analyzed(window, runs, qtbot)
+    job = page.start_download()
+    run = job.run
+    monkeypatch.setattr(run, "cancel", lambda: setattr(run, "cancelled", True))
+    job.card.select_box.setChecked(True)
+
+    page.remove_selected_jobs()
+    assert run.cancelled and job.spec.job_id in page.jobs
+    assert not job.card.select_box.isEnabled()
+
+    run.emit("result", files=[], total_bytes=1)  # late success after cancellation
+    assert job.spec.job_id not in page.jobs
+    assert not page.remove_selected_button.isEnabled()

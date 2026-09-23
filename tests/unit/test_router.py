@@ -104,6 +104,39 @@ def test_invalid_input_is_rejected(text):
 @pytest.mark.parametrize(
     "text",
     [
+        "example.com/photo.jpg",
+        "//example.com/photo.jpg",
+        "https:/example.com/photo.jpg",
+        "https:///photo.jpg",
+        "http://",
+        "https://example.com:abc/photo.jpg",
+        "https://[broken/photo.jpg",
+    ],
+)
+def test_incomplete_or_malformed_media_link_has_actionable_guidance(text):
+    result = route(text)
+    assert not result.ok and result.kind == "invalid"
+    assert "complete" in result.reason.lower()
+    assert "image" in result.reason.lower()
+    assert "social post" in result.reason.lower()
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://cdn.example.com/photo.jpg",
+        "https://cdn.example.com/video.mp4",
+        "https://www.instagram.com/p/ABC123/",
+        "https://vimeo.com/123456789",
+    ],
+)
+def test_complete_media_links_remain_accepted(text):
+    assert route(text).ok
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
         "https://www.youtube.com/playlist?list=PLabc",  # a YouTube list we cannot enumerate
         "https://www.youtube.com/@example/live",
     ],

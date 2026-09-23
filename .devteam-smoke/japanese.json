@@ -1,0 +1,122 @@
+{
+  "spotify_url": "https://open.spotify.com/track/1zVsw1SqQKgtzE4aqmE8nE",
+  "analyze": {
+    "type": "result",
+    "data": {
+      "kind": "spotify",
+      "spotify_kind": "track",
+      "spotify_id": "1zVsw1SqQKgtzE4aqmE8nE",
+      "title": "Idol",
+      "owner": "YOASOBI",
+      "tracks": [
+        {
+          "id": "1zVsw1SqQKgtzE4aqmE8nE",
+          "title": "Idol",
+          "artists": [
+            "YOASOBI"
+          ],
+          "album": "Idol",
+          "duration": 213.2,
+          "explicit": false,
+          "cover_url": "https://i.scdn.co/image/ab67616d0000b2735bc0a615145b2e32f8a2d677"
+        }
+      ],
+      "skipped": 0,
+      "truncated": false
+    }
+  },
+  "match": {
+    "type": "result",
+    "data": {
+      "kind": "spotify_match",
+      "track_id": "1zVsw1SqQKgtzE4aqmE8nE",
+      "video_id": "IzJ_ioBHrPU",
+      "title": "Idol",
+      "channel": "YOASOBI",
+      "duration": 214.0,
+      "confidence": 95.0,
+      "spotify_duration": 213,
+      "candidates": [
+        {
+          "video_id": "m9SMT5ipbxk",
+          "title": "アイドル",
+          "channel": "YOASOBI",
+          "duration": 214.0
+        },
+        {
+          "video_id": "pbNRQVJrnQ4",
+          "title": "IDOL (from \"Oshi no Ko\")",
+          "channel": "AmaLee",
+          "duration": 213.0
+        },
+        {
+          "video_id": "0k8rB-gsveQ",
+          "title": "Interlude \"Worship\"",
+          "channel": "YOASOBI",
+          "duration": 68.0
+        },
+        {
+          "video_id": "mJ1N7-HyH1A",
+          "title": "夜に駆ける",
+          "channel": "YOASOBI",
+          "duration": 259.0
+        },
+        {
+          "video_id": "by4SYYWlhEs",
+          "title": "夜に駆ける",
+          "channel": "YOASOBI",
+          "duration": 262.0
+        },
+        {
+          "video_id": "h1Ebp1_f6Q0",
+          "title": "群青",
+          "channel": "YOASOBI",
+          "duration": 249.0
+        },
+        {
+          "video_id": "Omb_L1xs2qw",
+          "title": "Idol (English Cover)",
+          "channel": "Rachie",
+          "duration": 213.0
+        }
+      ]
+    }
+  },
+  "review": {
+    "spotify_title": "Idol",
+    "spotify_artist": "YOASOBI",
+    "spotify_duration": 213.2,
+    "youtube_url": "https://music.youtube.com/watch?v=IzJ_ioBHrPU",
+    "youtube_title": "Idol",
+    "youtube_channel": "YOASOBI",
+    "youtube_duration": 214.0,
+    "duration_diff": 0.8,
+    "score": 99.3,
+    "uncertain": false
+  },
+  "download": {
+    "type": "result",
+    "data": {
+      "title": "YOASOBI - Idol",
+      "preset": "spotify_mp3",
+      "files": [
+        "C:\\Users\\aloka\\Mine\\Projects\\Stuff Donwloader\\.devteam-smoke\\japanese\\YOASOBI - Idol.mp3"
+      ],
+      "total_bytes": 7427187,
+      "tags": {
+        "title": "Idol",
+        "artist": "YOASOBI",
+        "album": "Idol",
+        "track_number": 1,
+        "cover": {
+          "width": 640,
+          "height": 640
+        }
+      },
+      "match": {
+        "video_id": "IzJ_ioBHrPU",
+        "manual": true
+      }
+    }
+  }
+}

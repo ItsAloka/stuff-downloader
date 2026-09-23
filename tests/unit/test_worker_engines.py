@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import sys
 from pathlib import Path
@@ -70,10 +71,11 @@ def fake_ytdlp(monkeypatch):
         fmt["url"] = f"https://rr1.googlevideo.com/videoplayback?sig=SECRET&itag={fmt['format_id']}"
         fmt["http_headers"] = {"Cookie": "SID=secret"}
     raw["thumbnails"] = [
-        {"url": "https://evil.example/huge.jpg", "width": 9999, "height": 9999},
+        {"url": "https://localhost/huge.jpg", "width": 9999, "height": 9999},
         {"url": "https://i.ytimg.com/vi/x/hq.jpg", "width": 480, "height": 360},
         {"url": "http://i.ytimg.com/vi/x/sq.jpg", "width": 544, "height": 544},
     ]
+    state["raw"] = raw
 
     class Resp:
         def __init__(self, data):
@@ -102,7 +104,7 @@ def fake_ytdlp(monkeypatch):
             assert download is False
             if state["raise"]:
                 raise FakeDownloadError(state["raise"])
-            return json.loads(json.dumps(raw))
+            return json.loads(json.dumps(state["raw"]))
 
         def urlopen(self, url):
             state["thumb_url"] = url
@@ -152,10 +154,96 @@ def test_analyze_returns_sanitized_info_and_safe_thumbnail(fake_ytdlp):
     assert "googlevideo" not in text and "SECRET" not in text and "Cookie" not in text
     assert result["title"] and result["engine_version"] == "2026.08.19"
     assert all("url" not in f for f in result["formats"])
-    assert fake_ytdlp["thumb_url"] == "https://i.ytimg.com/vi/x/hq.jpg"  # https + known host only
+    assert fake_ytdlp["thumb_url"] == "https://i.ytimg.com/vi/x/hq.jpg"
+    assert result["thumbnail_url"] == fake_ytdlp["thumb_url"]
     assert result["thumbnail"]["data"]
     assert events[0] == ("stage", {"stage": "analyzing"})
     assert fake_ytdlp["opts"]["noplaylist"] is True
+
+
+@pytest.mark.parametrize("ext", ["jpg", "webp"])
+def test_image_only_extractor_result_hands_off_to_gallery(fake_ytdlp, ext):
+    raw = fake_ytdlp["raw"]
+    raw["ext"] = ext
+    raw["formats"] = [{"format_id": "image", "ext": ext, "url": "https://cdn.example/image"}]
+    with pytest.raises(EngineError, match="image post requires gallery") as exc:
+        get_engine("ytdlp").download(_spec("ytdlp", mode="analyze"), lambda *_: None)
+    assert exc.value.code == "unsupported"
+
+
+def test_video_with_image_thumbnail_stays_a_video(fake_ytdlp):
+    fake_ytdlp["raw"]["ext"] = "mp4"
+    assert get_engine("ytdlp").download(_spec("ytdlp", mode="analyze"), lambda *_: None)[
+        "title"
+    ]
+
+
+def test_non_youtube_preview_uses_checked_http_and_falls_back(monkeypatch):
+    from stuff_downloader_worker.engines import ytdlp
+
+    url = "https://cdn.instagram.com/reel/cover.jpg"
+    assert ytdlp._thumbnail_url({"thumbnail": url}) == url
+    assert ytdlp._thumbnail_url({"thumbnail": "https://127.0.0.1/x.jpg"}) is None
+    assert ytdlp._thumbnail_url({"thumbnail": "http://cdn.instagram.com/x.jpg"}) is None
+    assert ytdlp._thumbnail_url({"thumbnail": None}) is None
+    called = []
+
+    class Conn:
+        def request(self, *_args, **_kwargs):
+            called.append("requested")
+
+        def getresponse(self):
+            return Resp()
+
+        def close(self):
+            called.append("closed")
+
+    class Resp:
+        status = 200
+
+        def read(self, amount):
+            return b"image"[:amount]
+
+    monkeypatch.setattr(ytdlp, "_connect", lambda target: (called.append(target.host) or Conn()))
+    result = ytdlp.YtDlpEngine._thumbnail_preview(None, {"thumbnail": url}, lambda *_: None)
+    assert base64.b64decode(result["data"]) == b"image"
+    assert called == ["cdn.instagram.com", "requested", "closed"]
+    monkeypatch.setattr(ytdlp, "_connect", lambda _: (_ for _ in ()).throw(OSError("secret")))
+    logs = []
+    assert (
+        ytdlp.YtDlpEngine._thumbnail_preview(
+            None, {"thumbnail": url}, lambda *event: logs.append(event)
+        )
+        is None
+    )
+    assert "secret" not in str(logs)
+
+
+def test_thumbnail_redirect_cannot_downgrade_to_http(monkeypatch):
+    from stuff_downloader_worker.engines import ytdlp
+
+    called = []
+
+    class Conn:
+        def request(self, *_args, **_kwargs):
+            pass
+
+        def getresponse(self):
+            return self
+
+        status = 302
+
+        def getheader(self, _name):
+            return "http://cdn.instagram.com/unprotected.jpg"
+
+        def close(self):
+            called.append("closed")
+
+    monkeypatch.setattr(ytdlp, "_connect", lambda target: (called.append(target.host) or Conn()))
+    assert ytdlp.YtDlpEngine._thumbnail_preview(
+        None, {"thumbnail": "https://cdn.instagram.com/cover.jpg"}, lambda *_: None
+    ) is None
+    assert called == ["cdn.instagram.com", "closed"]
 
 
 def test_download_emits_stages_progress_and_file(fake_ytdlp, tmp_path):

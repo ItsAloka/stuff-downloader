@@ -176,7 +176,24 @@ def build_gui(dest: Path) -> Path:
     )  # fmt: skip
     app_dir = dest / "StuffDownloader"
     check_onedir(app_dir, _find_tools_dir(app_dir))
+    check_gui_import(app_dir)
     return app_dir
+
+
+def check_gui_import(app_dir: Path) -> None:
+    """Catch DLL conflicts in the frozen GUI before making an installer."""
+    exe = app_dir / "StuffDownloader.exe"
+    try:
+        result = subprocess.run(
+            [str(exe), "--check-gui-import"],
+            capture_output=True,
+            timeout=20,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise PayloadError("frozen GUI import check timed out") from exc
+    if result.returncode:
+        raise PayloadError(f"frozen GUI import check failed (exit {result.returncode})")
 
 
 def _find_tools_dir(app_dir: Path) -> Path:

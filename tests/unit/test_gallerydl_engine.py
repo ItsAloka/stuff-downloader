@@ -52,6 +52,7 @@ class FakeSession:
 @pytest.fixture
 def fake_gdl(monkeypatch):
     state = {
+        "category": "instagram",
         "config": {},
         "items": [
             (
@@ -121,10 +122,9 @@ def fake_gdl(monkeypatch):
     message.Message = Message
 
     class FakeExtractor:
-        category = "instagram"
-
         def __init__(self, url):
             self.url = url
+            self.category = state["category"]
             self.session = FakeSession(state)
 
     extractor.find = lambda url: FakeExtractor(url) if state["found"] else None
@@ -247,6 +247,53 @@ def test_analyze_returns_rebuilt_rows_and_never_an_item_url(fake_gdl):
     assert "SUPERSECRET" not in text and "cdninstagram" not in text and "http" not in text
     assert "_secret" not in text
     assert [k for k, _ in events if k == "stage"] == ["stage", "stage"]
+
+
+@pytest.mark.parametrize(
+    ("category", "url"),
+    [
+        ("instagram", "https://www.instagram.com/p/ABC123/"),
+        ("tiktok", "https://www.tiktok.com/@person/photo/123"),
+        ("facebook", "https://www.facebook.com/photo.php?fbid=123"),
+        ("twitter", "https://x.com/person/status/123"),
+    ],
+)
+@pytest.mark.parametrize("count", [1, 3])
+def test_social_image_posts_keep_every_original_item(fake_gdl, tmp_path, category, url, count):
+    fake_gdl["category"] = category
+    fake_gdl["items"] = [
+        (f"https://cdn.example.com/original-{i}.jpg", {"extension": "jpg"})
+        for i in range(1, count + 1)
+    ]
+    result, _ = _run({"mode": "analyze"}, url=url)
+    assert [row["kind"] for row in result["items"]] == ["image"] * count
+    assert [row["index"] for row in result["items"]] == list(range(1, count + 1))
+    downloaded, _ = _run(
+        {"mode": "download", "preset": "gallery_original", "items": list(range(1, count + 1))},
+        url=url,
+        out=tmp_path,
+    )
+    assert len(downloaded["files"]) == count
+    assert all(Path(path).suffix == ".jpg" for path in downloaded["files"])
+
+
+def test_missing_social_image_preview_does_not_drop_original(fake_gdl):
+    fake_gdl["items"] = [("https://cdn.example.com/original.jpg", {"extension": "jpg"})]
+    fake_gdl["preview_bytes"] = b"x" * (gallerydl.MAX_PREVIEW_BYTES + 1)
+    result, _ = _run({"mode": "analyze"})
+    assert len(result["items"]) == 1 and result["items"][0]["kind"] == "image"
+    assert "thumbnail" not in result["items"][0]
+
+
+@pytest.mark.parametrize("category", ["instagram", "tiktok", "facebook", "twitter"])
+def test_social_image_extractor_failure_is_reported(fake_gdl, category):
+    fake_gdl["category"] = category
+    fake_gdl["items"] = []
+    fake_gdl["child_error"] = {"error": "AuthRequired", "message": "login required"}
+    with pytest.raises(EngineError) as exc:
+        _run({"mode": "analyze"})
+    assert exc.value.code == "download_error"
+    assert "login required" in exc.value.message
 
 
 def test_previews_only_from_https_public_hosts(fake_gdl):

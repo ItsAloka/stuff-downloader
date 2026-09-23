@@ -81,6 +81,15 @@ a = Analysis(
     excludes=ENGINE_EXCLUDES + ["tkinter", "pytest", "pytestqt"],
     noarchive=False,
 )
+# The build host can put unrelated native tools on PATH. In particular Poppler's ICU DLL
+# exports a different API from the Windows ICU used by Qt; if collected beside the app it
+# shadows the system DLL and PyQt6.QtWidgets fails to import with WinError 127.
+SYSTEM_DLLS = {"icuuc.dll", "ucrtbase.dll"}
+a.binaries = [
+    item for item in a.binaries
+    if Path(item[0]).name.lower() not in SYSTEM_DLLS
+    and not Path(item[0]).name.lower().startswith(("api-ms-win-", "icudt"))
+]
 pyz = PYZ(a.pure)
 
 exe = EXE(

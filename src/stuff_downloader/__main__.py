@@ -42,10 +42,16 @@ def self_test() -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="stuff_downloader")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--check-gui-import", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO)
     if args.self_test:
         return self_test()
+
+    if args.check_gui_import:
+        from .app import run_app  # noqa: F401 - import the complete GUI dependency chain
+
+        return 0
 
     from .app import run_app
 

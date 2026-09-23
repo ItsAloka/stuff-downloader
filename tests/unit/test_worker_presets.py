@@ -59,8 +59,20 @@ def test_thumbnail_and_original_audio_presets():
     assert thumb["skip_download"] and thumb["writethumbnail"]
     assert "thumbnailsconvertor+ffmpeg_o" in thumb["postprocessor_args"]
     audio = presets.build_ydl_opts(_req(preset="audio_original"), ".")
-    assert audio["format"] == "bestaudio/best"
-    assert [pp["key"] for pp in audio["postprocessors"]] == ["FFmpegMetadata"]
+    assert audio["format"] == "bestaudio[acodec=opus]/bestaudio/best"
+    assert "postprocessors" not in audio
+
+
+@pytest.mark.parametrize(
+    ("preset_id", "codec"),
+    [("audio_m4a", "m4a"), ("audio_flac", "flac"), ("audio_wav", "wav")],
+)
+def test_audio_conversion_uses_fixed_ffmpeg_codec(preset_id, codec):
+    opts = presets.build_ydl_opts(_req(preset=preset_id), ".")
+    assert opts["format"] == "bestaudio/best"
+    assert opts["postprocessors"] == [
+        {"key": "FFmpegExtractAudio", "preferredcodec": codec}
+    ]
 
 
 @pytest.mark.parametrize(

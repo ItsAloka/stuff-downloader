@@ -15,9 +15,10 @@ from typing import Any
 from .engines.base import EngineError
 from .names import safe_output_name
 
-PRESET_IDS = frozenset(
-    {"video_best", "video_1080", "video_720", "mp3_music", "audio_original", "thumbnail"}
-)
+PRESET_IDS = frozenset({
+    "video_best", "video_1080", "video_720", "mp3_music", "audio_original",
+    "audio_m4a", "audio_flac", "audio_wav", "thumbnail",
+})
 PRESET_MAX_HEIGHT = {"video_1080": 1080, "video_720": 720}
 VIDEO_PRESETS = frozenset({"video_best", "video_1080", "video_720"})
 HEIGHTS = frozenset({4320, 2160, 1440, 1080, 720, 480, 360, 240, 144})
@@ -231,9 +232,19 @@ def build_ydl_opts(request: DownloadRequest, output_dir: str) -> dict[str, Any]:
     elif request.preset == "audio_original":
         opts.update(
             {
+                "format": "bestaudio[acodec=opus]/bestaudio/best",
+                "outtmpl": music_outtmpl(request),
+            }
+        )
+    elif request.preset in ("audio_m4a", "audio_flac", "audio_wav"):
+        codec = {"audio_m4a": "m4a", "audio_flac": "flac", "audio_wav": "wav"}[
+            request.preset
+        ]
+        opts.update(
+            {
                 "format": "bestaudio/best",
                 "outtmpl": music_outtmpl(request),
-                "postprocessors": [{"key": "FFmpegMetadata", "add_metadata": True}],
+                "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": codec}],
             }
         )
     else:  # thumbnail

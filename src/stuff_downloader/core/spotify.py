@@ -22,6 +22,7 @@ import uuid
 from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from typing import Any
+from urllib.parse import urlsplit
 
 from .protocol import JobSpec
 from .router import SPOTIFY_ID, SPOTIFY_KINDS, route, spotify_url
@@ -45,6 +46,25 @@ UNCERTAIN_RULE = (
 )
 _FEAT = re.compile(r"[\(\[]\s*(feat|ft|with)\.?\s[^\)\]]*[\)\]]|\s(feat|ft)\.?\s.*$", re.I)
 _NON_WORD = re.compile(r"[^\w]+")
+_VERSION_MARKERS = (
+    "sped up", "speed up", "slowed", "reverb", "nightcore", "remix", "live",
+    "acoustic", "instrumental", "karaoke", "cover", "8d", "remaster",
+    "extended", "radio edit", "remastered", "spedup", "slowed down",
+)
+_UNVERIFIED_UPLOAD_MARKERS = ("lyric", "lyrics", "lyric video", "歌詞", "歌词", "歌詞版", "歌词版")
+
+
+def _versions(title: str) -> set[str]:
+    words = f" {_norm(title)} "
+    return {marker for marker in _VERSION_MARKERS if f" {marker} " in words}
+
+
+def _artist_channel(artist: str, channel: str) -> bool:
+    if f" {artist} " in f" {_norm(channel)} ":
+        return True
+    compact_artist = artist.replace(" ", "")
+    compact_channel = _norm(channel).replace(" ", "")
+    return any(compact_channel == compact_artist + suffix for suffix in ("vevo", "official"))
 
 OVERRIDE_INVALID_REASON = "Paste a YouTube or YouTube Music link to a single song."
 
@@ -64,6 +84,26 @@ def _seconds(value: Any) -> float | None:
     return float(value)
 
 
+def _cover_url(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parts = urlsplit(value)
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        return None
+    if (
+        parts.scheme != "https"
+        or not host.endswith((".scdn.co", ".spotifycdn.com"))
+        or port not in (None, 443)
+        or parts.username
+        or parts.password
+    ):
+        return None
+    return value
+
+
 @dataclass(frozen=True)
 class SpotifyTrack:
     track_id: str
@@ -73,6 +113,7 @@ class SpotifyTrack:
     album: str = ""
     duration: float | None = None
     explicit: bool = False
+    cover_url: str | None = None
 
     @property
     def url(self) -> str:
@@ -141,21 +182,34 @@ def match_score(track: SpotifyTrack, title: str, channel: str, duration: float |
     title_part = SequenceMatcher(None, want, got).ratio() if want and got else 0.0
     if want and got and (f" {want} " in f" {got} "):
         title_part = max(title_part, 0.9)  # "Song (Official Audio)" is still the song
-    where = f" {_norm(channel)} {got} "
     artists = [_norm(a) for a in track.artists if _norm(a)]
-    artist_part = 1.0 if any(f" {a} " in where for a in artists) else 0.0
+    artist_part = 1.0 if any(_artist_channel(a, channel) for a in artists) else 0.0
     diff = duration_diff(duration, track.duration)
     length_part = 0.5 if diff is None else max(0.0, 1 - min(abs(diff), 30.0) / 30.0)
-    return round(50 * title_part + 25 * artist_part + 25 * length_part, 1)
+    score = 50 * title_part + 25 * artist_part + 25 * length_part
+    if not artist_part:
+        score = min(score, UNCERTAIN_SCORE - 1)
+    if _versions(track.title) != _versions(title):
+        score = min(score, UNCERTAIN_SCORE - 1)
+    got_words = f" {got} "
+    want_words = f" {want} "
+    if any(
+        f" {marker} " in got_words and f" {marker} " not in want_words
+        for marker in _UNVERIFIED_UPLOAD_MARKERS
+    ):
+        score = min(score, UNCERTAIN_SCORE - 1)
+    return round(score, 1)
 
 
 def is_uncertain(match: Match) -> bool:
     """A match to check before downloading. A link the owner chose is never flagged."""
     if match.manual:
         return False
+    if match.duration_diff is None:
+        return True
     if match.duration_diff is not None and abs(match.duration_diff) > UNCERTAIN_DIFF:
         return True
-    return match.score is not None and match.score < UNCERTAIN_SCORE
+    return match.score is None or match.score < UNCERTAIN_SCORE
 
 
 def parse_candidates(data: Any, track: SpotifyTrack) -> tuple[Candidate, ...]:
@@ -218,6 +272,7 @@ def parse_track(raw: Any, index: int) -> SpotifyTrack | None:
         album=_text(raw.get("album")),
         duration=_seconds(raw.get("duration")),
         explicit=raw.get("explicit") is True,
+        cover_url=_cover_url(raw.get("cover_url")),
     )
 
 
@@ -348,17 +403,22 @@ def batch_specs(
     matches: dict[str, Match],
     output_dir: str,
     archive: bool = True,
+    output_names: dict[str, str] | None = None,
+    confirmed_ids: set[str] | None = None,
 ) -> list[JobSpec]:
-    """One ordinary download job per selected track, carrying its reviewed match if any.
-
-    A track with no reviewed match is still queued: the worker then searches for it itself.
-    """
+    """One job per track, requiring a reviewed or explicitly confirmed recording."""
     specs = []
     for track in tracks:
         match = matches.get(track.track_id)
+        if match is None or match.track_id != track.track_id:
+            raise ValueError(f"Spotify track {track.track_id} has no reviewed match")
+        if is_uncertain(match) and track.track_id not in (confirmed_ids or set()):
+            raise ValueError(f"Spotify track {track.track_id} needs match confirmation")
         options = download_options(
-            video_id=match.video_id if match is not None else None, archive=archive
+            video_id=match.video_id, archive=archive
         )
+        if output_names and track.track_id in output_names:
+            options["output_name"] = output_names[track.track_id]
         specs.append(
             JobSpec(
                 job_id=uuid.uuid4().hex,

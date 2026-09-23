@@ -106,16 +106,16 @@ def test_a_video_page_after_a_file_gets_the_video_presets_back(page, runs, qtbot
     assert combo.currentData() == "video_1080"
 
 
-def test_an_unknown_page_falls_back_to_gallery_then_direct_engine_once_each(page, runs):
+def test_an_unknown_page_probes_direct_then_video_and_gallery_once_each(page, runs):
     _analyze(page, "https://media.example.net/get?id=7")
-    assert runs[0].spec.engine == "ytdlp"
-    runs[0].emit("error", code="unsupported", message="ERROR: Unsupported URL: [link]")
+    assert runs[0].spec.engine == "http"
+    runs[0].emit("error", code="unsupported", message="unsupported url: not a media file")
     assert len(runs) == 2
-    assert runs[1].spec.engine == "gallerydl" and runs[1].spec.url == runs[0].spec.url
-    runs[1].emit("error", code="unsupported", message="unsupported url: no gallery found")
+    assert runs[1].spec.engine == "ytdlp" and runs[1].spec.url == runs[0].spec.url
+    runs[1].emit("error", code="unsupported", message="ERROR: Unsupported URL: [link]")
     assert len(runs) == 3
-    assert runs[2].spec.engine == "http" and runs[2].spec.url == runs[0].spec.url
-    runs[2].emit("error", code="unsupported", message="unsupported url: not a media file")
+    assert runs[2].spec.engine == "gallerydl" and runs[2].spec.url == runs[0].spec.url
+    runs[2].emit("error", code="unsupported", message="unsupported url: no gallery found")
     assert len(runs) == 3  # no fourth attempt
     assert "not a video page" in page.message_label.text()
 

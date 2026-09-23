@@ -1,0 +1,122 @@
+{
+  "spotify_url": "https://open.spotify.com/track/73fXPtSK5jS0MaGUdGDUqJ",
+  "analyze": {
+    "type": "result",
+    "data": {
+      "kind": "spotify",
+      "spotify_kind": "track",
+      "spotify_id": "73fXPtSK5jS0MaGUdGDUqJ",
+      "title": "Manike Mage Hithe",
+      "owner": "Yohani",
+      "tracks": [
+        {
+          "id": "73fXPtSK5jS0MaGUdGDUqJ",
+          "title": "Manike Mage Hithe",
+          "artists": [
+            "Yohani"
+          ],
+          "album": "Manike Mage Hithe",
+          "duration": 167.6,
+          "explicit": false,
+          "cover_url": "https://i.scdn.co/image/ab67616d0000b2734369396341771d806ab037b6"
+        }
+      ],
+      "skipped": 0,
+      "truncated": false
+    }
+  },
+  "match": {
+    "type": "result",
+    "data": {
+      "kind": "spotify_match",
+      "track_id": "73fXPtSK5jS0MaGUdGDUqJ",
+      "video_id": "k0NzOb6CMBs",
+      "title": "Manike Mage Hithe",
+      "channel": "Chamath Sangeeth, Yohani, Satheeshan",
+      "duration": 163.0,
+      "confidence": 80.0,
+      "spotify_duration": 167,
+      "candidates": [
+        {
+          "video_id": "99CFGKKvzRs",
+          "title": "Manike",
+          "channel": "Yohani, Jubin Nautiyal, Surya Ragunaathan",
+          "duration": 198.0
+        },
+        {
+          "video_id": "XTB3bbSH2Yk",
+          "title": "Manike Mage Hithe (feat. Dulan ARX)",
+          "channel": "Satheeshan",
+          "duration": 194.0
+        },
+        {
+          "video_id": "Ihk5Bt61kgM",
+          "title": "Manike Mage Hithe (Malayalam & Tamil Version)",
+          "channel": "Chamath Sangeeth, Yohani, Anas Shajahan",
+          "duration": 160.0
+        },
+        {
+          "video_id": "xdMPX1VxLcc",
+          "title": "Manike Mage Hithe",
+          "channel": "Khala Gul",
+          "duration": 123.0
+        },
+        {
+          "video_id": "C4a4Obf6-AQ",
+          "title": "Awidan Yanawa (feat. Funky Dirt, Shenal & Murshad) (feat. Funky Dirt, Shenal & Murshad)",
+          "channel": "Yohani",
+          "duration": 240.0
+        },
+        {
+          "video_id": "YkOrn_5z5XU",
+          "title": "Ha Chuttak",
+          "channel": "Yohani",
+          "duration": 169.0
+        },
+        {
+          "video_id": "m1o19Kv5G3U",
+          "title": "Manike Mage Hithe",
+          "channel": "Vihanga Thudugalage",
+          "duration": 201.0
+        }
+      ]
+    }
+  },
+  "review": {
+    "spotify_title": "Manike Mage Hithe",
+    "spotify_artist": "Yohani",
+    "spotify_duration": 167.6,
+    "youtube_url": "https://music.youtube.com/watch?v=k0NzOb6CMBs",
+    "youtube_title": "Manike Mage Hithe",
+    "youtube_channel": "Chamath Sangeeth, Yohani, Satheeshan",
+    "youtube_duration": 163.0,
+    "duration_diff": -4.6,
+    "score": 96.2,
+    "uncertain": false
+  },
+  "download": {
+    "type": "result",
+    "data": {
+      "title": "Yohani - Manike Mage Hithe",
+      "preset": "spotify_mp3",
+      "files": [
+        "C:\\Users\\aloka\\Mine\\Projects\\Stuff Donwloader\\.devteam-smoke\\sinhala\\Yohani - Manike Mage Hithe.mp3"
+      ],
+      "total_bytes": 5590216,
+      "tags": {
+        "title": "Manike Mage Hithe",
+        "artist": "Yohani",
+        "album": "Manike Mage Hithe",
+        "track_number": 1,
+        "cover": {
+          "width": 640,
+          "height": 640
+        }
+      },
+      "match": {
+        "video_id": "k0NzOb6CMBs",
+        "manual": true
+      }
+    }
+  }
+}

@@ -188,6 +188,67 @@ def test_an_oversized_preview_falls_back_to_the_placeholder(window, runs, qtbot)
     assert page._thumb is None
 
 
+def test_non_youtube_video_preview_and_missing_image_fallback(window, runs, qtbot):  # noqa: F811
+    thumb = {"data": base64.b64encode(png(64, 36, "#00ff00")).decode()}
+    page = _analyzed(
+        window, runs, qtbot, url="https://www.instagram.com/reel/abc123/", thumbnail=thumb
+    )
+    assert page._thumb is not None
+    assert page._thumb.toImage().pixelColor(10, 10) == QColor("#00ff00")
+    page = _analyzed(
+        window, runs, qtbot, url="https://www.instagram.com/reel/abc123/", thumbnail=None
+    )
+    assert page._thumb is None
+    assert page.preview.cover.text() == "No preview available"
+    page = _analyzed(
+        window,
+        runs,
+        qtbot,
+        url="https://www.instagram.com/reel/abc123/",
+        thumbnail={"data": "invalid-base64"},
+    )
+    assert page._thumb is None
+    assert page.preview.cover.text() == "No preview available"
+
+
+def test_spotify_cover_art_appears_in_listing_and_queue(window, runs, qtbot):  # noqa: F811
+    page = window.downloads_page
+    cover_url = "https://i.scdn.co/image/albumart"
+    fake = FakeFetch()
+    page.thumbs.fetcher = fake
+    page.url_edit.setText("https://open.spotify.com/track/6OmhkSOpvYBokMKQxpIGx2")
+    page.analyze()
+    run = runs[-1]
+    run.on_event(
+        Event(
+            "result",
+            run.spec.job_id,
+            {
+                "kind": "spotify",
+                "spotify_kind": "track",
+                "spotify_id": "6OmhkSOpvYBokMKQxpIGx2",
+                "title": "Song",
+                "tracks": [
+                    {
+                        "id": "6OmhkSOpvYBokMKQxpIGx2",
+                        "title": "Song",
+                        "artists": ["Artist"],
+                        "cover_url": cover_url,
+                    }
+                ],
+            },
+        )
+    )
+    item = page.spotify_card.table.item(0, page.spotify_card.MATCH_COLUMN)
+    qtbot.waitUntil(lambda: _icon_colour(item) == RED, timeout=3000)
+    track = page._spotify.tracks[0]
+    page._spotify_matches[track.track_id] = Match(track_id=track.track_id, video_id=VID, manual=True)
+    jobs = page.start_spotify_download()
+    assert len(jobs) == 1
+    qtbot.waitUntil(lambda: not jobs[0].card.thumb.pixmap().isNull(), timeout=3000)
+    assert fake.calls == [cover_url]
+
+
 def test_spotify_matches_show_the_matched_video(window, qtbot):  # noqa: F811
     page = window.downloads_page
     page.thumbs.fetcher = FakeFetch()

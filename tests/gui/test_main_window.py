@@ -151,6 +151,11 @@ def _analyzed(window, runs, qtbot, url=VID_URL, **extra):
     page.url_edit.setText(url)
     page.analyze()
     run = runs[-1]
+    if router.route(url).kind == "video" and not router.social_group(url):
+        assert run.spec.engine == "http"
+        run.emit("error", code="unsupported", message="not a direct media file")
+        run = runs[-1]
+        assert run.spec.engine == "ytdlp"
     info = json.loads(FIXTURE.read_text(encoding="utf-8"))
     info.update(extra)
     run.emit("stage", stage="analyzing")
@@ -171,6 +176,9 @@ def test_downloads_initial_empty_state(window):
     ("url", "needle"),
     [
         ("", "paste a link"),
+        ("cdn.example.com/photo.jpg", "direct image"),
+        ("https:///photo.jpg", "social post"),
+        ("https://example.com:abc/photo.jpg", "complete"),
         ("file:///C:/Windows/notepad.exe", "http"),
         # Since M3 another site is not a reason to refuse. These still are.
         ("http://127.0.0.1:8080/watch/1", "private network"),
@@ -192,9 +200,59 @@ def test_analyze_accepts_a_public_link_from_another_site(window, runs):
     page.url_edit.setText("https://vimeo.com/123456789?quality=1080p#t=30")
     page.analyze()
     (run,) = runs
-    assert run.started and run.spec.engine == "ytdlp"
+    assert run.started and run.spec.engine == "http"
     assert run.spec.url == "https://vimeo.com/123456789?quality=1080p"  # fragment dropped
     assert run.spec.options == {"mode": "analyze"}
+
+
+@pytest.mark.parametrize("ext", ["jpg", "png", "webp", "gif"])
+def test_extensionless_image_uses_direct_preview_and_original_download(window, runs, qtbot, ext):
+    page = window.downloads_page
+    page.url_edit.setText("https://cdn.example.com/media?id=123")
+    page.analyze()
+    run = runs[-1]
+    assert run.spec.engine == "http"
+    run.on_event(Event("result", run.spec.job_id, {
+        "kind": "file", "title": "image", "ext": ext, "content_type": f"image/{ext}",
+        "thumbnail": {"data": _png_b64(8, 8)}, "formats": [],
+    }))
+    qtbot.waitUntil(lambda: not page.preview.isHidden())
+    assert page._route.is_file
+    assert page._thumb is not None
+    assert page.preview.preset_combo.currentData() == "original_file"
+    assert not page.preview.image_format_combo.isHidden()
+    spec = page.start_download().spec
+    assert spec.engine == "http" and spec.options["preset"] == "original_file"
+    assert "image_format" not in spec.options
+
+
+def test_image_suffix_with_video_mime_hides_image_options(window, runs, qtbot):
+    page = window.downloads_page
+    page.url_edit.setText("https://cdn.example.com/clip.jpg")
+    page.analyze()
+    run = runs[-1]
+    assert run.spec.engine == "http"
+    run.on_event(Event("result", run.spec.job_id, {
+        "kind": "file", "title": "clip", "ext": "jpg", "content_type": "video/mp4",
+        "formats": [],
+    }))
+    qtbot.waitUntil(lambda: not page.preview.isHidden())
+    assert page.preview.image_format_combo.isHidden()
+    assert "image_format" not in page.start_download().spec.options
+
+
+def test_generic_mime_image_suffix_shows_image_options(window, runs, qtbot):
+    page = window.downloads_page
+    page.url_edit.setText("https://cdn.example.com/photo.jpg")
+    page.analyze()
+    run = runs[-1]
+    run.on_event(Event("result", run.spec.job_id, {
+        "kind": "file", "title": "photo", "ext": "jpg",
+        "content_type": "application/octet-stream", "formats": [],
+    }))
+    qtbot.waitUntil(lambda: not page.preview.isHidden())
+    assert not page.preview.image_format_combo.isHidden()
+    assert page.start_download().spec.options["preset"] == "original_file"
 
 
 def test_analyze_sends_normalized_url_and_no_engine_options(window, runs, qtbot):
@@ -242,7 +300,7 @@ def test_playlist_and_music_links(window, runs, qtbot):
         window, runs, qtbot, url="https://music.youtube.com/watch?v=dQw4w9WgXcQ&list=RDAMVM1"
     )
     assert not page.preview.playlist_label.isHidden()
-    assert page.preview.preset_combo.currentData() == "mp3_music"
+    assert page.preview.preset_combo.currentData() == "audio_original"
     assert runs[0].spec.url == "https://music.youtube.com/watch?v=dQw4w9WgXcQ"
 
 
@@ -250,7 +308,7 @@ def test_each_analyzed_route_gets_a_fresh_preset_default(window, runs, qtbot):
     page = _analyzed(
         window, runs, qtbot, url="https://music.youtube.com/watch?v=dQw4w9WgXcQ"
     )
-    assert page.preview.preset_combo.currentData() == "mp3_music"
+    assert page.preview.preset_combo.currentData() == "audio_original"
 
     # A new ordinary YouTube video must not inherit the previous music choice.
     page.url_edit.setText(VID_URL)
@@ -259,10 +317,10 @@ def test_each_analyzed_route_gets_a_fresh_preset_default(window, runs, qtbot):
     assert page.preview.preset_combo.currentData() == presets.DEFAULT_PRESET_ID
 
 
-def test_youtube_music_playlist_resets_to_mp3(window):
+def test_youtube_music_playlist_resets_to_original_audio(window):
     page = window.downloads_page
     page.playlist_card.preset_combo.setCurrentIndex(
-        page.playlist_card.preset_combo.findData("audio_original")
+        page.playlist_card.preset_combo.findData("mp3_music")
     )
     page._route = router.route("https://music.youtube.com/playlist?list=PL1234567890")
     page.show_playlist(
@@ -273,7 +331,18 @@ def test_youtube_music_playlist_resets_to_mp3(window):
             "entries": [{"id": "dQw4w9WgXcQ", "title": "Song"}],
         }
     )
-    assert page.playlist_card.preset_combo.currentData() == "mp3_music"
+    assert page.playlist_card.preset_combo.currentData() == "audio_original"
+
+
+def test_youtube_lossless_conversion_warning(window, runs, qtbot):
+    page = _analyzed(window, runs, qtbot, url="https://music.youtube.com/watch?v=dQw4w9WgXcQ")
+    assert page.preview.audio_note.isHidden()
+    for preset_id in ("audio_flac", "audio_wav"):
+        page.preview.preset_combo.setCurrentIndex(page.preview.preset_combo.findData(preset_id))
+        assert not page.preview.audio_note.isHidden()
+        assert "do not improve sound quality" in page.preview.audio_note.text()
+    page.preview.preset_combo.setCurrentIndex(page.preview.preset_combo.findData("audio_m4a"))
+    assert page.preview.audio_note.isHidden()
 
 
 def test_analyze_error_timeout_and_cancel(window, runs, qtbot):

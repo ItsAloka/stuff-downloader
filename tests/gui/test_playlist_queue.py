@@ -140,7 +140,7 @@ def test_selected_entries_become_numbered_jobs_behind_the_concurrency_limit(wind
     assert [s.options["playlist_index"] for s in specs] == [1, 2, 3]
     assert all(s.options["playlist_title"] == "Chill Mix" for s in specs)
     assert all(s.options["playlist_count"] == 4 for s in specs)
-    assert all(s.options["preset"] == "mp3_music" for s in specs)
+    assert all(s.options["preset"] == "audio_original" for s in specs)
 
     started = [r for r in runs if r.started and r.spec.options.get("mode") == "download"]
     assert len(started) == page.scheduler.max_concurrent == 3

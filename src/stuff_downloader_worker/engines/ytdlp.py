@@ -21,11 +21,12 @@ import os
 import re
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 from .. import presets, site_login, tagging
 from ..protocol import JobSpec
 from .base import Emit, EngineError
+from .http import MAX_REDIRECTS, USER_AGENT, _connect, check_url, is_public_name
 
 TOOLS_DIR_ENV_VAR = "STUFF_DOWNLOADER_TOOLS_DIR"
 _TOOL_EXES = {"deno": "deno.exe", "ffmpeg": "ffmpeg.exe"}
@@ -130,32 +131,67 @@ def trusted_tool(name: str) -> Path | None:
     return path if path.is_file() else None
 
 
+def _public_thumbnail_url(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parts = urlsplit(value)
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except ValueError:
+        return None
+    if (
+        parts.scheme != "https"
+        or not is_public_name(host)
+        or port not in (None, 443)
+        or parts.username
+        or parts.password
+    ):
+        return None
+    return value
+
+
 def _thumbnail_url(info: dict[str, Any]) -> str | None:
-    """The largest https thumbnail on a known image host, preferring square art."""
+    """The largest HTTPS thumbnail on a public host."""
     best: tuple[tuple[int, int], str] | None = None
     for thumb in info.get("thumbnails") or []:
         if not isinstance(thumb, dict) or not isinstance(thumb.get("url"), str):
             continue
-        parts = urlsplit(thumb["url"])
-        host = (parts.hostname or "").lower()
-        if parts.scheme != "https" or not host.endswith(_THUMB_HOST_SUFFIXES):
+        url = _public_thumbnail_url(thumb["url"])
+        if url is None:
             continue
         width, height = thumb.get("width") or 0, thumb.get("height") or 0
         if not isinstance(width, int) or not isinstance(height, int):
             width = height = 0
-        key = (int(bool(width) and width == height), width * height)
+        key = (width * height, int(bool(width) and width == height))
         if best is None or key > best[0]:
-            best = (key, thumb["url"])
+            best = (key, url)
     if best:
         return best[1]
-    url = info.get("thumbnail")
-    if isinstance(url, str):
-        parts = urlsplit(url)
-        if parts.scheme == "https" and (parts.hostname or "").lower().endswith(
-            _THUMB_HOST_SUFFIXES
-        ):
-            return url
-    return None
+    return _public_thumbnail_url(info.get("thumbnail"))
+
+
+def _open_thumbnail(url: str) -> tuple[Any, Any]:
+    """Fetch a public HTTPS thumbnail; reject a downgrade before connecting."""
+    for _ in range(MAX_REDIRECTS + 1):
+        if _public_thumbnail_url(url) is None:
+            raise ValueError("unsafe thumbnail URL")
+        target = check_url(url)
+        conn = _connect(target)  # pins a verified public DNS address for this hop
+        try:
+            conn.request("GET", target.path, headers={"User-Agent": USER_AGENT})
+            resp = conn.getresponse()
+            if resp.status not in (301, 302, 303, 307, 308):
+                return conn, resp
+            location = resp.getheader("Location") or ""
+        except Exception:
+            conn.close()
+            raise
+        conn.close()
+        if not location:
+            raise ValueError("thumbnail redirect has no target")
+        url = urljoin(url, location)
+    raise ValueError("too many thumbnail redirects")
 
 
 def sanitize_info(info: dict[str, Any]) -> dict[str, Any]:
@@ -177,6 +213,19 @@ def sanitize_info(info: dict[str, Any]) -> dict[str, Any]:
     result["automatic_captions"] = sanitize_subtitles(info.get("automatic_captions"), auto=True)
     result["thumbnails"] = sanitize_thumbnails(info.get("thumbnails"))
     return result
+
+
+def _image_only(info: dict[str, Any]) -> bool:
+    """Recognize a still image returned by a video extractor without using its thumbnail."""
+    image_exts = {"jpg", "jpeg", "png", "gif", "webp", "avif", "bmp", "heic"}
+    ext = info.get("ext")
+    if isinstance(ext, str) and ext.lower() in image_exts:
+        return True
+    formats = info.get("formats")
+    return bool(formats) and all(
+        isinstance(fmt, dict) and str(fmt.get("ext", "")).lower() in image_exts
+        for fmt in formats
+    )
 
 
 def sanitize_subtitles(raw: Any, auto: bool) -> list[dict[str, Any]]:
@@ -421,9 +470,14 @@ class YtDlpEngine:
                     return listing
                 if is_playlist:
                     raise EngineError("unsupported", "that link is a playlist, not a video")
+                if _image_only(info):
+                    # The gallery extractor retains every image and its original format.
+                    # yt-dlp's video presets would otherwise process this as a video.
+                    raise EngineError("unsupported", "image post requires gallery extraction")
                 summary = sanitize_info(info)
                 summary["engine_version"] = yt_dlp.version.__version__
                 if request is None:
+                    summary["thumbnail_url"] = _thumbnail_url(info)
                     summary["thumbnail"] = self._thumbnail_preview(ydl, info, emit)
                     emit("stage", {"stage": "completed"})
                     return summary
@@ -456,12 +510,21 @@ class YtDlpEngine:
         if not url:
             return None
         try:
-            with ydl.urlopen(url) as resp:
-                data = resp.read(MAX_THUMB_BYTES + 1)
-        except Exception as exc:  # a missing preview must not fail the analyze
-            emit("log", {"level": "warning", "message": f"thumbnail preview failed: {exc}"})
+            host = (urlsplit(url).hostname or "").lower()
+            if host.endswith(_THUMB_HOST_SUFFIXES):
+                with ydl.urlopen(url) as resp:
+                    data = resp.read(MAX_THUMB_BYTES + 1)
+            else:
+                # The source controls this URL. Each redirect is HTTPS-only and DNS-pinned.
+                conn, resp = _open_thumbnail(url)
+                try:
+                    data = resp.read(MAX_THUMB_BYTES + 1) if resp.status == 200 else b""
+                finally:
+                    conn.close()
+        except Exception:  # a missing preview must not fail the analyze
+            emit("log", {"level": "warning", "message": "thumbnail preview failed"})
             return None
-        if len(data) > MAX_THUMB_BYTES:
+        if not data or len(data) > MAX_THUMB_BYTES:
             return None
         return {"data": base64.b64encode(data).decode("ascii")}
 

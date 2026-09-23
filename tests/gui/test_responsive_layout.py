@@ -1,10 +1,66 @@
 from __future__ import annotations
 
-from PyQt6.QtWidgets import QScrollArea, QSizePolicy
+import pytest
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QContextMenuEvent
+from PyQt6.QtWidgets import (
+    QApplication,
+    QMenu,
+    QScrollArea,
+    QSizePolicy,
+    QStyle,
+    QStyleOptionButton,
+)
 
 from stuff_downloader.core import playlist, settings
 from stuff_downloader.gui.pages import DownloadsPage
 from stuff_downloader.gui.widgets import JobCard, PlaylistCard, PreviewCard, SpotifyCard
+
+
+@pytest.mark.parametrize("width", [520, 900, 1600])
+@pytest.mark.parametrize("font_scale", [1.0, 1.5])
+def test_queue_reflows_without_horizontal_scroll(qtbot, width, font_scale):
+    page = DownloadsPage(settings.Settings())
+    qtbot.addWidget(page)
+    if font_scale > 1:
+        font = page.font()
+        font.setPointSizeF(font.pointSizeF() * font_scale)
+        page.setFont(font)
+    card = JobCard()
+    card.title_label.setText("A very long song title with details " * 15)
+    card.details_label.setText("A long status detail " * 10)
+    page.queue_layout.addWidget(card)
+    page.resize(width, 720)
+    page.show()
+    qtbot.wait(1)
+
+    assert page.page_scroll.horizontalScrollBar().maximum() == 0
+    assert card.width() <= page.page_scroll.viewport().width()
+    assert card.title_label.width() < card.width()
+    assert card.title_label.height() > card.title_label.fontMetrics().height()
+    for control in (card.chip, card.pause_button, card.cancel_button,
+                    page.pause_all_button, page.cancel_all_button):
+        assert control.isVisible()
+        assert control.width() >= control.minimumSizeHint().width()
+
+
+def test_queue_card_actions_fit_and_accept_keyboard_focus(qtbot):
+    card = JobCard()
+    qtbot.addWidget(card)
+    card.title_label.setText("Long unbroken title " * 30)
+    for button in (card.open_button, card.folder_button, card.retry_button):
+        button.show()
+    card.resize(440, 320)
+    card.show()
+    qtbot.wait(1)
+
+    for button in (card.open_button, card.folder_button, card.retry_button,
+                   card.pause_button, card.cancel_button):
+        assert button.isVisible()
+        assert button.width() >= button.minimumSizeHint().width()
+        assert button.geometry().right() <= card.width()
+        button.setFocus()
+        assert button.hasFocus()
 
 
 def _intersects(a, b) -> bool:
@@ -118,6 +174,92 @@ def test_playlist_name_editors_fit_their_rows(qtbot):
     editor = card.table.cellWidget(0, 6)
     # The on-screen height, after the table's item padding: a squashed editor clips its text.
     assert editor.height() >= editor.sizeHint().height()
+
+
+def test_playlist_checkbox_indicator_has_room_at_window_sizes(qtbot):
+    from stuff_downloader.gui.theme import STYLE
+
+    card = PlaylistCard()
+    qtbot.addWidget(card)
+    card.setStyleSheet(STYLE)
+    card.set_entries([playlist.PlaylistEntry(
+        video_id="id000000001", index=1, url="https://youtu.be/id000000001", title="Song"
+    )])
+    for width in (520, 900, 1600):
+        card.resize(width, 500)
+        card.show()
+        qtbot.wait(1)
+        box = card.checkbox(0)
+        option = QStyleOptionButton()
+        option.initFrom(box)
+        indicator = box.style().subElementRect(QStyle.SubElement.SE_CheckBoxIndicator, option, box)
+        assert card.table.columnWidth(0) >= 44
+        assert box.width() >= 24
+        assert box.rect().contains(indicator)
+        assert box.isChecked()
+
+
+def test_playlist_metadata_and_file_name_copy(qtbot):
+    card = PlaylistCard()
+    qtbot.addWidget(card)
+    card.set_entries([playlist.PlaylistEntry(
+        video_id="id000000001", index=1, url="https://youtu.be/id000000001",
+        title="Copyable Song", uploader="Copyable Artist"
+    )])
+    card.show()
+    table = card.table
+    for column, expected in ((2, "Copyable Song"), (3, "Copyable Artist")):
+        table.setCurrentCell(0, column)
+        table.setFocus()
+        qtbot.keyClick(table, Qt.Key.Key_C, modifier=Qt.KeyboardModifier.ControlModifier)
+        assert QApplication.clipboard().text() == expected
+    editor = table.cellWidget(0, 6)
+    editor.setFocus()
+    qtbot.keyClick(editor, Qt.Key.Key_C, modifier=Qt.KeyboardModifier.ControlModifier)
+    assert QApplication.clipboard().text() == "Copyable Song"
+    editor.setText("output-name")
+    qtbot.keyClick(editor, Qt.Key.Key_C, modifier=Qt.KeyboardModifier.ControlModifier)
+    assert QApplication.clipboard().text() == "output-name"
+    assert card.selected_rows() == [0]
+    card.apply_filter("missing")
+    assert table.isRowHidden(0)
+    card.apply_filter("")
+    assert not table.isRowHidden(0)
+    assert editor.text() == "output-name"
+
+
+def test_playlist_right_click_copy_actions(qtbot, monkeypatch):
+    card = PlaylistCard()
+    qtbot.addWidget(card)
+    card.set_entries([playlist.PlaylistEntry(
+        video_id="id000000001", index=1, url="https://youtu.be/id000000001",
+        title="Copyable Song", uploader="Copyable Artist"
+    )])
+    card.show()
+
+    def choose_copy(menu, _position):
+        actions = [
+            action for action in menu.actions()
+            if action.text().split("\t", 1)[0].replace("&", "") == "Copy"
+        ]
+        assert len(actions) == 1
+        assert actions[0].isEnabled()
+        actions[0].trigger()
+
+    monkeypatch.setattr(QMenu, "exec", choose_copy)
+    table = card.table
+    for column, expected in ((2, "Copyable Song"), (3, "Copyable Artist")):
+        rect = table.visualItemRect(table.item(0, column))
+        point = rect.center()
+        event = QContextMenuEvent(QContextMenuEvent.Reason.Mouse, point, table.mapToGlobal(point))
+        table.contextMenuEvent(event)
+        assert QApplication.clipboard().text() == expected
+
+    editor = table.cellWidget(0, 6)
+    point = editor.rect().center()
+    event = QContextMenuEvent(QContextMenuEvent.Reason.Mouse, point, editor.mapToGlobal(point))
+    editor.contextMenuEvent(event)
+    assert QApplication.clipboard().text() == "Copyable Song"
 
 
 def test_the_preview_title_uses_the_width_beside_the_cover(qtbot):

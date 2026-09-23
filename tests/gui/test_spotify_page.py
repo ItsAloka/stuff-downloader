@@ -294,6 +294,35 @@ def test_a_pasted_link_wins_over_a_lookup_still_running(page, runs, qtbot, monke
 
 
 # ── download ──────────────────────────────────────────────────────────────────────────────
+def test_clickable_spotify_file_name_and_f2_queue_only_selected_rename(page, runs, qtbot):
+    from PyQt6.QtCore import Qt
+
+    _analyzed(page, runs, qtbot)
+    for track in page._spotify.tracks:
+        page._spotify_matches[track.track_id] = spotify.Match(track.track_id, VID, manual=True)
+    card = page.spotify_card
+    editor = card.table.cellWidget(0, card.NAME_COLUMN)
+    assert editor.placeholderText() == "Pitbull, Sensato - Global Warming"
+    editor.setText("  My song  ")
+    card.table.setCurrentCell(0, 2)
+    card.table.setFocus()
+    qtbot.keyClick(card.table, Qt.Key.Key_F2)
+    assert editor.selectedText() == "  My song  "
+    jobs = page.start_spotify_download()
+    assert jobs[0].spec.options["output_name"] == "My song"
+    assert all("output_name" not in job.spec.options for job in jobs[1:])
+    assert page._spotify.tracks[0].title == "Global Warming"
+
+
+def test_spotify_invalid_custom_name_falls_back_to_default(page, runs, qtbot):
+    _analyzed(page, runs, qtbot)
+    for track in page._spotify.tracks:
+        page._spotify_matches[track.track_id] = spotify.Match(track.track_id, VID, manual=True)
+    page.spotify_card.table.cellWidget(0, SpotifyCard.NAME_COLUMN).setText("CON")
+    jobs = page.start_spotify_download()
+    assert "output_name" not in jobs[0].spec.options
+
+
 def test_ticked_songs_queue_as_one_group_carrying_their_reviewed_matches(
     page, runs, qtbot, monkeypatch
 ):
@@ -327,14 +356,47 @@ def test_ticked_songs_queue_as_one_group_carrying_their_reviewed_matches(
         assert "site_login" not in record.options
 
 
-def test_an_unreviewed_song_is_queued_for_the_worker_to_match(page, runs, qtbot):
+def test_an_unreviewed_song_starts_match_lookup_before_download(page, runs, qtbot):
     _analyzed(page, runs, qtbot)
     page.spotify_card.set_all_checked(False)
     page.spotify_card.checkbox(1).setChecked(True)
     page.spotify_card.archive_check.setChecked(False)
+    assert page.start_spotify_download() == []
+    assert _match_runs(runs)
+    assert not page.jobs
+    assert "Match lookup has started" in page.message_label.text()
+
+
+def test_uncertain_match_requires_explicit_confirmation(page, runs, qtbot, monkeypatch):
+    _analyzed(page, runs, qtbot)
+    page.spotify_card.set_all_checked(False)
+    page.spotify_card.checkbox(0).setChecked(True)
+    track = page._spotify.tracks[0]
+    page._spotify_matches[track.track_id] = spotify.parse_match(
+        match_result(track.track_id, duration=3600.0), track
+    )
+    monkeypatch.setattr(
+        pages.QMessageBox, "question", lambda *args: pages.QMessageBox.StandardButton.No
+    )
+    assert page.start_spotify_download() == []
+    assert not page.jobs
+    monkeypatch.setattr(
+        pages.QMessageBox, "question", lambda *args: pages.QMessageBox.StandardButton.Yes
+    )
     (job,) = page.start_spotify_download()
-    assert job.spec.options == {"mode": "download", "preset": "spotify_mp3", "archive": False}
-    assert job.group_id == ""  # one song is one job, not a group of one
+    assert job.spec.options["video_id"] == VID
+
+
+def test_high_confidence_match_downloads_without_confirmation(page, runs, qtbot, monkeypatch):
+    _analyzed(page, runs, qtbot)
+    page.spotify_card.set_all_checked(False)
+    page.spotify_card.checkbox(0).setChecked(True)
+    track = page._spotify.tracks[0]
+    page._spotify_matches[track.track_id] = spotify.parse_match(match_result(track.track_id), track)
+    monkeypatch.setattr(
+        pages.QMessageBox, "question", lambda *args: pytest.fail("unexpected prompt")
+    )
+    assert len(page.start_spotify_download()) == 1
 
 
 def test_nothing_ticked_means_no_download(page, runs, qtbot):
@@ -349,6 +411,8 @@ def test_a_spotify_job_restores_after_a_restart_and_downloads_again(page, runs, 
     _analyzed(page, runs, qtbot)
     page.spotify_card.set_all_checked(False)
     page.spotify_card.checkbox(0).setChecked(True)
+    track = page._spotify.tracks[0]
+    page._spotify_matches[track.track_id] = spotify.parse_match(match_result(track.track_id), track)
     (job,) = page.start_spotify_download()
     # What the next start-up does: unfinished jobs come back paused, and a Spotify one must not
     # be dropped for having a preset the video presets do not know.

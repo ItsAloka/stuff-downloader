@@ -1,0 +1,128 @@
+{
+  "spotify_url": "https://open.spotify.com/track/1ivCIgrYZyE0BvItL4Z8lk",
+  "analyze": {
+    "type": "result",
+    "data": {
+      "kind": "spotify",
+      "spotify_kind": "track",
+      "spotify_id": "1ivCIgrYZyE0BvItL4Z8lk",
+      "title": "告白氣球",
+      "owner": "Jay Chou",
+      "tracks": [
+        {
+          "id": "1ivCIgrYZyE0BvItL4Z8lk",
+          "title": "告白氣球",
+          "artists": [
+            "Jay Chou"
+          ],
+          "album": "周杰倫的床邊故事",
+          "duration": 215.1,
+          "explicit": false,
+          "cover_url": "https://i.scdn.co/image/ab67616d0000b273fb0610caa5ce0747743fb52e"
+        }
+      ],
+      "skipped": 0,
+      "truncated": false
+    }
+  },
+  "match": {
+    "type": "result",
+    "data": {
+      "kind": "spotify_match",
+      "track_id": "1ivCIgrYZyE0BvItL4Z8lk",
+      "video_id": "UjuUbocKxkk",
+      "title": "周杰倫 Jay Chou - 告白氣球【歌詞版】",
+      "channel": "EnjoyLife",
+      "duration": 216.0,
+      "confidence": 100.0,
+      "spotify_duration": 215,
+      "candidates": [
+        {
+          "video_id": "cSqlwNjq77c",
+          "title": "告白氣球",
+          "channel": "周杰倫",
+          "duration": 216.0
+        },
+        {
+          "video_id": "72bKZ2B96ZI",
+          "title": "告白氣球",
+          "channel": "周杰倫",
+          "duration": 265.0
+        },
+        {
+          "video_id": "I6WMxYf9Zjc",
+          "title": "告白氣球 - R&B版",
+          "channel": "格雷乐团-Grey",
+          "duration": 218.0
+        },
+        {
+          "video_id": "l6a5D6yxqEU",
+          "title": "稻香",
+          "channel": "周杰倫",
+          "duration": 224.0
+        },
+        {
+          "video_id": "mPKqUi8C1GM",
+          "title": "等你下課",
+          "channel": "周杰倫, 楊瑞代",
+          "duration": 270.0
+        },
+        {
+          "video_id": "Ii46Q7i4uuk",
+          "title": "夜曲",
+          "channel": "周杰倫",
+          "duration": 229.0
+        },
+        {
+          "video_id": "XvHc_VEop7I",
+          "title": "倒影",
+          "channel": "周杰倫",
+          "duration": 235.0
+        },
+        {
+          "video_id": "hlb8YbCjN1Y",
+          "title": "可愛女人",
+          "channel": "周杰倫",
+          "duration": 240.0
+        }
+      ]
+    }
+  },
+  "review": {
+    "spotify_title": "告白氣球",
+    "spotify_artist": "Jay Chou",
+    "spotify_duration": 215.1,
+    "youtube_url": "https://music.youtube.com/watch?v=UjuUbocKxkk",
+    "youtube_title": "周杰倫 Jay Chou - 告白氣球【歌詞版】",
+    "youtube_channel": "EnjoyLife",
+    "youtube_duration": 216.0,
+    "duration_diff": 0.9,
+    "score": 94.2,
+    "uncertain": false
+  },
+  "download": {
+    "type": "result",
+    "data": {
+      "title": "Jay Chou - 告白氣球",
+      "preset": "spotify_mp3",
+      "files": [
+        "C:\\Users\\aloka\\Mine\\Projects\\Stuff Donwloader\\.devteam-smoke\\chinese\\Jay Chou - 告白氣球.mp3"
+      ],
+      "total_bytes": 6737179,
+      "tags": {
+        "title": "告白氣球",
+        "artist": "Jay Chou",
+        "album": "周杰倫的床邊故事",
+        "track_number": 8,
+        "cover": {
+          "width": 640,
+          "height": 640
+        }
+      },
+      "match": {
+        "video_id": "UjuUbocKxkk",
+        "manual": true
+      }
+    }
+  }
+}

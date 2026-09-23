@@ -158,6 +158,51 @@ def test_analyze_accepts_octet_stream_only_with_a_media_name(server):
         _analyze(server, "/a.exe")
 
 
+@pytest.mark.parametrize(
+    ("ctype", "suffix"),
+    [("image/jpeg", "jpg"), ("image/png", "png"),
+     ("image/webp", "webp"), ("image/gif", "gif")],
+)
+def test_image_mime_classifies_extensionless_and_misleading_paths(server, tmp_path, ctype, suffix):
+    for path in ("/image", "/misleading.mp4"):
+        Handler.routes[path] = serve_file(body=BODY, ctype=ctype)
+        info, _ = _analyze(server, path)
+        assert info["kind"] == "file" and info["ext"] == suffix
+        result, _ = _download(server, path, tmp_path, preset="original_file")
+        assert Path(result["files"][0]).suffix == f".{suffix}"
+        assert Path(result["files"][0]).read_bytes() == BODY
+
+
+@pytest.mark.parametrize("ctype", ["image/svg+xml", "image/tiff", "text/html"])
+def test_unsupported_content_is_not_saved_as_an_image(server, tmp_path, ctype):
+    Handler.routes["/photo.png"] = serve_file(body=BODY, ctype=ctype)
+    with pytest.raises(EngineError, match="not a media file"):
+        _analyze(server, "/photo.png")
+    with pytest.raises(EngineError, match="not a media file"):
+        _download(server, "/photo.png", tmp_path, preset="original_file")
+
+
+@pytest.mark.parametrize(
+    ("probe_type", "second_type"),
+    [("image/jpeg", "text/html"), ("image/jpeg", "image/tiff"),
+     ("image/jpeg", "image/png"), ("application/octet-stream", "text/html")],
+)
+def test_download_rejects_image_type_changed_after_probe(
+    server, tmp_path, probe_type, second_type
+):
+    requests = 0
+
+    def changing_response(req):
+        nonlocal requests
+        requests += 1
+        serve_file(body=BODY, ctype=probe_type if requests == 1 else second_type)(req)
+
+    Handler.routes["/photo.jpg"] = changing_response
+    with pytest.raises(EngineError, match="image type changed"):
+        _download(server, "/photo.jpg", tmp_path, preset="original_file")
+    assert not list(tmp_path.iterdir())
+
+
 def test_http_errors_use_status_text_and_never_the_url(server):
     with pytest.raises(EngineError) as info:
         _analyze(server, "/missing.mp4?token=SECRET")

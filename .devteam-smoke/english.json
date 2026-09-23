@@ -1,0 +1,122 @@
+{
+  "spotify_url": "https://open.spotify.com/track/6Jkm5kUldvIqxzI1Pa7nXH",
+  "analyze": {
+    "type": "result",
+    "data": {
+      "kind": "spotify",
+      "spotify_kind": "track",
+      "spotify_id": "6Jkm5kUldvIqxzI1Pa7nXH",
+      "title": "10 Things I Hate About You",
+      "owner": "Leah Kate",
+      "tracks": [
+        {
+          "id": "6Jkm5kUldvIqxzI1Pa7nXH",
+          "title": "10 Things I Hate About You",
+          "artists": [
+            "Leah Kate"
+          ],
+          "album": "10 Things I Hate About You",
+          "duration": 157.1,
+          "explicit": true,
+          "cover_url": "https://i.scdn.co/image/ab67616d0000b273596a9d381ffda7d97da5d702"
+        }
+      ],
+      "skipped": 0,
+      "truncated": false
+    }
+  },
+  "match": {
+    "type": "result",
+    "data": {
+      "kind": "spotify_match",
+      "track_id": "6Jkm5kUldvIqxzI1Pa7nXH",
+      "video_id": "qjgnkysCPm4",
+      "title": "10 Things I Hate About You",
+      "channel": "Leah Kate",
+      "duration": 158.0,
+      "confidence": 95.0,
+      "spotify_duration": 157,
+      "candidates": [
+        {
+          "video_id": "V3ejrgCuYcE",
+          "title": "10 Things I Hate About You",
+          "channel": "Leah Kate",
+          "duration": 158.0
+        },
+        {
+          "video_id": "kocbwD_obcM",
+          "title": "10 Things I Hate About You",
+          "channel": "Leah Kate, Sunday Scaries",
+          "duration": 156.0
+        },
+        {
+          "video_id": "fBKdcbV7Ybw",
+          "title": "10 Things I Hate About You (Sped Up)",
+          "channel": "10X, Leah Kate",
+          "duration": 143.0
+        },
+        {
+          "video_id": "OR2P8a1E500",
+          "title": "Monster",
+          "channel": "Leah Kate",
+          "duration": 161.0
+        },
+        {
+          "video_id": "KHrfEiX02M4",
+          "title": "Boyfriend",
+          "channel": "Leah Kate",
+          "duration": 144.0
+        },
+        {
+          "video_id": "YPZOatd3ftQ",
+          "title": "Life Sux",
+          "channel": "Leah Kate",
+          "duration": 175.0
+        },
+        {
+          "video_id": "efdwopOJtRk",
+          "title": "Twinkle Twinkle",
+          "channel": "Leah Kate",
+          "duration": 157.0
+        }
+      ]
+    }
+  },
+  "review": {
+    "spotify_title": "10 Things I Hate About You",
+    "spotify_artist": "Leah Kate",
+    "spotify_duration": 157.1,
+    "youtube_url": "https://music.youtube.com/watch?v=qjgnkysCPm4",
+    "youtube_title": "10 Things I Hate About You",
+    "youtube_channel": "Leah Kate",
+    "youtube_duration": 158.0,
+    "duration_diff": 0.9,
+    "score": 99.2,
+    "uncertain": false
+  },
+  "download": {
+    "type": "result",
+    "data": {
+      "title": "Leah Kate - 10 Things I Hate About You",
+      "preset": "spotify_mp3",
+      "files": [
+        "C:\\Users\\aloka\\Mine\\Projects\\Stuff Donwloader\\.devteam-smoke\\english\\Leah Kate - 10 Things I Hate About You.mp3"
+      ],
+      "total_bytes": 5165171,
+      "tags": {
+        "title": "10 Things I Hate About You",
+        "artist": "Leah Kate",
+        "album": "10 Things I Hate About You",
+        "track_number": 1,
+        "cover": {
+          "width": 640,
+          "height": 640
+        }
+      },
+      "match": {
+        "video_id": "qjgnkysCPm4",
+        "manual": true
+      }
+    }
+  }
+}

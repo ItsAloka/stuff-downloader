@@ -1,8 +1,8 @@
 """Thumbnails for rows and queue cards, loaded off the GUI thread.
 
-The GUI fetches only images whose URL it built itself from a validated YouTube video id
-(``i.ytimg.com``, https). Every other preview — a gallery tile, a direct image link, the analyzed
-video's cover — is fetched by the worker, behind its own address checks, and arrives as bytes.
+The GUI fetches only validated YouTube thumbnail URLs and Spotify cover URLs from approved
+CDN hosts. Every other preview — a gallery tile, a direct image link, the analyzed video's
+cover — is fetched by the worker, behind its own address checks, and arrives as bytes.
 All image bytes, from either side, are decoded here with a byte cap and a pixel cap checked from
 the header before any pixels are allocated. Any failure just leaves the placeholder.
 """
@@ -28,6 +28,7 @@ DECODE_BOX = QSize(320, 320)  # the analyze preview; nothing is shown bigger tha
 ROW_BOX = QSize(160, 160)  # rows and queue cards: keeps a full cache near 25 MB
 
 ALLOWED_HOSTS = frozenset({"i.ytimg.com"})
+ALLOWED_SUFFIXES = (".scdn.co", ".spotifycdn.com")
 _VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 
 Fetch = Callable[[str], bytes]
@@ -51,7 +52,10 @@ def allowed(url: str) -> bool:
         return False
     return (
         parts.scheme == "https"
-        and (parts.hostname or "") in ALLOWED_HOSTS
+        and (
+            (parts.hostname or "") in ALLOWED_HOSTS
+            or (parts.hostname or "").endswith(ALLOWED_SUFFIXES)
+        )
         and parts.port in (None, 443)
         and not parts.username
         and not parts.password

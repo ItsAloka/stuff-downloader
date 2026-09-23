@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import html
 
-from PyQt6.QtCore import QMimeData, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QDrag, QIcon, QImage, QPixmap
+from PyQt6.QtCore import QEvent, QMimeData, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import QColor, QDrag, QIcon, QImage, QKeySequence, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
     QListView,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QProgressBar,
     QPushButton,
     QRadioButton,
@@ -154,14 +155,20 @@ class JobCard(Card):
         text_col.setSpacing(2)
         self.title_label = QLabel("")
         self.title_label.setStyleSheet("font-weight:600;")
+        self.title_label.setWordWrap(True)
+        self.title_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.title_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.details_label = QLabel("")
         self.details_label.setObjectName("muted")
         self.details_label.setTextFormat(Qt.TextFormat.PlainText)  # carries worker text
+        self.details_label.setWordWrap(True)
+        self.details_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         text_col.addWidget(self.title_label)
         text_col.addWidget(self.details_label)
 
         self.chip = Chip("Idle")
+        self.select_box = QCheckBox()
+        self.select_box.setToolTip("Select this queue item")
         self.cancel_button = QPushButton("✕  Cancel")
         self.cancel_button.setObjectName("iconButton")
         self.cancel_button.setToolTip("Cancel this job")
@@ -177,13 +184,18 @@ class JobCard(Card):
         for button in (self.retry_button, self.open_button, self.folder_button):
             button.hide()
 
+        top.addWidget(self.select_box, 0, Qt.AlignmentFlag.AlignTop)
         top.addWidget(self.thumb)
         top.addLayout(text_col, 1)
-        top.addWidget(self.chip, 0, Qt.AlignmentFlag.AlignTop)
-        for button in (self.open_button, self.folder_button, self.retry_button):
-            top.addWidget(button, 0, Qt.AlignmentFlag.AlignTop)
-        top.addWidget(self.pause_button, 0, Qt.AlignmentFlag.AlignTop)
-        top.addWidget(self.cancel_button, 0, Qt.AlignmentFlag.AlignTop)
+        controls = QGridLayout()
+        controls.setSpacing(6)
+        controls.addWidget(self.chip, 0, 0)
+        for index, button in enumerate((self.open_button, self.folder_button,
+                                        self.retry_button, self.pause_button,
+                                        self.cancel_button)):
+            controls.addWidget(button, 1 + index // 2, index % 2)
+        controls.setColumnStretch(0, 1)
+        controls.setColumnStretch(1, 1)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
@@ -197,6 +209,7 @@ class JobCard(Card):
         bar_row.addWidget(self.percent_label)
 
         self.body.addLayout(top)
+        self.body.addLayout(controls)
         self.body.addLayout(bar_row)
 
     def set_state(self, text: str, state: str) -> None:
@@ -341,8 +354,17 @@ class PreviewCard(Card):
         self.compatible_check.setChecked(True)
         self.crop_check = QCheckBox("Crop cover to a square")
         self.crop_check.setChecked(True)
+        self.audio_note = QLabel(
+            "YouTube audio is usually lossy. FLAC and WAV only change the format; "
+            "they do not improve sound quality and make larger files."
+        )
+        self.audio_note.setObjectName("muted")
+        self.audio_note.setWordWrap(True)
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("Use the suggested file name")
+        self.title_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.title_label.setToolTip("Click to rename the downloaded file")
+        self.title_label.installEventFilter(self)
         self.download_button = QPushButton("⬇  Download")
         self.download_button.setObjectName("primary")
         grid.addWidget(QLabel("Preset"), 0, 0)
@@ -358,6 +380,7 @@ class PreviewCard(Card):
         self.image_format_combo = image_format_combo()
         grid.addWidget(self.image_format_label, 5, 0)
         grid.addWidget(self.image_format_combo, 5, 1)
+        grid.addWidget(self.audio_note, 6, 1)
         self.image_format_label.hide()
         self.image_format_combo.hide()
         grid.setColumnStretch(1, 1)
@@ -366,6 +389,13 @@ class PreviewCard(Card):
         buttons.addStretch(1)
         buttons.addWidget(self.download_button)
         self.body.addLayout(buttons)
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is self.title_label and event.type() == QEvent.Type.MouseButtonRelease:
+            self.name_edit.setFocus()
+            self.name_edit.selectAll()
+            return True
+        return super().eventFilter(watched, event)
 
 
 class GroupCard(Card):
@@ -399,6 +429,57 @@ class GroupCard(Card):
         self.progress.setValue(min(done + failed + skipped, max(1, total)))
 
 
+class _PlaylistTable(QTableWidget):
+    """Copy the current metadata cell without interfering with cell widgets."""
+
+    COPY_COLUMNS = (2, 3)
+
+    def _copy_cell(self, row: int, column: int) -> None:
+        if column in self.COPY_COLUMNS and not self.isRowHidden(row):
+            item = self.item(row, column)
+            if item is not None:
+                QApplication.clipboard().setText(item.text())
+
+    def keyPressEvent(self, event) -> None:
+        if event.matches(QKeySequence.StandardKey.Copy):
+            self._copy_cell(self.currentRow(), self.currentColumn())
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def contextMenuEvent(self, event) -> None:
+        item = self.itemAt(event.pos())
+        if item is None or item.column() not in self.COPY_COLUMNS:
+            return super().contextMenuEvent(event)
+        menu = QMenu(self)
+        menu.addAction("Copy", lambda: self._copy_cell(item.row(), item.column()))
+        menu.exec(event.globalPos())
+
+
+class _PlaylistNameEdit(QLineEdit):
+    """Copy the visible output name, including its default-name hint."""
+
+    def _copy_name(self) -> None:
+        text = self.selectedText() or self.text() or self.placeholderText()
+        QApplication.clipboard().setText(text)
+
+    def keyPressEvent(self, event) -> None:
+        if event.matches(QKeySequence.StandardKey.Copy):
+            self._copy_name()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def contextMenuEvent(self, event) -> None:
+        menu = self.createStandardContextMenu()
+        for action in menu.actions():
+            if action.text().split("\t", 1)[0].replace("&", "").lower() == "copy":
+                menu.removeAction(action)
+                break
+        menu.addAction("Copy", self._copy_name)
+        menu.exec(event.globalPos())
+
+
 class PlaylistCard(Card):
     """The playlist expansion table: checkbox · # · title · artist · duration · state."""
 
@@ -416,16 +497,19 @@ class PlaylistCard(Card):
         self.body.addWidget(self.title_label)
         self.body.addWidget(self.meta_label)
 
-        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table = _PlaylistTable(0, len(self.COLUMNS))
         self.table.setObjectName("playlistTable")  # compact rows for the name editors
         self.table.setIconSize(ROW_THUMB)
         self.table.setHorizontalHeaderLabels(list(self.COLUMNS))
         self.table.verticalHeader().setVisible(False)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.cellClicked.connect(self._focus_name_on_title_click)
         self.table.setMinimumHeight(220)
         header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(0, 44)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
@@ -449,10 +533,17 @@ class PlaylistCard(Card):
         self.preset_combo = QComboBox()
         self.archive_check = QCheckBox("Skip songs already downloaded to this folder")
         self.archive_check.setChecked(True)
+        self.audio_note = QLabel(
+            "YouTube audio is usually lossy. FLAC and WAV only change the format; "
+            "they do not improve sound quality and make larger files."
+        )
+        self.audio_note.setObjectName("muted")
+        self.audio_note.setWordWrap(True)
         options.addWidget(QLabel("Preset"))
         options.addWidget(self.preset_combo)
         options.addWidget(self.archive_check, 1)
         self.body.addLayout(options)
+        self.body.addWidget(self.audio_note)
 
         buttons = QHBoxLayout()
         self.selection_label = QLabel("")
@@ -472,6 +563,7 @@ class PlaylistCard(Card):
         self.table.setRowCount(len(entries))
         for row, entry in enumerate(entries):
             box = QCheckBox()
+            box.setStyleSheet("margin-left: 10px;")
             box.setChecked(entry.selectable)
             box.setEnabled(entry.selectable)
             self.table.setCellWidget(row, 0, box)
@@ -490,7 +582,7 @@ class PlaylistCard(Card):
                 self.table.setItem(row, column, item)
             # Empty means "use the default name" (e.g. "Artist - Title" for music); only
             # text the user types is sent, so the title is just a hint.
-            name = QLineEdit()
+            name = _PlaylistNameEdit()
             name.setObjectName("cellEdit")  # compact, so it fits the 30px row
             name.setPlaceholderText(entry.title)
             name.setEnabled(entry.selectable)
@@ -537,6 +629,13 @@ class PlaylistCard(Card):
         widget = self.table.cellWidget(row, 6)
         text = widget.text().strip() if isinstance(widget, QLineEdit) else ""
         return text or None
+
+    def _focus_name_on_title_click(self, row: int, column: int) -> None:
+        if column == self.TITLE_COLUMN:
+            editor = self.table.cellWidget(row, 6)
+            if isinstance(editor, QLineEdit) and editor.isEnabled():
+                editor.setFocus()
+                editor.selectAll()
 
 
 class MatchDialog(QDialog):
@@ -898,6 +997,18 @@ def format_diff(seconds: float | None) -> str:
 # an extended edit or a video with a long intro rather than the recording Spotify lists.
 
 
+class _SpotifyTable(QTableWidget):
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key.Key_F2 and self.currentRow() >= 0:
+            editor = self.cellWidget(self.currentRow(), SpotifyCard.NAME_COLUMN)
+            if isinstance(editor, QLineEdit):
+                editor.setFocus()
+                editor.selectAll()
+                event.accept()
+                return
+        super().keyPressEvent(event)
+
+
 class SpotifyCard(Card):
     """A Spotify track/album/playlist: tick tracks, review their YouTube matches, download.
 
@@ -905,8 +1016,11 @@ class SpotifyCard(Card):
     whole point of the match columns is that the audio comes from somewhere else.
     """
 
-    COLUMNS = ("", "#", "Title", "Artist", "Length", "YouTube match", "Diff", "Score", "")
+    COLUMNS = (
+        "", "#", "Title", "Artist", "Length", "YouTube match", "Diff", "Score", "", "File name"
+    )
     MATCH_COLUMN, DIFF_COLUMN, SCORE_COLUMN, CHANGE_COLUMN = 5, 6, 7, 8
+    NAME_COLUMN = 9
     DISCLOSURE = (
         "Spotify's own audio is protected and is never downloaded. Each song is matched from "
         "YouTube Music, then tagged with Spotify's title, artist, album and cover. A match can "
@@ -941,12 +1055,13 @@ class SpotifyCard(Card):
         self.uncertain_label.hide()
         self.body.addWidget(self.uncertain_label)
 
-        self.table = QTableWidget(0, len(self.COLUMNS))
+        self.table = _SpotifyTable(0, len(self.COLUMNS))
         self.table.setObjectName("spotifyTable")  # compact rows for the Change… buttons
         self.table.setHorizontalHeaderLabels(list(self.COLUMNS))
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.cellClicked.connect(self._focus_name_on_title_click)
         self.table.setMinimumHeight(260)
         self.table.verticalHeader().setDefaultSectionSize(36)
         self.table.setIconSize(ROW_THUMB)
@@ -961,6 +1076,7 @@ class SpotifyCard(Card):
         # ResizeToContents measures items, not cell widgets, so the button column is sized here.
         header.setSectionResizeMode(self.CHANGE_COLUMN, QHeaderView.ResizeMode.Fixed)
         header.resizeSection(self.CHANGE_COLUMN, 104)
+        header.setSectionResizeMode(self.NAME_COLUMN, QHeaderView.ResizeMode.Stretch)
         self.body.addWidget(self.table)
 
         controls = QHBoxLayout()
@@ -1013,7 +1129,25 @@ class SpotifyCard(Card):
             change.setToolTip("Pick another YouTube Music result, or paste a link")
             change.clicked.connect(lambda _=False, r=row: self.change_requested.emit(r))
             self.table.setCellWidget(row, self.CHANGE_COLUMN, change)
+            name = _PlaylistNameEdit()
+            name.setObjectName("cellEdit")
+            name.setPlaceholderText(
+                f"{track.artist} - {track.title}" if track.artist else track.title
+            )
+            name.setToolTip("Click to rename the downloaded file; Spotify tags stay unchanged")
+            self.table.setCellWidget(row, self.NAME_COLUMN, name)
             self.set_status(row, self.NOT_CHECKED, tip=self.NOT_CHECKED_TIP)
+
+    def output_name(self, row: int) -> str | None:
+        widget = self.table.cellWidget(row, self.NAME_COLUMN)
+        text = widget.text().strip() if isinstance(widget, QLineEdit) else ""
+        return text or None
+
+    def _focus_name_on_title_click(self, row: int, column: int) -> None:
+        if column == 2:
+            editor = self.table.cellWidget(row, self.NAME_COLUMN)
+            if isinstance(editor, QLineEdit):
+                editor.setFocus()
 
     def set_status(self, row: int, text: str, warn: bool = False, tip: str = "") -> None:
         """A row with no match to show: not checked yet, checking, or why none was found."""
