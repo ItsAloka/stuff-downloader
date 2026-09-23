@@ -301,9 +301,17 @@ class Store:
 
     def forget(self, job_id: str) -> None:
         """Remove the history row. The downloaded file is never touched."""
+        self.forget_many([job_id])
+
+    def forget_many(self, job_ids: Iterable[str]) -> None:
+        """Remove records and their file references, never the downloaded files."""
+        ids = list(dict.fromkeys(job_ids))
+        if not ids:
+            return
         with self._lock:
-            self._conn.execute("DELETE FROM job_files WHERE job_id = ?", (job_id,))
-            self._conn.execute("DELETE FROM jobs WHERE job_id = ?", (job_id,))
+            rows = [(job_id,) for job_id in ids]
+            self._conn.executemany("DELETE FROM job_files WHERE job_id = ?", rows)
+            self._conn.executemany("DELETE FROM jobs WHERE job_id = ?", rows)
             self._conn.commit()
 
     # ── reads ────────────────────────────────────────────────────────────────────────────

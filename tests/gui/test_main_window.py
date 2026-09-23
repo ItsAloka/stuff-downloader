@@ -30,10 +30,11 @@ def window(qtbot, monkeypatch, statuses):
     return w
 
 
-def test_shell_has_four_pages_and_navigation(window):
-    assert [window.sidebar.item(i).text().split()[-1] for i in range(4)] == [
+def test_shell_has_five_pages_and_navigation(window):
+    assert [window.sidebar.item(i).text().split()[-1] for i in range(5)] == [
         "Downloads",
         "History",
+        "Converters",
         "Tools",
         "Settings",
     ]
@@ -41,8 +42,10 @@ def test_shell_has_four_pages_and_navigation(window):
     window.sidebar.setCurrentRow(1)
     assert window.stack.currentWidget() is window.history_page
     window.sidebar.setCurrentRow(2)
-    assert window.stack.currentWidget() is window.tools_page
+    assert window.stack.currentWidget() is window.converters_page
     window.sidebar.setCurrentRow(3)
+    assert window.stack.currentWidget() is window.tools_page
+    window.sidebar.setCurrentRow(4)
     assert window.stack.currentWidget() is window.settings_page
 
 

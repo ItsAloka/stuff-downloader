@@ -6,6 +6,7 @@ import logging
 import sqlite3
 
 import pytest
+from PyQt6.QtCore import QItemSelectionModel
 from PyQt6.QtGui import QCloseEvent
 from test_main_window import FakeRun, _analyzed  # reuse the runner stand-in
 
@@ -328,6 +329,53 @@ def test_history_remove_deletes_the_entry_but_keeps_the_file(window, runs, tmp_p
     assert history_page.forget_selected()
     assert history_page.table.rowCount() == 0
     assert out.is_file()
+
+
+def test_history_removes_multiple_selected_rows_and_keeps_downloads(window, runs, tmp_path):
+    page = expand(window, runs)
+    jobs = page.start_playlist_download()
+    files = [tmp_path / f"track-{index}.mp3" for index in range(3)]
+    for index, path in enumerate(files):
+        path.write_bytes(bytes([index]))
+        jobs[index].run.emit("result", files=[str(path)], total_bytes=1)
+
+    history_page = window.history_page
+    history_page.refresh()
+    assert history_page.table.rowCount() == 3
+    selected_ids = [history_page._records[index].job_id for index in (0, 2)]
+    for index in (0, 2):
+        history_page.table.selectionModel().select(
+            history_page.table.model().index(index, 0),
+            QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows,
+        )
+    assert history_page.forget_selected()
+    assert history_page.table.rowCount() == 1
+    assert all(page.store.get(job_id) is None for job_id in selected_ids)
+    assert all(path.read_bytes() == bytes([index]) for index, path in enumerate(files))
+
+
+def test_history_filter_keeps_visible_selection_and_never_removes_hidden_rows(window, runs):
+    page = expand(window, runs)
+    jobs = page.start_playlist_download()
+    for job in jobs[:3]:
+        job.run.emit("result", files=[], total_bytes=1)
+
+    history_page = window.history_page
+    history_page.refresh()
+    selected_id = history_page._records[0].job_id
+    history_page.table.selectRow(0)
+    history_page.search_edit.setText(history_page._records[0].title)
+    assert [record.job_id for record in history_page.selected_records()] == [selected_id]
+    history_page.search_edit.setText("Track 1")
+    assert history_page.table.rowCount() == 1
+    assert history_page.selected_records() == []
+    assert not history_page.forget_selected()
+    assert page.store.get(selected_id) is not None
+    history_page.table.selectRow(0)
+    assert history_page.forget_selected()
+    assert history_page.table.rowCount() == 0
+    assert not history_page.empty_label.isHidden()
+    assert page.store.get(selected_id) is not None
 
 
 def test_history_filters_and_download_again_signal(window, runs, tmp_path, qtbot):

@@ -1,14 +1,22 @@
 # Stuff Downloader — Change Plan
 
-## Planned feature: Converters tab
+## Converters
 
-- Add a **Converters** tab to the sidebar.
-- Provide three local conversion tools: **Video**, **Image**, and **Audio**.
-- **Video:** select a local video file, choose MP4, MKV, AVI, MOV, WebM, or MPEG/MPG, then convert. Example: MPEG/MPG → MP4.
-- **Image:** select a local image, choose JPEG, PNG, WebP, GIF, or BMP, then convert with options appropriate to the format.
-- **Audio:** select a local audio file, choose MP3, M4A, AAC, Opus, WAV, or FLAC, then convert.
-- Show source file, output format, destination, progress, clear completion/error state, and an **Open folder** action for every conversion.
-- Use the bundled FFmpeg tool for video/audio conversions and the image conversion pipeline for image conversions.
+- [x] Add a **Converters** tab to the sidebar.
+- [x] **Image:** convert local images to JPEG, PNG, WebP, GIF, or BMP; preserve the source, report progress and completion/errors, and open the output folder. Animated inputs keep their first frame.
+- [x] **Video:** select a local video file, choose MP4, MKV, AVI, MOV, WebM, or MPEG/MPG, then convert. Example: MPEG/MPG → MP4. The source is preserved, existing outputs are not overwritten, and temporary files are cleaned after errors or cancellation.
+- [x] **Audio:** select a local audio file, choose MP3, M4A, AAC, Opus, WAV, or FLAC, then convert.
+- [x] Apply the source, destination, progress, completion/error, cancellation, and **Open folder** workflow to video conversion.
+- [x] Apply the same workflow to audio conversion.
+- [x] Use the bundled FFmpeg tool for video conversion.
+- [x] Use the bundled FFmpeg tool for audio conversion.
+
+## Next DevTeam session
+
+- [x] **History:** select multiple rows and remove them in one action. Removal deletes only history records; downloaded media files remain untouched. Selection follows records still visible under the active filters, and the empty state appears when no records remain. Focused GUI and store tests pass (61 passed); independent DevTeam review is still pending.
+- [x] **Local video conversion:** added MP4, MKV, AVI, MOV, WebM, and MPEG/MPG output to the Converters tab. Bundled-FFmpeg worker and GUI tests passed (45 converter regression tests); DevTeam completed a read-only self-review because only one agent was present.
+- [x] **Local audio conversion:** added MP3, M4A, AAC, Opus, WAV, and FLAC output with source preservation, collision-safe names, and temporary cleanup. All 33 converter tests and Ruff pass; DevTeam self-review is complete and the task is accepted.
+- After audio conversion, address the clipped playlist selection indicator and copyable playlist titles as a focused table usability pass.
 
 ## YouTube music output options
 
@@ -36,11 +44,10 @@
 - **Expected:** Titles (and other useful table text such as artist and file name) can be selected and copied with `Ctrl+C`; expose a right-click **Copy** option as well.
 - **Fix direction:** Use copy-enabled text cells/delegates or implement the table's copy-to-clipboard action while preserving row selection and inline editing.
 
-### History removal ignores multi-selection
+### History removal ignores multi-selection — completed
 
-- **Observed:** When several history rows are selected, **Remove from history** removes only the last selected row.
-- **Expected:** Remove every selected history entry in one action. The downloaded media files must remain untouched, as the screen states.
-- **Fix direction:** Pass the full set of selected row IDs to the history deletion action, then refresh the table while keeping the selection state consistent.
+- **Done:** **Remove from history** now removes all selected visible rows. The store deletes history rows and file references without touching downloaded media. Selection is retained for still-visible records after refresh.
+- **Verification:** Focused History GUI and store tests pass (61 passed); targeted Ruff checks pass. Independent DevTeam review remains pending.
 
 ### Most non-YouTube social-media video previews are missing
 

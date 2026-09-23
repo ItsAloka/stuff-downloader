@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (
 
 from .. import data_root, release_version, resource_path
 from ..core import history, runner, settings, tools
+from .converters import ConvertersPage
 from .pages import (
     NOTIFICATION_TITLE_LIMIT,
     TOOL_LABELS,
@@ -294,11 +295,13 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.downloads_page = DownloadsPage(self.app_settings, self.store)
         self.history_page = HistoryPage(self.store)
+        self.converters_page = ConvertersPage()
         self.tools_page = ToolsPage(self.app_settings)
         self.settings_page = SettingsPage(self.app_settings)
         for label, page in (
             ("⬇   Downloads", self.downloads_page),
             ("🕘   History", self.history_page),
+            ("🔄   Converters", self.converters_page),
             ("🛠   Tools", self.tools_page),
             ("⚙   Settings", self.settings_page),
         ):
@@ -466,6 +469,10 @@ class MainWindow(QMainWindow):
         except Exception:
             log.exception("Stopping downloads failed during shutdown")
         finally:
+            try:
+                self.converters_page.shutdown()
+            except Exception:
+                log.exception("Stopping conversion failed during shutdown")
             if self.owns_store:
                 self.store.close()
         super().closeEvent(event)

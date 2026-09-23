@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -31,6 +32,7 @@ _EXTENSIONS = {"jpg": (".jpg", ".jpeg"), "png": (".png",)}
 _BACKGROUND = re.compile(r"#[0-9a-fA-F]{6}")
 TIMEOUT = 120
 FIRST_FRAME_NOTE = "Animated image: only the first frame was kept."
+LOCAL_FORMATS = {"jpg": ".jpg", "png": ".png", "webp": ".webp", "gif": ".gif", "bmp": ".bmp"}
 
 
 @dataclass(frozen=True)
@@ -130,6 +132,73 @@ def convert_image(
         except OSError:
             pass  # the converted file is in place; a locked original is only clutter
     return ConvertResult(final, converted=True, note=note)
+
+
+def convert_local_image(
+    source: Path,
+    destination: Path,
+    fmt: str,
+    *,
+    background: str = "#ffffff",
+    quality: int = 90,
+    job_id: str = "local",
+    ffmpeg: Path | None = None,
+    emit=None,
+    timeout: float = TIMEOUT,
+) -> ConvertResult:
+    """Convert a local file without deleting it or replacing an existing output."""
+    if fmt not in LOCAL_FORMATS or not _BACKGROUND.fullmatch(background):
+        raise EngineError("bad_options", "invalid image format or background colour")
+    if isinstance(quality, bool) or not isinstance(quality, int) or not 1 <= quality <= 100:
+        raise EngineError("bad_options", "quality must be between 1 and 100")
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", job_id):
+        raise EngineError("bad_options", "invalid conversion job ID")
+    if not source.is_file():
+        raise EngineError("convert_error", "source image does not exist")
+    if not destination.is_dir():
+        raise EngineError("convert_error", "destination folder does not exist")
+    ffmpeg = ffmpeg or trusted_tool("ffmpeg")
+    if ffmpeg is None or not ffmpeg.is_file():
+        raise EngineError("convert_error", "FFmpeg is needed to convert images")
+
+    ext = LOCAL_FORMATS[fmt]
+    # mkdtemp claims an exclusive private directory. The worker may be killed on cancel,
+    # so the parent receives its path and removes that directory after the process exits.
+    temp_dir = Path(tempfile.mkdtemp(
+        prefix=f".{source.stem[:40]}.{job_id}.", suffix=".converting", dir=destination
+    ))
+    temp = temp_dir / ("image" + ext)
+    animated = is_animated(source)
+    args = [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i", str(source)]
+    if fmt == "jpg":
+        colour = "0x" + background[1:]
+        graph = (
+            "[0:v]format=rgba,split[fg][ref];"
+            f"[ref]format=rgb24,drawbox=x=0:y=0:w=iw:h=ih:c={colour}:t=fill[bg];"
+            "[bg][fg]overlay=format=auto,format=yuvj444p"
+        )
+        args += ["-filter_complex", graph, "-q:v", str(max(2, round((101 - quality) * 30 / 100)))]
+    elif fmt == "webp":
+        args += ["-quality", str(quality)]
+    args += ["-frames:v", "1", "-update", "1", str(temp)]
+    if emit is not None:
+        emit("stage", {"stage": "converting", "temporary_path": str(temp_dir)})
+    try:
+        try:
+            proc = subprocess.run(
+                args, stdin=subprocess.DEVNULL, capture_output=True, timeout=timeout,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise EngineError("convert_error", "image conversion timed out") from exc
+        except OSError as exc:
+            raise EngineError("convert_error", "FFmpeg could not be started") from exc
+        if proc.returncode or not temp.is_file() or temp.stat().st_size == 0:
+            raise EngineError("convert_error", f"could not convert this image to {fmt.upper()}")
+        final = move_into_place(temp, destination, source.stem + ext)
+    finally:
+        shutil.rmtree(temp_dir)
+    return ConvertResult(final, converted=True, note=FIRST_FRAME_NOTE if animated else None)
 
 
 # ── job options and the engines' shared finishing step (item 6B) ──────────────────────────

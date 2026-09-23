@@ -78,7 +78,7 @@ def runtime_python(engine: str = "fake") -> Path:
     return root / "python" / "python.exe"
 
 
-DEV_ENGINES = frozenset({"fake", "probe"})
+DEV_ENGINES = frozenset({"fake", "probe", "imageconvert"})
 
 
 def default_worker_command(engine: str = "fake") -> list[str]:
