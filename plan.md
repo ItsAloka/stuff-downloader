@@ -592,6 +592,28 @@ loading with placeholders, and the same picture on queue cards and History.
 YTM playlist → MP3 → each file's album is the real album, not the playlist name.
 Ticks are fully visible at all sizes and DPIs. The queue has no horizontal scrollbar at 1280×720.
 
+> **✅ Done (2026-09-24), approved by Codex, accepted by the owner.** Code commit `77999cd` on `rebuild`.
+> Tests: **1484 passed, 4 skipped, 20 deselected (network), ruff clean.** Three of the skips are mutagen tag tests; the dev venv
+> has no mutagen, and they pass in the yt-dlp engine env.
+> - One `TrackTable` for YouTube, YTM and Spotify. Ticks are model check states, with no `QCheckBox` in any table (P8). Every Title
+>   is edited in place (SelectedClicked | DoubleClicked | EditKeyPressed), including Spotify's (`spotdl.edited_stem`). The edit names
+>   the file only (P4). Ctrl+C copies the selected cells (P16).
+> - "Download selected as": the §5.4 rows (MP3 320–128, M4A, Opus, FLAC, WAV, MP4 ≤2160/1080/720/480p). Playlist batches are row
+>   requests carrying `playlist_index/title/count`, `archive` and `album_order`. Songs default to MP3 320, videos to MP4 1080p.
+> - §5.7 (P10): TALB comes only from the track itself; the playlist title is just the folder. TRCK is written only for album lists
+>   (`OLAK5uy_…`). "X - Topic" and "XVEVO" are tagged as "X". **Live:** a YTM song downloaded as entry 2 of "R5 Test Playlist" was
+>   tagged TALB "Random Access Memories" with no TRCK.
+> - §5.6a (P19): 96×54 video rows and 56×56 square song rows, with fixed placeholders. Only rows on screen load their picture, and
+>   hovering shows it at 240 px. Header cover. The same picture appears on the queue card and in History (`job_thumbs` side table,
+>   schema still v3).
+> - Queue (P11, P18): one row plus a thin bar, with icon buttons. The header has Pause all, Cancel remaining and a "Clear done ▾"
+>   menu (Finished / Cancelled & failed / Everything not running). No horizontal scrollbar at 1280×720 at 100/125/150%
+>   (`test_the_queue_has_no_horizontal_scrollbar_at_1280x720`). Screenshots are in `%TEMP%/stuff-downloader-screenshots/r5-*.png`,
+>   outside git.
+> - **Carried forward to R6:** Spotify album art on every row (rows show the 🎵 placeholder until then; the YouTube match's picture
+>   is never used); the small YouTube match picture inside the Change… dialog; a live Spotify download with an edited name.
+>   The R4 items not verified live (Instagram carousel, TikTok slideshow, X 4-photo post, Reddit gallery) still need the owner's links.
+
 ### R6 — Spotify v2
 §7 items 1–7.
 **Accept:** a 7-song playlist lists in about 2 s with **Spotify album art in every row before any
