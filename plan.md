@@ -122,8 +122,8 @@ the milestone named.
 | **P2** | No format list like 9xbuddy/ytmp3. Options are hidden in Preset + Quality dropdowns. The "All formats" table is read-only. | Plan decision in M3 ("no per-row download"). **S** | ✅ R2 |
 | **P3** | No format conversion at download time (MP4/MKV/WebM, MP3 bitrates, FLAC/WAV, PNG/WebP). The Converters tab was the wrong fix. | Presets are a fixed list of 6. **S + C** | ✅ R2 |
 | **P4** | The "File name" field or column appears everywhere. The owner wants to click the title and edit it. | `PreviewCard.name_edit`, `PlaylistCard` col 6, Spotify col 9. **S + C** | ✅ R2 (single item, playlist table), R5 |
-| **P5** | Most non-YouTube videos (Instagram, TikTok, X, Vimeo…) show a blank preview. | `ytdlp._thumbnail_url` only accepts `*.ytimg.com`, `*.ggpht.com`, `*.googleusercontent.com` (`_THUMB_HOST_SUFFIXES`). Everything else is dropped. **S** | R3 |
-| **P6** | Direct video/audio file links show no preview and no info (duration, resolution, bitrate). | `HttpEngine` analyze builds a preview only for images. **S** | R3 |
+| **P5** | Most non-YouTube videos (Instagram, TikTok, X, Vimeo…) show a blank preview. | `ytdlp._thumbnail_url` only accepts `*.ytimg.com`, `*.ggpht.com`, `*.googleusercontent.com` (`_THUMB_HOST_SUFFIXES`). Everything else is dropped. **S** | ✅ R3 |
+| **P6** | Direct video/audio file links show no preview and no info (duration, resolution, bitrate). | `HttpEngine` analyze builds a preview only for images. **S** | ✅ R3 |
 | **P7** | **Social-media images are blocked while videos work** (Instagram photos/carousels, TikTok photo slideshows, Facebook photos). | They go to gallery-dl, which now needs a login for Instagram ("HTTP redirect to login page", gallery-dl issue #9564, June 2026). TikTok returns 403. yt-dlp ignores photos ("no video in this post"). Our knowledge notes confirm: *"Instagram redirects to login, TikTok profiles 403 (Sept 2026)"*. **S** | R4 |
 | **P8** | The blue tick in playlist and Spotify tables is clipped. | `QCheckBox` placed as a *cell widget* in a narrow column with the theme's padding, in compact 30–36 px rows (plus R-6). **S + C** | R5 |
 | **P9** | Spotify album art does not load in the table or queue. | spotDL's free client returns **no cover for playlist rows** (header note in `engines/spotdl.py`). The table only showed the *YouTube match* thumbnail after "Check matches". **S** | R6 |
@@ -532,11 +532,36 @@ Every audio file has tags and a cover, checked with mutagen. The edited title be
 **Accept:** Instagram reel, TikTok video, X video, Vimeo, Reddit video, direct mp4 and a generic news
 page video all show a preview. A direct mp3 shows duration and bitrate.
 
+> **✅ Done (2026-09-24), accepted by the owner from screenshots.** Code commit `6523bf0` on `rebuild`.
+> Codex reviewed and approved the worker/preview card. The owner accepted the integration card (UI, gallery key,
+> direct-video rows) from the screenshots without waiting for a second Codex review, which was stuck in routing.
+> Tests: **1382 passed, 1 skipped, 20 deselected (network), ruff clean.**
+> - Thumbnails from **any public HTTPS host**: largest wins, square first for music. Fetched with the direct engine's
+>   checked, DNS-pinned `open_url` (`https_only`, every hop re-checked). The Sep 23 `_open_thumbnail` was not re-applied;
+>   this replaces it. With no thumbnail, the page's `og:image` / `twitter:image` / JSON-LD `thumbnailUrl` is used.
+> - Direct video/audio: ffprobe gives duration, resolution, codecs and bitrate. ffmpeg grabs a frame at 10% or the embedded cover.
+>   **ffmpeg/ffprobe never see the real link.** They read it through a loopback relay (`127.0.0.1`, random token,
+>   `-protocol_whitelist http,tcp`), which fetches through `open_url` and caps bytes and time. The relay also handles
+>   sites that ignore `Range` (found live on the sample mp4 host). This replaces the §5.6 wording "`https,tls,tcp` on the checked URL",
+>   because ffmpeg would re-resolve DNS and follow redirects outside our checks.
+> - Direct video now also has Audio rows (MP3 320–64, M4A, Opus, FLAC, WAV) and an Image row `i:frame` (JPG/PNG/WebP),
+>   made by the trusted ffmpeg from the downloaded local file (R2 carry-forward closed).
+> - Result card preview is 480×270 for video and 300×300 for music, with a duration badge. It decodes up to 960 px.
+>   Gallery items now carry `preview` (core still reads the old `thumbnail`).
+> - Live acceptance (analyze only, screenshots kept outside the repo): Instagram reel ✅, X video ✅ (0:17 badge), X photo ✅,
+>   Reddit video ✅, direct mp4 ✅ (real frame), direct mp3 ✅ (0:03, "MP3 ~128 kbps", 🎵 placeholder because the file has no cover).
+> - **Not verified live:** TikTok (the test link was IP-blocked), Vimeo (the test links were login-only or deleted), and a
+>   generic news-page video (dead test link). Re-check them with the owner's own links in the §9 test matrix.
+> - Carried forward: the Instagram **photo** post the owner gave (`/p/DdHWXPMyCL0/`) fails with "That video is not public"
+>   → R4 (P7), and that error must not say "video" for a photo. Idea for later (not planned): an embed/oEmbed preview
+>   fallback for TikTok/X/Vimeo when yt-dlp is blocked. The Instagram reel had no duration from the site, so it has no badge.
+
 ### R4 — Social images
 §6. Gallery grid and the image row flow.
 **Accept (no login):** an Instagram single photo, an Instagram mixed carousel, a TikTok photo
 slideshow, an X post with 4 photos and a Reddit gallery all download at original quality.
 Stories and private accounts give a clear "needs a login" message with the optional login offer.
+Include the owner's Instagram photo link that failed in R3: `https://www.instagram.com/p/DdHWXPMyCL0/`.
 
 ### R5 — Playlists, metadata, queue
 One shared track-table widget for YouTube, YTM and Spotify, with model checkboxes (P8). Title cell
