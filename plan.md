@@ -620,7 +620,7 @@ Ticks are fully visible at all sizes and DPIs. The queue has no horizontal scrol
 match check**, and the playlist cover in the header. The art stays after matching and follows into the queue. Certain matches start
 immediately. Uncertain ones are flagged, not blocked. The four-language sample passes.
 
-> **✅ Done (2026-09-24), approved by Codex.** Not committed yet (commit after the owner accepts the screenshots).
+> **✅ Done (2026-09-24), approved by Codex, accepted by the owner.** Code commit `429e2ac` on `rebuild`.
 > Tests: **1561 passed, 4 skipped, 23 deselected (network), ruff clean.** Live network tests: 6/6 passed.
 > - Listing (§7.1): the public embed page (`__NEXT_DATA__`), one request, about 1 s live, no credentials. The embed lists at most
 >   100 rows; only longer lists fall back to spotDL `get_metadata` (free client). That is the only place spotDL is still used.
@@ -646,12 +646,36 @@ immediately. Uncertain ones are flagged, not blocked. The four-language sample p
 > - §7.5 licensing: spotDL is now needed only for lists of more than 100 songs. Dropping it from the installer is R7 work.
 > - **Carried forward:** the R4 items not verified live (Instagram carousel, TikTok slideshow, X 4-photo post, Reddit gallery)
 >   still need the owner's links. The CJK header title rendered as boxes in offscreen screenshots only (the table cell renders it);
->   check it on a real display.
+>   check it on a real display. *(Both followed up in R7 below.)*
 
 ### R7 — Other music sites and release 1.1.0
 SoundCloud / Bandcamp checked. Apple Music / Deezer link matching. Installer
 `StuffDownloader-Setup-1.1.0.exe` with self-test. Full manual matrix (§9) on the installed build.
 THIRD_PARTY_LICENSES updated (ytmusicapi, curl_cffi already there, and spotDL if still shipped).
+
+> **🟡 Code done (2026-09-24), approved by Codex (code review only). Not fully done:** the §9 manual matrix is not run yet.
+> Tests: **1645 passed, 4 skipped, network deselected; ruff clean.** Live network test `test_real_music.py`: 6/6.
+> - Apple Music and Deezer (§7): routed from their numeric ids. The listing comes from iTunes Lookup and the Deezer API (no keys).
+>   Deezer lists are paged by index. Each song is then matched from YouTube Music exactly like Spotify, with the uncertain flow,
+>   Change… dialog, tagging, artwork, queue and History. It runs on a new `music` worker engine that shares Spotify's code.
+>   **Live:** Apple album 15/15 rows with art. Deezer album 14/14. A 180-song Deezer playlist fully listed. Downloads were tagged
+>   with the service's title, artist, album, date and a 600 px / 1000 px cover (ID3 v2.3). A second run was skipped as archived.
+> - Refused by name: Tidal, Amazon Music, Apple Music playlists (no keyless lookup) and Deezer short share links.
+> - SoundCloud (`forss/flickermood`) and Bandcamp (`youtube-dl-test-song`): real `audio` results. **Live:** MP3 320 and M4A.
+> - Runtime: a new required `music` env (ytmusicapi, yt-dlp, mutagen, requests), pinned like `ytdlp.txt`. spotDL is an
+>   installer option, **ticked by default and shipped offline** (owner's choice). Without it, Spotify lists stop at 100 songs.
+> - Installer `StuffDownloader-Setup-1.1.0.exe` (171 MB) was installed on the owner's machine. All five engine envs passed the
+>   worker self-test. THIRD_PARTY_LICENSES has a `music.txt` section. It stays PERSONAL USE ONLY (F2, F4, F5).
+> - R6 carry-overs: the CJK title (告白氣球) renders correctly on the real Windows display, so no fix was needed.
+>   R4 live (analyze): X 4-photo post ✅ (4 images), TikTok photo slideshow ✅ (16 images + audio), the owner's IG
+>   post (2 images) and reel ✅, the owner's X video ✅, the owner's Reddit video ✅.
+> - Screenshots: `%TEMP%/stuff-downloader-screenshots/r7-*.png` (1280×720 and 1920×1080 at 100/125/150%), outside git.
+> - **Carried forward:**
+>   - The §9 manual matrix on the installed build (needs the owner's link list).
+>   - An Instagram carousel that **mixes** photos and a video (no example found yet).
+>   - A Reddit gallery: Reddit blocks this machine ("blocked by network security"), and yt-dlp hangs over 120 s on
+>     `/gallery/hrrh23` instead of failing fast.
+>   - The M4A "(2)" file-name issue (a separate follow-up).
 
 ---
 
@@ -704,3 +728,4 @@ stays for later.
    Video tab?
 3. **Spotify:** is it OK to keep spotDL only as a fallback for playlists longer than the embed page
    shows, and drop it completely later if the embed + ytmusicapi path proves reliable?
+   *Answered 2026-09-24 (R7): keep it, shipped in setup like the other libraries, as an option ticked by default.*
