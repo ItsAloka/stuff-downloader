@@ -235,7 +235,7 @@ def fake(monkeypatch):
 
     monkeypatch.setattr(ytdlp.YtDlpEngine, "download", fake_ytdlp_download)
 
-    def fetch_cover(url):
+    def fetch_cover(url, allowed=None):
         state["covers"].append(url)
         return state["cover"]
 
@@ -724,7 +724,7 @@ def test_a_missing_cover_is_a_warning_not_a_failure(fake, tmp_path):
     fake["cover"] = None
     result, events = _run(spotify.download_options(VID), out=tmp_path)
     assert result["files"]
-    assert ("log", {"level": "warning", "message": "the Spotify cover could not be loaded"}) in (
+    assert ("log", {"level": "warning", "message": "the cover could not be loaded"}) in (
         events
     )
 

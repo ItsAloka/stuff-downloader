@@ -3,8 +3,11 @@
 ;   .venv\Scripts\python.exe packaging\build_installer.py installer
 ;
 ; which builds dist\payload\ and then runs ISCC with AppVersion, PayloadDir and OutputDir set.
-; PERSONAL USE ONLY: the payload carries the spotDL environment's wheels. Do not sign, publish
-; or share the setup .exe this produces.
+; PERSONAL USE ONLY: the payload carries the gallery-dl and requests wheels together and the
+; spotDL environment (THIRD_PARTY_LICENSES.txt F2, F4, F5). Do not sign, publish or share the
+; setup .exe this produces. The "spotdl" task (ticked by default) installs spotDL offline like
+; the other engines; only Spotify lists over 100 songs need it, and a failed spotDL install
+; leaves the rest of the install working.
 ;
 ; Program files go to %LOCALAPPDATA%\Programs\Stuff Downloader. The app's own data
 ; (%LOCALAPPDATA%\StuffDownloader: settings, runtime\ engine envs, logs) and the user's downloads
@@ -48,6 +51,7 @@ CloseApplications=yes
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "spotdl"; Description: "spotDL, for Spotify playlists over 100 songs"; GroupDescription: "Optional:"
 
 [Files]
 Source: "{#PayloadDir}\StuffDownloader\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
@@ -77,16 +81,20 @@ begin
 end;
 
 // Build the engine envs under %LOCALAPPDATA%\StuffDownloader\runtime, offline, from the staged
-// hash-pinned wheels. Output goes to {app}\setup-runtime.log.
+// hash-pinned wheels; with the spotdl task, spotDL too (optional, never fatal).
+// Output goes to {app}\setup-runtime.log.
 procedure SetupRuntime;
 var
-  Python, Script, Log, Params: String;
+  Python, Script, Log, Params, Extra: String;
   ResultCode: Integer;
 begin
   Python := ExpandConstant('{app}\runtime-setup\python\python.exe');
   Script := ExpandConstant('{app}\runtime-setup\packaging\build_installer.py');
   Log := ExpandConstant('{app}\setup-runtime.log');
-  Params := '/C ""' + Python + '" "' + Script + '" setup-runtime > "' + Log + '" 2>&1"';
+  Extra := '';
+  if WizardIsTaskSelected('spotdl') then
+    Extra := ' --with-spotdl';
+  Params := '/C ""' + Python + '" "' + Script + '" setup-runtime' + Extra + ' > "' + Log + '" 2>&1"';
   WizardForm.StatusLabel.Caption := 'Setting up download engines (this takes a few minutes)...';
   RuntimeOk := Exec(ExpandConstant('{cmd}'), Params, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
     and (ResultCode = 0);

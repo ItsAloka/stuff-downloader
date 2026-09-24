@@ -20,6 +20,7 @@ LOCKS = [
     "packaging/engine-requirements/ytdlp.txt",
     "packaging/engine-requirements/ytdlp-previous.txt",
     "packaging/engine-requirements/gallerydl.txt",
+    "packaging/engine-requirements/music.txt",
     "packaging/engine-requirements/spotdl.txt",
 ]
 PIN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)==([^\s\\;]+)")
@@ -29,6 +30,7 @@ ENGINE_MODULES = (
     "yt_dlp",
     "gallery_dl",
     "spotdl",
+    "ytmusicapi",
     "mutagen",
     "curl_cffi",
     "stuff_downloader_worker",

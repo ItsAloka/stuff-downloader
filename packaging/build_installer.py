@@ -13,7 +13,7 @@ Layout of the payload (the folder is rebuilt from scratch every time)::
     runtime-setup\\python\\             CPython 3.11 (python-build-standalone, SHA-256 pinned)
     runtime-setup\\src\\stuff_downloader_worker\\
     runtime-setup\\packaging\\          build_runtime.py, this file, engine-requirements\\*.txt
-    runtime-setup\\wheels\\             every pinned engine wheel, downloaded with --require-hashes
+    runtime-setup\\wheels\\             every pinned wheel of the shipped engines (--require-hashes)
     licences\\                          LICENSE, THIRD_PARTY_LICENSES.txt, tool and package licences
     PAYLOAD.txt                        version, inputs and their hashes
 
@@ -26,8 +26,14 @@ created on the target machine instead, offline, from the staged wheels::
 That runs build_runtime's own base + install for each engine, so every env still has its hashes
 checked by pip, its imports checked and the worker self-test passed before it becomes active.
 
-Personal use only (THIRD_PARTY_LICENSES.txt F2): the payload contains the spotDL environment's
-wheels, so it and any installer built from it must not be published or shared.
+spotDL is optional (plan §7 item 5, R7): only Spotify lists over 100 songs need it. Its wheels
+are staged like every other engine's, and ``setup-runtime --with-spotdl`` installs it offline
+after the required engines are ready (the installer's spotDL task, ticked by default). If it
+fails, the rest still works.
+
+Personal use only (THIRD_PARTY_LICENSES.txt F2, F4, F5): the payload ships the gallery-dl
+(GPL-2.0-only) and requests (Apache-2.0) wheels together, and the spotDL environment (GPLv3), so
+it and any installer built from it must not be published or shared.
 """
 
 from __future__ import annotations
@@ -60,11 +66,15 @@ ENGINE_INSTALLS: tuple[tuple[str, str], ...] = (
     ("ytdlp", "ytdlp-previous.txt"),
     ("ytdlp", "ytdlp.txt"),
     ("gallerydl", "gallerydl.txt"),
-    ("spotdl", "spotdl.txt"),
+    ("music", "music.txt"),
 )
+# Shipped and installed offline like the others, but only when asked (see the module docstring).
+OPTIONAL_INSTALLS: tuple[tuple[str, str], ...] = (("spotdl", "spotdl.txt"),)
 
 # Engine packages that must never be frozen into the GUI (they run in the runtime's envs).
-ENGINE_PACKAGES = ("stuff_downloader_worker", "yt_dlp", "gallery_dl", "spotdl", "curl_cffi")
+ENGINE_PACKAGES = (
+    "stuff_downloader_worker", "yt_dlp", "gallery_dl", "spotdl", "ytmusicapi", "curl_cffi",
+)  # fmt: skip
 
 LICENCE_NAME = re.compile(r"^(LICEN[CS]E|COPYING|NOTICE|AUTHORS)([.\-_].*)?$", re.IGNORECASE)
 PIN = re.compile(r"^([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?==([^\s;\\]+)")
@@ -133,7 +143,7 @@ def check_inputs(tools_dir: Path) -> None:
     except fetch_tools.ToolError as exc:
         raise PayloadError(str(exc)) from None
     build_runtime = _load("build_runtime")
-    for _engine, name in ENGINE_INSTALLS:
+    for _engine, name in ENGINE_INSTALLS + OPTIONAL_INSTALLS:
         path = REQS / name
         if not path.is_file():
             raise PayloadError(f"{path} is missing")
@@ -211,7 +221,8 @@ def download_wheels(wheels: Path) -> list[Path]:
     """Every pinned engine wheel for CPython 3.11 on win_amd64, hash-checked by pip."""
     cache = CACHE / "wheels"
     cache.mkdir(parents=True, exist_ok=True)
-    for _engine, name in ENGINE_INSTALLS:
+    staged = ENGINE_INSTALLS + OPTIONAL_INSTALLS
+    for _engine, name in staged:
         subprocess.run(
             [
                 sys.executable, "-m", "pip", "download", "--require-hashes", "--no-deps",
@@ -221,7 +232,7 @@ def download_wheels(wheels: Path) -> list[Path]:
             ],
             check=True,
         )  # fmt: skip
-    return copy_pinned_wheels(cache, wheels, [REQS / name for _e, name in ENGINE_INSTALLS])
+    return copy_pinned_wheels(cache, wheels, [REQS / name for _e, name in staged])
 
 
 def copy_pinned_wheels(cache: Path, wheels: Path, requirements: list[Path]) -> list[Path]:
@@ -243,7 +254,7 @@ def stage_runtime_setup(setup: Path) -> None:
     (setup / "packaging" / "engine-requirements").mkdir(parents=True)
     for name in ("build_runtime.py", "build_installer.py"):
         shutil.copy2(HERE / name, setup / "packaging" / name)
-    for _engine, name in ENGINE_INSTALLS:
+    for _engine, name in ENGINE_INSTALLS + OPTIONAL_INSTALLS:
         shutil.copy2(REQS / name, setup / "packaging" / "engine-requirements" / name)
     shutil.copytree(
         PROJECT / "src" / "stuff_downloader_worker",
@@ -252,8 +263,12 @@ def stage_runtime_setup(setup: Path) -> None:
     )
 
 
-def setup_runtime(root: Path | None = None) -> dict[str, str]:
+def setup_runtime(root: Path | None = None, with_spotdl: bool = False) -> dict[str, str]:
     """On the target machine: build every engine env offline from the staged wheels.
+
+    ``with_spotdl`` then also installs the optional spotDL env, offline too. Its failure is
+    reported in the result ("failed: …") but never fails the setup: everything except Spotify
+    lists over 100 songs works without it.
 
     Runs from ``runtime-setup\\packaging``; build_runtime (loaded from beside this file) then
     treats ``runtime-setup`` as its project, so it copies the worker from there too.
@@ -274,16 +289,22 @@ def setup_runtime(root: Path | None = None) -> dict[str, str]:
     saved = {key: os.environ.get(key) for key in offline}
     os.environ.update(offline)
     try:
-        return {
+        done = {
             f"{engine}:{name}": build_runtime.install_engine(root, engine, REQS / name)
             for engine, name in ENGINE_INSTALLS
         }
+        for engine, name in OPTIONAL_INSTALLS if with_spotdl else ():
+            try:
+                done[f"{engine}:{name}"] = build_runtime.install_engine(root, engine, REQS / name)
+            except Exception as exc:  # optional: report it, keep the working install
+                done[f"{engine}:{name}"] = f"failed: {type(exc).__name__}: {exc}"
     finally:
         for key, value in saved.items():
             if value is None:
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+    return done
 
 
 # --- licences -----------------------------------------------------------------------------------
@@ -415,7 +436,8 @@ def _rename(src: Path, dst: Path, attempts: int = 10) -> None:
 def payload_manifest(root: Path) -> str:
     lines = [
         f"Stuff Downloader {_release_version()} installer payload. PERSONAL USE ONLY:",
-        "contains the spotDL environment (THIRD_PARTY_LICENSES.txt F2); do not publish or share.",
+        "contains gallery-dl with requests and the spotDL environment (THIRD_PARTY_LICENSES.txt",
+        "F2, F4, F5); do not publish or share.",
         "",
         "Inputs:",
     ]
@@ -486,7 +508,8 @@ def build_setup(payload: Path, out_dir: Path, rebuild_payload: bool = True) -> P
 
 def _inputs() -> list[Path]:
     names = ["LICENSE", "THIRD_PARTY_LICENSES.txt", "requirements.lock"]
-    return [PROJECT / n for n in names] + [REQS / name for _e, name in ENGINE_INSTALLS]
+    reqs = ENGINE_INSTALLS + OPTIONAL_INSTALLS
+    return [PROJECT / n for n in names] + [REQS / name for _e, name in reqs]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -500,6 +523,9 @@ def main(argv: list[str] | None = None) -> int:
     ins.add_argument("--skip-payload", action="store_true", help="reuse an existing payload")
     run = sub.add_parser("setup-runtime", help="build the engine envs (on the target machine)")
     run.add_argument("--root", type=Path, default=None)
+    run.add_argument(
+        "--with-spotdl", action="store_true", help="also install the optional spotDL env"
+    )
     args = parser.parse_args(argv)
     try:
         if args.command == "payload":
@@ -507,8 +533,9 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "installer":
             print(build_setup(args.payload.resolve(), args.out.resolve(), not args.skip_payload))
         else:
-            for label, env_id in setup_runtime(args.root).items():
-                print(f"ok  {label} -> {env_id}")
+            for label, env_id in setup_runtime(args.root, args.with_spotdl).items():
+                status = "warn" if env_id.startswith("failed:") else "ok  "
+                print(f"{status} {label} -> {env_id}")
     except subprocess.CalledProcessError as exc:
         print(f"error: {exc.cmd[2] if len(exc.cmd) > 2 else exc.cmd} failed ({exc.returncode})",
               file=sys.stderr)  # fmt: skip

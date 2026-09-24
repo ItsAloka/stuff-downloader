@@ -50,6 +50,7 @@ from ..core import cookies
 from ..core.gallery import GalleryItem
 from ..core.presets import BATCH_CHOICES
 from ..core.spotify import (
+    SERVICE_NAMES,
     UNCERTAIN_RULE,
     Candidate,
     Match,
@@ -1365,7 +1366,8 @@ class MatchDialog(QDialog):
         top.setSpacing(12)
         self.spotify_art = QLabel()
         self.spotify_art.setFixedSize(self.SPOTIFY_ART)
-        self.spotify_art.setToolTip("Spotify's cover")
+        site = SERVICE_NAMES.get(track.service, "Spotify")
+        self.spotify_art.setToolTip(f"{site}'s cover")
         self.spotify_art.setPixmap(
             row_icon(art, self.SPOTIFY_ART).pixmap(self.SPOTIFY_ART)
             if isinstance(art, QImage) and not art.isNull()
@@ -1379,7 +1381,7 @@ class MatchDialog(QDialog):
         heading.setWordWrap(True)
         text.addWidget(heading)
         info = QLabel(
-            f"Spotify length {format_duration(track.duration)}. "
+            f"{site} length {format_duration(track.duration)}. "
             f"Results with a ⚠ are uncertain: {UNCERTAIN_RULE}."
         )
         info.setObjectName("muted")
@@ -1779,8 +1781,8 @@ class SpotifyCard(Card):
     EXTRA = ("YouTube match", "Diff", "Score", "")
     MATCH_COLUMN, DIFF_COLUMN, SCORE_COLUMN, CHANGE_COLUMN = 7, 8, 9, 10
     DISCLOSURE = (
-        "Spotify's own audio is protected and is never downloaded. Each song is matched from "
-        "YouTube Music, then tagged with Spotify's title, artist, album and cover. A match can "
+        "{site}'s own audio is protected and is never downloaded. Each song is matched from "
+        "YouTube Music, then tagged with {site}'s title, artist, album and cover. A match can "
         "be the wrong recording, so check the ones that matter to you."
     )
     NOT_CHECKED = "Not checked"
@@ -1794,7 +1796,7 @@ class SpotifyCard(Card):
         self.header.set_music(True)
         self.title_label = self.header.title_label
         self.meta_label = self.header.meta_label
-        self.disclosure_label = QLabel(self.DISCLOSURE)
+        self.disclosure_label = QLabel(self.DISCLOSURE.format(site="Spotify"))
         self.disclosure_label.setWordWrap(True)
         self.disclosure_label.setTextFormat(Qt.TextFormat.PlainText)
         self.body.addWidget(self.header)
@@ -1849,6 +1851,10 @@ class SpotifyCard(Card):
     def change_button(self, row: int) -> QPushButton | None:
         widget = self.table.cellWidget(row, self.CHANGE_COLUMN)
         return widget if isinstance(widget, QPushButton) else None
+
+    def set_service(self, site: str) -> None:
+        """Name the service the list came from: Spotify, Apple Music or Deezer (plan §7)."""
+        self.disclosure_label.setText(self.DISCLOSURE.format(site=site))
 
     def set_tracks(self, tracks: tuple[SpotifyTrack, ...] | list[SpotifyTrack]) -> None:
         rows = [

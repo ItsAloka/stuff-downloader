@@ -82,10 +82,27 @@ DEV_ENGINES = frozenset({"fake", "probe"})
 # Engines with no env of their own run in another engine's env: the social extractor needs
 # only the stdlib and the yt-dlp env's curl_cffi (plan §6).
 ENV_OF = {"social": "ytdlp"}
+# The music env (ytmusicapi, yt-dlp, mutagen) runs Spotify, Apple Music and Deezer matching. The
+# spotDL env is an optional installer component (plan §7 item 5, R7) holding all of that plus
+# spotDL, which only Spotify lists over 100 songs need. So the Spotify engine prefers the spotDL
+# env when it is installed, and either env stands in for the other when only one exists (an
+# install from before 1.1.0 has only the spotDL env).
+_ENV_PREFERENCES = {"spotdl": ("spotdl", "music"), "music": ("music", "spotdl")}
+
+
+def env_for(engine: str) -> str:
+    """The engine env whose interpreter runs ``engine``'s jobs."""
+    engine = ENV_OF.get(engine, engine)
+    choices = _ENV_PREFERENCES.get(engine)
+    if choices is None:
+        return engine
+    root = runtime_root()
+    # With neither installed, name the env every install should have: the music env.
+    return next((env for env in choices if _active_env(root, env)), "music")
 
 
 def default_worker_command(engine: str = "fake") -> list[str]:
-    engine = ENV_OF.get(engine, engine)
+    engine = env_for(engine)
     if not is_frozen():
         # From source, real engines use the installed engine env when there is one, because the
         # dev venv deliberately does not contain yt-dlp.

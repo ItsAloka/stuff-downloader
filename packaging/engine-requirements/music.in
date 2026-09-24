@@ -1,0 +1,7 @@
+# The music env (plan §7, R7): Spotify, Apple Music and Deezer matching and tagging.
+# ytmusicapi finds the YouTube Music recording; yt-dlp downloads it; mutagen tags the MP3.
+# The same yt-dlp pins as ytdlp.txt (compiled with it as a constraint).
+yt-dlp[default,curl-cffi]==2026.8.19
+ytmusicapi==1.12.2
+mutagen==1.48.1
+requests==2.34.2

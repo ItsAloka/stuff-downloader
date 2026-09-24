@@ -504,3 +504,87 @@ def test_social_hosts_share_their_site_rate_limit_group():
 )
 def test_only_an_unsupported_answer_moves_down_the_chain(code, falls_back):
     assert _router.should_fall_back(code) is falls_back
+
+
+# ── Apple Music, Deezer, Tidal, Amazon Music (plan §7 "Other music sites") ────────────────
+@pytest.mark.parametrize(
+    ("text", "service", "kind", "catalog_id", "url"),
+    [
+        (
+            "https://music.apple.com/us/album/in-between-dreams/1440857781?uo=4",
+            "apple", "album", "1440857781", "https://music.apple.com/us/album/1440857781",
+        ),
+        (
+            "https://music.apple.com/gb/album/better-together/1440857781?i=1440857786&uo=4",
+            "apple", "track", "1440857786", "https://music.apple.com/gb/song/1440857786",
+        ),
+        (
+            "https://music.apple.com/jp/song/better-together/1440857786",
+            "apple", "track", "1440857786", "https://music.apple.com/jp/song/1440857786",
+        ),
+        (
+            "https://itunes.apple.com/us/album/x/id1440857781",
+            "apple", "album", "1440857781", "https://music.apple.com/us/album/1440857781",
+        ),
+        (
+            "https://www.deezer.com/fr/track/3135556?utm_source=x",
+            "deezer", "track", "3135556", "https://www.deezer.com/track/3135556",
+        ),
+        (
+            "https://deezer.com/album/302127",
+            "deezer", "album", "302127", "https://www.deezer.com/album/302127",
+        ),
+        (
+            "https://www.deezer.com/en/playlist/908622995",
+            "deezer", "playlist", "908622995", "https://www.deezer.com/playlist/908622995",
+        ),
+    ],
+)  # fmt: skip
+def test_apple_music_and_deezer_links_are_rebuilt_from_kind_and_id(
+    text, service, kind, catalog_id, url
+):
+    r = route(text)
+    assert (r.kind, r.service, r.catalog_kind, r.catalog_id, r.url) == (
+        "catalog", service, kind, catalog_id, url
+    )  # fmt: skip
+    assert r.engine == "music" and r.is_catalog and not r.is_spotify
+
+
+def test_spotify_is_a_catalog_link_too():
+    assert route("https://open.spotify.com/track/6OmhkSOpvYBokMKQxpIGx2").is_catalog
+
+
+@pytest.mark.parametrize(
+    ("text", "reason"),
+    [
+        ("https://listen.tidal.com/album/123", "Tidal is not supported"),
+        ("https://tidal.com/browse/track/123", "Tidal is not supported"),
+        ("https://music.amazon.com/albums/B0ABC", "Amazon Music is not supported"),
+        ("https://music.amazon.co.uk/albums/B0ABC", "Amazon Music is not supported"),
+        ("https://www.amazon.com/music/player/albums/B0ABC", "Amazon Music is not supported"),
+        ("https://music.apple.com/us/playlist/x/pl.u-abc", "Apple Music playlists"),
+        ("https://link.deezer.com/s/abc", "copy the full deezer.com address"),
+        ("https://deezer.page.link/abc", "copy the full deezer.com address"),
+        ("https://www.deezer.com/artist/27", "No Deezer song"),
+        ("https://music.apple.com/us/artist/x/909253", "No Apple Music song"),
+    ],
+)
+def test_services_we_cannot_use_are_refused_by_name(text, reason):
+    r = route(text)
+    assert not r.ok and reason in r.reason
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://music.apple.com/us/album/x/0123",
+        "https://music.apple.com/us/album/x/1440857781?i=abc",
+        "https://www.deezer.com/track/12a",
+    ],
+)
+def test_a_malformed_music_id_is_invalid(text):
+    assert route(text).kind == "invalid"
+
+
+def test_an_amazon_shop_page_is_not_mistaken_for_amazon_music():
+    assert route("https://www.amazon.com/dp/B0ABC").kind == "video"

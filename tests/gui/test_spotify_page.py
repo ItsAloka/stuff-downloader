@@ -662,3 +662,71 @@ def test_a_playlist_song_takes_its_oembed_lookup_into_history(page, runs, qtbot)
     page.spotify_card.table.set_checked(1, True)
     (job,) = page.start_spotify_download()
     assert page.store.get(job.spec.job_id).thumb_url == spotify.oembed_url(T2)
+
+
+# ── Apple Music and Deezer (plan §7 "Other music sites") ──────────────────────────────────
+DZ_ART = (
+    "https://cdn-images.dzcdn.net/images/cover/5718f7c81c27e0b2417e2a4c45224f8a/"
+    "300x300-000000-80-0-0.jpg"
+)
+DZ_URL = "https://www.deezer.com/fr/album/302127?utm_source=share"
+
+
+def deezer_result():
+    tracks = [
+        {"id": "3135553", "title": "One More Time", "artists": ["Daft Punk"], "album": "Discovery",
+         "duration": 320.0, "explicit": False, "date": "2001-03-07", "art": DZ_ART},
+        {"id": "3135556", "title": "Harder, Better, Faster, Stronger", "artists": ["Daft Punk"],
+         "album": "Discovery", "duration": 226.0, "explicit": False, "date": "2001-03-07",
+         "art": DZ_ART},
+    ]  # fmt: skip
+    return protocol.media_result(
+        "playlist", ["tracks"], "Discovery", "https://www.deezer.com/album/302127",
+        entries=tracks, tracks=tracks, site="Deezer", service="deezer", catalog_kind="album",
+        catalog_id="302127", country="us", owner="Daft Punk", skipped=0, truncated=False,
+        cover=DZ_ART,
+    )  # fmt: skip
+
+
+def test_a_deezer_album_gets_the_spotify_treatment_on_the_music_engine(page, runs, qtbot):
+    run = _analyzed(page, runs, qtbot, url=DZ_URL, result=deezer_result())
+    assert run.spec.engine == "music"
+    assert run.spec.url == "https://www.deezer.com/album/302127"  # no tracking, no language
+    card = page.spotify_card
+    assert "Deezer's own audio is protected" in card.disclosure_label.text()
+    assert "Spotify" not in card.disclosure_label.text()
+    assert card.table.rowCount() == 2
+    assert page._spotify_art_urls == [DZ_ART, DZ_ART]
+
+    card.match_button.click()
+    lookups = _match_runs(runs)
+    assert {r.spec.engine for r in lookups} == {"music"}
+    assert lookups[0].spec.options["song"]["title"] == "One More Time"
+    assert lookups[0].spec.options["album"] == "Discovery"
+
+
+def test_a_deezer_song_downloads_as_a_tagged_mp3_job_on_the_music_engine(page, runs, qtbot):
+    _analyzed(page, runs, qtbot, url=DZ_URL, result=deezer_result())
+    _all_matched(page)
+    specs = [j.spec for j in page.start_spotify_download()]
+    assert len(specs) == 2
+    first = specs[0]
+    assert first.engine == "music" and first.url == "https://www.deezer.com/track/3135553"
+    assert first.options["video_id"] == VID2 and first.options["album_track"] == 1
+    assert first.options["song"]["date"] == "2001-03-07"
+
+
+def test_a_spotify_card_says_spotify_again_after_a_deezer_list(page, runs, qtbot):
+    _analyzed(page, runs, qtbot, url=DZ_URL, result=deezer_result())
+    _analyzed(page, runs, qtbot)
+    assert page.spotify_card.disclosure_label.text().startswith("Spotify's own audio")
+
+
+@pytest.mark.parametrize(
+    "url", ["https://listen.tidal.com/album/1", "https://music.amazon.com/albums/B0ABC"]
+)
+def test_tidal_and_amazon_music_are_refused_before_any_job(page, runs, url):
+    page.url_edit.setText(url)
+    page.analyze()
+    assert runs == []
+    assert "not supported" in page.message_label.text()

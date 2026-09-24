@@ -271,10 +271,10 @@ MATCH_TIMEOUT_MS = 180_000
 # and re-downloads like any other.
 SPOTIFY_PRESET = presets.Preset(
     spotify.PRESET_ID,
-    "MP3 — matched from YouTube, tagged from Spotify",
+    "MP3 — matched from YouTube, tagged from the music service",
     "audio",
     None,
-    "Spotify's metadata and cover on audio matched from YouTube Music",
+    "Spotify's, Apple Music's or Deezer's metadata and cover on audio matched from YouTube Music",
 )
 
 
@@ -659,7 +659,7 @@ class DownloadsPage(QWidget):
         self.url_edit = QLineEdit()
         self.url_edit.setObjectName("urlEdit")
         self.url_edit.setPlaceholderText(
-            "🔗  Paste a link — YouTube, a Spotify song or playlist, or another site…"
+            "🔗  Paste a link — YouTube, Spotify, Apple Music, Deezer, or another site…"
         )
         self.url_edit.setClearButtonEnabled(True)
         self.paste_button = QPushButton("Paste")
@@ -1041,15 +1041,16 @@ class DownloadsPage(QWidget):
         self._analyze_run = run
         self._analyze_job_id = spec.job_id
         self._analyze_timed_out = False
-        if route.is_spotify:
-            self._show_message("Reading Spotify…")
+        if route.is_catalog:
+            site = spotify.SERVICE_NAMES.get(route.service or "spotify", "Spotify")
+            self._show_message(f"Reading {site}…")
         else:
             reading = "Reading the playlist…" if route.is_playlist else "Analyzing link…"
             self._show_message(f"{route.note} {reading}" if route.note else reading)
         self.analyze_button.setEnabled(False)
         self.analyze_cancel_button.show()
         self._analyze_timer.start(
-            SPOTIFY_ANALYZE_TIMEOUT_MS if route.is_spotify else ANALYZE_TIMEOUT_MS
+            SPOTIFY_ANALYZE_TIMEOUT_MS if route.is_catalog else ANALYZE_TIMEOUT_MS
         )
         run.start()
 
@@ -1090,7 +1091,7 @@ class DownloadsPage(QWidget):
             if (
                 route is not None
                 and not route.is_file
-                and not route.is_spotify  # public share links only; no Spotify login
+                and not route.is_catalog  # public share links only; no music-service login
                 and errors.needs_site_login(code, message)
             ):
                 self._login_site = cookies.site_key(route.url)
@@ -1106,7 +1107,7 @@ class DownloadsPage(QWidget):
         self._show_message("")
         # Chosen by what the link holds, never by the engine or route that read it (§5.2).
         kind = result["kind"]
-        if kind == "playlist" and result.get("spotify_kind"):
+        if kind == "playlist" and (result.get("spotify_kind") or result.get("catalog_kind")):
             self.show_spotify(result)
         elif kind == "playlist":
             self.show_playlist(result)
@@ -1341,10 +1342,12 @@ class DownloadsPage(QWidget):
         count = len(listing.tracks)
         meta = [kind, listing.owner, f"{count} song" if count == 1 else f"{count} songs"]
         if listing.skipped:
-            meta.append(f"{listing.skipped} not downloadable (local files or podcasts)")
+            why = " (local files or podcasts)" if listing.service == "spotify" else ""
+            meta.append(f"{listing.skipped} not downloadable{why}")
         if listing.truncated:
             meta.append(f"showing the first {spotify.MAX_TRACKS}")
         card.meta_label.setText("  ·  ".join(m for m in meta if m))
+        card.set_service(listing.site)
         card.set_tracks(listing.tracks)
         self._forget_spotify_batch()
         card.set_uncertain_count(0)
@@ -1622,7 +1625,7 @@ class DownloadsPage(QWidget):
         listing = self._spotify
         route = self._route
         tracks = [t for t in self.selected_spotify_tracks() if t.track_id not in self._spotify_sent]
-        if listing is None or route is None or not route.is_spotify or not tracks:
+        if listing is None or route is None or not route.is_catalog or not tracks:
             return []
         self._spotify_archive = self.spotify_card.archive_check.isChecked()
         busy = {t.track_id for t in self._match_waiting}

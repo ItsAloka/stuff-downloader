@@ -67,6 +67,7 @@ ENGINE_EXCLUDES = [
     "curl_cffi",
     "gallery_dl",
     "spotdl",
+    "ytmusicapi",
     "mutagen",
 ]
 

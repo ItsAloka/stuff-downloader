@@ -51,6 +51,13 @@ PYTHON_VERSION = "3.11.16"
 # Modules that must import for an env to be activated, and the distribution to name it by.
 ENGINES: dict[str, dict[str, object]] = {
     "ytdlp": {"imports": ["yt_dlp", "curl_cffi", "yt_dlp_ejs"], "dist": "yt-dlp"},
+    # Spotify, Apple Music and Deezer matching and tagging (plan §7, R7).
+    "music": {
+        "imports": ["ytmusicapi", "yt_dlp", "curl_cffi", "yt_dlp_ejs", "mutagen", "requests"],
+        "dist": "ytmusicapi",
+    },
+    # Optional (R7): only Spotify lists over 100 songs need it. The installer ships its wheels
+    # and installs it offline when its task is ticked (the default).
     "spotdl": {"imports": ["spotdl"], "dist": "spotdl"},
     # GPLv2-only (plan §8.3): lives only in its own env, run as a separate worker process.
     "gallerydl": {"imports": ["gallery_dl", "requests"], "dist": "gallery-dl"},
@@ -306,7 +313,8 @@ def check_env(root: Path, engine: str, env_dir: Path) -> dict[str, str]:
         f"mods = {modules!r}\n"
         "for m in mods: importlib.import_module(m)\n"
         "names = {'yt_dlp': 'yt-dlp', 'curl_cffi': 'curl_cffi', 'yt_dlp_ejs': 'yt-dlp-ejs',"
-        " 'spotdl': 'spotdl', 'gallery_dl': 'gallery-dl', 'requests': 'requests'}\n"
+        " 'spotdl': 'spotdl', 'gallery_dl': 'gallery-dl', 'requests': 'requests',"
+        " 'ytmusicapi': 'ytmusicapi', 'mutagen': 'mutagen'}\n"
         "found = {m: metadata.version(names[m]) for m in mods}\n"
         "print(json.dumps(found | {'prefix': sys.prefix}))\n"
     )

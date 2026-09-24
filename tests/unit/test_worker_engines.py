@@ -18,7 +18,7 @@ def _spec(engine, **options):
 
 
 def test_registry_has_spike_engines():
-    assert {"fake", "probe", "ytdlp"} <= set(ENGINES)
+    assert {"fake", "probe", "ytdlp", "spotdl", "music"} <= set(ENGINES)
 
 
 def test_probe_reports_interpreter_and_modules():

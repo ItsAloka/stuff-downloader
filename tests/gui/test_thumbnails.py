@@ -345,3 +345,37 @@ def test_the_placeholder_shows_only_without_a_picture(qtbot, kind, text):
     card.set_preview(_image(10, 10, "#00ff00"), {"kind": kind})
     card.set_preview(None, {"kind": kind, "duration": 5})
     assert card.cover.text() == text and card.cover.pixmap().isNull()
+
+
+APPLE_ART = (
+    "https://is1-ssl.mzstatic.com/image/thumb/Music115/v4/44/06/fd/"
+    "4406fdc0-aab5-e300-82ba-3e5fe81a68a7/00602537868858.rgb.jpg/300x300bb.jpg"
+)
+DEEZER_ART = (
+    "https://cdn-images.dzcdn.net/images/cover/5718f7c81c27e0b2417e2a4c45224f8a/"
+    "300x300-000000-80-0-0.jpg"
+)
+
+
+def test_apple_music_and_deezer_covers_are_allowed_in_their_exact_form():
+    assert thumbs.allowed(APPLE_ART) and thumbs.allowed(DEEZER_ART)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        APPLE_ART + "?x=1",
+        APPLE_ART.replace("is1-ssl", "is9-ssl"),
+        APPLE_ART.replace("/image/thumb/", "/other/"),
+        "https://is1-ssl.mzstatic.com/image/thumb/../../x/300x300bb.jpg".replace("..", "%2e%2e"),
+        DEEZER_ART.replace("cdn-images", "e-cdns-images"),  # only the normalized host
+        DEEZER_ART.replace("/cover/", "/artist/"),
+        "https://api.deezer.com/album/302127/image",
+        "https://is1-ssl.mzstatic.com/",
+    ],
+)
+def test_nothing_else_on_apple_or_deezer_hosts_is_fetched(url, monkeypatch):
+    monkeypatch.undo()
+    assert not thumbs.allowed(url)
+    with pytest.raises(thumbs.ThumbnailError):
+        thumbs.fetch(url)

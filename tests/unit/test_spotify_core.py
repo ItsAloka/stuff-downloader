@@ -297,3 +297,69 @@ def test_an_unknown_method_reads_as_a_video(method):
 def test_a_match_keeps_the_album_it_was_found_on_as_plain_text():
     m = spotify.parse_match(match_data(album="Global\n  Warming", method="song"), track())
     assert m.album == "Global Warming"
+
+
+# ── Apple Music and Deezer (plan §7 "Other music sites") ──────────────────────────────────
+DZ_ART = (
+    "https://cdn-images.dzcdn.net/images/cover/5718f7c81c27e0b2417e2a4c45224f8a/"
+    "300x300-000000-80-0-0.jpg"
+)
+
+
+def deezer_listing(**extra):
+    return {
+        "service": "deezer",
+        "catalog_kind": "album",
+        "catalog_id": "302127",
+        "title": "Discovery",
+        "cover": DZ_ART,
+        "tracks": [
+            {"id": "3135553", "title": "One More Time", "artists": ["Daft Punk"],
+             "album": "Discovery", "duration": 320.0, "date": "2001-03-07", "art": DZ_ART},
+            {"id": "6OmhkSOpvYBokMKQxpIGx2", "title": "A Spotify id is not a Deezer id"},
+            {"id": "3135556", "title": "Harder", "date": 2001, "art": "https://evil.example/x.jpg"},
+        ],
+        **extra,
+    }  # fmt: skip
+
+
+def test_a_deezer_listing_keeps_its_service_numeric_ids_and_pictures():
+    listing = spotify.parse_listing(deezer_listing())
+    assert (listing.service, listing.kind, listing.spotify_id) == ("deezer", "album", "302127")
+    assert listing.site == "Deezer" and listing.cover == DZ_ART
+    assert [t.track_id for t in listing.tracks] == ["3135553", "3135556"]
+    assert listing.skipped == 1
+    first, second = listing.tracks
+    assert first.url == "https://www.deezer.com/track/3135553" and first.engine == "music"
+    assert first.art_url == DZ_ART and first.date == "2001-03-07"
+    assert second.art == "" and second.art_url == "" and second.date == ""  # no oEmbed guess
+
+
+def test_a_listing_naming_an_unknown_service_is_read_as_spotify():
+    listing = spotify.parse_listing(deezer_listing(service="tidal"))
+    assert listing.service == "spotify"
+    assert [t.track_id for t in listing.tracks] == ["6OmhkSOpvYBokMKQxpIGx2"]  # no numeric ids
+
+
+def test_catalog_jobs_carry_the_checked_song_and_go_to_the_music_engine():
+    track = spotify.parse_listing(deezer_listing()).tracks[0]
+    match = spotify.match_spec(track)
+    assert match.engine == "music" and match.url == track.url
+    assert match.options == {
+        "mode": "match",
+        "album": "Discovery",
+        "song": {
+            "title": "One More Time", "artists": ["Daft Punk"], "explicit": False,
+            "duration": 320.0, "date": "2001-03-07", "art": DZ_ART,
+        },
+    }  # fmt: skip
+    [download] = spotify.batch_specs([track], {}, "out", album_order=True)
+    assert download.engine == "music"
+    assert download.options["song"] == match.options["song"]
+    assert download.options["album_track"] == 1
+
+
+def test_spotify_jobs_are_unchanged_and_carry_no_song():
+    track = spotify.SpotifyTrack("6OmhkSOpvYBokMKQxpIGx2", 1, "Song")
+    assert "song" not in spotify.match_spec(track).options
+    assert spotify.match_spec(track).engine == "spotdl"

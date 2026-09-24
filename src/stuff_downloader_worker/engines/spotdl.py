@@ -363,6 +363,7 @@ def track_fields(entity: dict[str, Any], track_id: str, opts: dict[str, Any]) ->
         "date": date,
         "url": f"https://open.spotify.com/track/{track_id}",
         "cover_url": picture(entity, 640),
+        "track_id": track_id,
     }
 
 
@@ -643,26 +644,35 @@ def move_no_overwrite(src: Path, folder: Path, stem: str, suffix: str) -> Path:
 
 
 class Archive:
-    """Spotify track ids already downloaded into one folder, one per line."""
+    """Track ids already downloaded into one folder, one "<service> <id>" per line.
 
-    def __init__(self, folder: Path) -> None:
+    Spotify, Apple Music and Deezer share the one file; the service prefix keeps their ids apart.
+    """
+
+    def __init__(self, folder: Path, service: str = "spotify") -> None:
         self.path = folder / ARCHIVE_FILENAME
+        self.service = service
 
     def __contains__(self, track_id: str) -> bool:
         try:
             with open(self.path, encoding="utf-8") as fp:
-                return any(line.strip() == f"spotify {track_id}" for line in fp)
+                return any(line.strip() == f"{self.service} {track_id}" for line in fp)
         except FileNotFoundError:
             return False
 
     def add(self, track_id: str) -> None:
         with open(self.path, "a", encoding="utf-8") as fp:
-            fp.write(f"spotify {track_id}\n")
+            fp.write(f"{self.service} {track_id}\n")
 
 
-def fetch_cover(url: str | None) -> bytes | None:
-    """Spotify's cover as JPEG bytes, or None. Only a normalized i.scdn.co picture."""
-    if not url or spotify_image(url) != url:
+def fetch_cover(url: str | None, allowed: Any = None) -> bytes | None:
+    """The cover as JPEG bytes, or None.
+
+    Only a picture that ``allowed`` returns unchanged is fetched: by default a normalized
+    i.scdn.co picture; the music engine passes its own Apple Music / Deezer check.
+    """
+    check = allowed or spotify_image
+    if not url or check(url) != url:
         return None
     import requests
 
@@ -832,6 +842,14 @@ class SpotDlEngine:
 
             SpotDlEngine._client()
             _, songs = (Album if kind == "album" else Playlist).get_metadata(url)
+        except ImportError:
+            # spotDL is an optional installer component (plan §7 item 5, R7).
+            message = (
+                f"only the first {len(rows)} songs could be listed. Longer Spotify lists need the "
+                "optional spotDL component: run the installer again and tick it"
+            )
+            emit("log", {"level": "warning", "message": message})
+            return rows, skipped
         except Exception:
             message = f"only the first {len(rows)} songs could be listed"
             emit("log", {"level": "warning", "message": message})
@@ -915,58 +933,75 @@ class SpotDlEngine:
 
         emit("stage", {"stage": "analyzing"})
         fields = track_fields(fetch_embed("track", track_id), track_id, job.options)
-        manual = video_id is not None
-        if video_id is None:
-            found = find_match(fields, emit)
-            if found is None:
-                raise EngineError("no_match", "No matching song was found on YouTube Music.")
-            video_id = found["video_id"]
-            if not fields["album_name"] and found["album"]:
-                fields["album_name"] = found["album"]
+        return download_matched(job, folder, fields, video_id, emit, ledger if archive else None)
 
-        # The audio: this project's own MP3 recipe, run by the yt-dlp engine in this env.
-        from stuff_downloader_worker.engines.ytdlp import YtDlpEngine
 
-        def forward(event_type: str, data: dict[str, Any]) -> None:
-            if event_type == "stage" and data.get("stage") == "completed":
-                return  # not complete until it is tagged
-            emit(event_type, data)
+def download_matched(
+    job: JobSpec,
+    folder: Path,
+    fields: dict[str, Any],
+    video_id: str | None,
+    emit: Emit,
+    ledger: Archive | None,
+    cover_check: Any = None,
+) -> dict[str, Any]:
+    """Match (unless the owner reviewed ``video_id``), download the MP3, tag, name and archive it.
 
-        audio = YtDlpEngine().download(
-            JobSpec(
-                job_id=job.job_id,
-                engine="ytdlp",
-                url=f"https://www.youtube.com/watch?v={video_id}",
-                output_dir=str(folder),
-                options={
-                    "mode": "download",
-                    "preset": "mp3_music",
-                    "height": None,
-                    "compatible": True,
-                    "crop_cover": True,
-                },
-            ),
-            forward,
-        )
-        mp3s = [Path(p) for p in audio.get("files") or [] if str(p).lower().endswith(".mp3")]
-        if not mp3s or not mp3s[0].is_file():
-            raise EngineError("no_output", "download finished without an MP3 file")
+    Shared by the Spotify and music engines: ``fields`` is what the track is matched and tagged
+    with, whichever service listed it. ``cover_check`` vets its cover URL (see fetch_cover).
+    """
+    manual = video_id is not None
+    if video_id is None:
+        found = find_match(fields, emit)
+        if found is None:
+            raise EngineError("no_match", "No matching song was found on YouTube Music.")
+        video_id = found["video_id"]
+        if not fields["album_name"] and found["album"]:
+            fields["album_name"] = found["album"]
 
-        emit("stage", {"stage": "tagging"})
-        cover = fetch_cover(fields.get("cover_url"))
-        if cover is None:
-            emit("log", {"level": "warning", "message": "the Spotify cover could not be loaded"})
-        tags = tag_mp3(mp3s[0], fields, cover)
-        stem = edited_stem(job.options) or file_stem(fields["artists"], fields["name"])
-        final = move_no_overwrite(mp3s[0], folder, stem, ".mp3")
-        if archive:
-            ledger.add(track_id)
-        emit("stage", {"stage": "completed"})
-        return {
-            "title": final.stem,
-            "preset": PRESET_ID,
-            "files": [str(final)],
-            "total_bytes": final.stat().st_size,
-            "tags": tags,
-            "match": {"video_id": video_id, "manual": manual},
-        }
+    # The audio: this project's own MP3 recipe, run by the yt-dlp engine in this env.
+    from stuff_downloader_worker.engines.ytdlp import YtDlpEngine
+
+    def forward(event_type: str, data: dict[str, Any]) -> None:
+        if event_type == "stage" and data.get("stage") == "completed":
+            return  # not complete until it is tagged
+        emit(event_type, data)
+
+    audio = YtDlpEngine().download(
+        JobSpec(
+            job_id=job.job_id,
+            engine="ytdlp",
+            url=f"https://www.youtube.com/watch?v={video_id}",
+            output_dir=str(folder),
+            options={
+                "mode": "download",
+                "preset": "mp3_music",
+                "height": None,
+                "compatible": True,
+                "crop_cover": True,
+            },
+        ),
+        forward,
+    )
+    mp3s = [Path(p) for p in audio.get("files") or [] if str(p).lower().endswith(".mp3")]
+    if not mp3s or not mp3s[0].is_file():
+        raise EngineError("no_output", "download finished without an MP3 file")
+
+    emit("stage", {"stage": "tagging"})
+    cover = fetch_cover(fields.get("cover_url"), cover_check)
+    if cover is None:
+        emit("log", {"level": "warning", "message": "the cover could not be loaded"})
+    tags = tag_mp3(mp3s[0], fields, cover)
+    stem = edited_stem(job.options) or file_stem(fields["artists"], fields["name"])
+    final = move_no_overwrite(mp3s[0], folder, stem, ".mp3")
+    if ledger is not None:
+        ledger.add(fields["track_id"])
+    emit("stage", {"stage": "completed"})
+    return {
+        "title": final.stem,
+        "preset": PRESET_ID,
+        "files": [str(final)],
+        "total_bytes": final.stat().st_size,
+        "tags": tags,
+        "match": {"video_id": video_id, "manual": manual},
+    }

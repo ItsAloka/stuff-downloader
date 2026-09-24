@@ -1,5 +1,9 @@
 """Spotify listings, matches and the per-track jobs a batch expands into (plan §7). No Qt.
 
+Apple Music and Deezer links (plan §7 "Other music sites") use the same types and the same flow on
+the ``music`` engine: their song lists come from iTunes Lookup and the Deezer API instead of
+Spotify's embed page. A track's ``service`` says which; a Spotify track's is "spotify".
+
 Spotify audio is DRM-protected and never captured. Each track's audio is *matched* from YouTube
 Music, so a wrong recording can be picked. The flow therefore has three worker modes, each an
 ordinary job on the ``spotdl`` engine:
@@ -24,9 +28,18 @@ from difflib import SequenceMatcher
 from typing import Any
 
 from .protocol import JobSpec
-from .router import SPOTIFY_ID, SPOTIFY_KINDS, route, spotify_url
+from .router import (
+    CATALOG_ID,
+    CATALOG_SERVICES,
+    SPOTIFY_ID,
+    SPOTIFY_KINDS,
+    catalog_url,
+    route,
+    spotify_url,
+)
 
 ENGINE = "spotdl"
+CATALOG_ENGINE = "music"  # Apple Music and Deezer
 PRESET_ID = "spotify_mp3"
 MAX_TRACKS = 500
 MAX_TEXT = 300
@@ -35,6 +48,15 @@ MAX_DURATION = 24 * 3600  # seconds; anything longer is not a song
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 # Spotify's pictures, by hash. The worker normalizes every host to i.scdn.co; core re-checks.
 IMAGE_URL = re.compile(r"https://i\.scdn\.co/image/[0-9a-f]{40}")
+# Apple's and Deezer's pictures, exactly as the music engine normalizes them.
+APPLE_IMAGE_URL = re.compile(
+    r"https://is[1-5]-ssl\.mzstatic\.com/image/thumb/[A-Za-z0-9/._-]{1,300}/\d{2,4}x\d{2,4}bb\.jpg"
+)
+DEEZER_IMAGE_URL = re.compile(
+    r"https://cdn-images\.dzcdn\.net/images/(?:cover|playlist)/[0-9a-f]{32}/"
+    r"\d{2,4}x\d{2,4}-000000-80-0-0\.jpg"
+)
+_DATE = re.compile(r"\d{4}(?:-\d{2}-\d{2})?")
 
 MAX_CANDIDATES = 8
 
@@ -81,16 +103,27 @@ class SpotifyTrack:
     album: str = ""
     duration: float | None = None
     explicit: bool = False
-    art: str = ""  # Spotify's own picture (i.scdn.co), when the listing named one
+    art: str = ""  # the service's own picture, when the listing named one
+    service: str = "spotify"  # "spotify" | "apple" | "deezer"
+    country: str = "us"  # the Apple Music storefront (apple only)
+    date: str = ""  # release date, YYYY or YYYY-MM-DD (apple/deezer only)
 
     @property
     def url(self) -> str:
-        return spotify_url("track", self.track_id)
+        if self.service == "spotify":
+            return spotify_url("track", self.track_id)
+        return catalog_url(self.service, "track", self.track_id, self.country)
+
+    @property
+    def engine(self) -> str:
+        return ENGINE if self.service == "spotify" else CATALOG_ENGINE
 
     @property
     def art_url(self) -> str:
-        """Where the row's picture comes from: the listing's, or the track's oEmbed lookup."""
-        return self.art or oembed_url(self.track_id)
+        """The row's picture: the listing's, or a Spotify track's oEmbed lookup."""
+        if self.art or self.service != "spotify":
+            return self.art
+        return oembed_url(self.track_id)
 
     @property
     def artist(self) -> str:
@@ -106,7 +139,13 @@ class SpotifyListing:
     owner: str = ""
     truncated: bool = False
     skipped: int = 0  # rows the worker reported that were not usable (local files, podcasts)
-    cover: str = ""  # the playlist's or album's own cover (i.scdn.co)
+    cover: str = ""  # the playlist's or album's own cover
+    service: str = "spotify"  # "spotify" | "apple" | "deezer"
+    country: str = "us"
+
+    @property
+    def site(self) -> str:
+        return SERVICE_NAMES.get(self.service, "Spotify")
 
 
 @dataclass(frozen=True)
@@ -142,9 +181,16 @@ class Candidate:
     kind: str = "song"  # "song" or "video"
 
 
+SERVICE_NAMES = {"spotify": "Spotify", "apple": "Apple Music", "deezer": "Deezer"}
+
+
 def image_url(value: Any) -> str:
-    """A Spotify picture URL exactly as the worker normalizes it, or ""."""
-    return value if isinstance(value, str) and IMAGE_URL.fullmatch(value) else ""
+    """A Spotify, Apple Music or Deezer picture URL exactly as the worker normalizes it, or ""."""
+    if not isinstance(value, str):
+        return ""
+    if any(p.fullmatch(value) for p in (IMAGE_URL, APPLE_IMAGE_URL, DEEZER_IMAGE_URL)):
+        return value
+    return ""
 
 
 def oembed_url(track_id: str) -> str:
@@ -231,12 +277,24 @@ def candidate_match(candidate: Candidate, track: SpotifyTrack) -> Match:
     )
 
 
-def parse_track(raw: Any, index: int) -> SpotifyTrack | None:
+def _valid_date(value: Any) -> bool:
+    return isinstance(value, str) and bool(_DATE.fullmatch(value))
+
+
+def _valid_id(service: str, value: Any) -> bool:
+    pattern = SPOTIFY_ID if service == "spotify" else CATALOG_ID
+    return isinstance(value, str) and bool(pattern.fullmatch(value))
+
+
+def parse_track(
+    raw: Any, index: int, service: str = "spotify", country: str = "us"
+) -> SpotifyTrack | None:
     if not isinstance(raw, dict):
         return None
     track_id = raw.get("id")
-    if not isinstance(track_id, str) or not SPOTIFY_ID.fullmatch(track_id):
+    if not _valid_id(service, track_id):
         return None
+    date = raw.get("date")
     artists_raw = raw.get("artists")
     artists: list[str] = []
     if isinstance(artists_raw, list):
@@ -253,6 +311,9 @@ def parse_track(raw: Any, index: int) -> SpotifyTrack | None:
         duration=_seconds(raw.get("duration")),
         explicit=raw.get("explicit") is True,
         art=image_url(raw.get("art")),
+        service=service,
+        country=country,
+        date=date if service != "spotify" and _valid_date(date) else "",
     )
 
 
@@ -260,11 +321,16 @@ def parse_listing(data: Any) -> SpotifyListing:
     """Turn a worker ``mode=analyze`` result into a SpotifyListing, dropping unusable rows."""
     if not isinstance(data, dict):
         return SpotifyListing("", "", "Spotify", ())
-    kind = data.get("spotify_kind")
-    spotify_id = data.get("spotify_id")
+    service = data.get("service") if data.get("service") in CATALOG_SERVICES else "spotify"
+    country = data.get("country")
+    country = country if isinstance(country, str) and re.fullmatch(r"[a-z]{2}", country) else "us"
+    if service == "spotify":
+        kind, spotify_id = data.get("spotify_kind"), data.get("spotify_id")
+    else:
+        kind, spotify_id = data.get("catalog_kind"), data.get("catalog_id")
     if kind not in SPOTIFY_KINDS:
         kind = ""
-    if not isinstance(spotify_id, str) or not SPOTIFY_ID.fullmatch(spotify_id):
+    if not _valid_id(service, spotify_id):
         spotify_id = ""
     raw_tracks = data.get("tracks")
     raw_tracks = raw_tracks if isinstance(raw_tracks, list) else []
@@ -272,7 +338,7 @@ def parse_listing(data: Any) -> SpotifyListing:
     seen: set[str] = set()
     dropped = 0
     for raw in raw_tracks[:MAX_TRACKS]:
-        track = parse_track(raw, len(tracks) + 1)
+        track = parse_track(raw, len(tracks) + 1, service, country)
         if track is None or track.track_id in seen:
             dropped += 1
             continue
@@ -284,12 +350,14 @@ def parse_listing(data: Any) -> SpotifyListing:
     return SpotifyListing(
         kind=kind,
         spotify_id=spotify_id,
-        title=_text(data.get("title"), "Spotify"),
+        title=_text(data.get("title"), SERVICE_NAMES[service]),
         tracks=tuple(tracks),
         owner=_text(data.get("owner")),
         truncated=bool(data.get("truncated")) or len(raw_tracks) > MAX_TRACKS,
         skipped=max(0, min(worker_skipped, 100_000)) + dropped,
         cover=image_url(data.get("cover")),
+        service=service,
+        country=country,
     )
 
 
@@ -353,11 +421,33 @@ def analyze_options() -> dict[str, Any]:
     return {"mode": "analyze"}
 
 
-def match_options(album: str | None = None) -> dict[str, Any]:
+def song_fields(track: SpotifyTrack) -> dict[str, Any]:
+    """What an Apple Music or Deezer track is matched and tagged with, from the checked listing.
+
+    Spotify's worker re-reads each track's embed page instead. iTunes Lookup allows about 20
+    requests a minute, so the music engine is handed what core already validated.
+    """
+    song: dict[str, Any] = {
+        "title": track.title,
+        "artists": list(track.artists),
+        "explicit": track.explicit,
+    }
+    if track.duration is not None:
+        song["duration"] = track.duration
+    if track.date:
+        song["date"] = track.date
+    if track.art:
+        song["art"] = track.art
+    return song
+
+
+def match_options(album: str | None = None, track: SpotifyTrack | None = None) -> dict[str, Any]:
     """``album`` (an album link's own name) lets the worker look on that album first."""
     options: dict[str, Any] = {"mode": "match"}
     if _text(album):
         options["album"] = _text(album)
+    if track is not None and track.service != "spotify":
+        options["song"] = song_fields(track)
     return options
 
 
@@ -367,6 +457,7 @@ def download_options(
     edited_title: str | None = None,
     album: str | None = None,
     album_track: int | None = None,
+    track: SpotifyTrack | None = None,
 ) -> dict[str, Any]:
     """The job ``options`` for one track's download. Mirrors the worker's validation exactly.
 
@@ -393,6 +484,8 @@ def download_options(
         ):
             raise ValueError(f"invalid track number: {album_track!r}")
         options["album_track"] = album_track
+    if track is not None and track.service != "spotify":
+        options["song"] = song_fields(track)
     return options
 
 
@@ -400,10 +493,10 @@ def match_spec(track: SpotifyTrack) -> JobSpec:
     """A short job asking the worker which YouTube recording it would pick for ``track``."""
     return JobSpec(
         job_id=uuid.uuid4().hex,
-        engine=ENGINE,
+        engine=track.engine,
         url=track.url,
         output_dir=".",
-        options=match_options(track.album),
+        options=match_options(track.album, track),
     )
 
 
@@ -429,11 +522,12 @@ def batch_specs(
             edited_title=(edited_titles or {}).get(track.track_id),
             album=track.album or (match.album if match is not None else ""),
             album_track=track.index if album_order else None,
+            track=track,
         )
         specs.append(
             JobSpec(
                 job_id=uuid.uuid4().hex,
-                engine=ENGINE,
+                engine=track.engine,
                 url=track.url,
                 output_dir=output_dir,
                 options=options,

@@ -30,12 +30,29 @@ def _sha(data: bytes) -> str:
 
 
 def test_every_engine_requirements_file_is_installed_previous_ytdlp_first(bi):
-    names = [name for _engine, name in bi.ENGINE_INSTALLS]
+    names = [name for _engine, name in bi.ENGINE_INSTALLS + bi.OPTIONAL_INSTALLS]
     assert sorted(names) == sorted(
         p.name for p in (PACKAGING / "engine-requirements").glob("*.txt")
     )
+    names = [name for _engine, name in bi.ENGINE_INSTALLS]
     assert names.index("ytdlp-previous.txt") < names.index("ytdlp.txt")
-    assert {engine for engine, _ in bi.ENGINE_INSTALLS} == {"ytdlp", "gallerydl", "spotdl"}
+    assert {engine for engine, _ in bi.ENGINE_INSTALLS} == {"ytdlp", "gallerydl", "music"}
+
+
+def test_spotdl_is_optional_but_shipped_like_the_others(bi):
+    """R7: only long Spotify lists need it; the owner asked for it in the offline setup."""
+    assert bi.OPTIONAL_INSTALLS == (("spotdl", "spotdl.txt"),)
+    assert all(engine != "spotdl" for engine, _ in bi.ENGINE_INSTALLS)
+    assert "spotdl" in bi.ENGINE_PACKAGES  # and never frozen into the GUI either
+
+
+def test_the_music_env_pins_the_same_yt_dlp_as_the_ytdlp_env(bi):
+    music = bi.pins(PACKAGING / "engine-requirements" / "music.txt")
+    ytdlp = bi.pins(PACKAGING / "engine-requirements" / "ytdlp.txt")
+    assert "ytmusicapi" in music and "mutagen" in music
+    shared = set(music) & set(ytdlp)
+    assert {"yt-dlp", "curl-cffi", "yt-dlp-ejs", "requests"} <= shared
+    assert all(music[name] == ytdlp[name] for name in shared)
 
 
 def test_pins_reads_exact_pins_with_extras_and_markers(bi, tmp_path):
@@ -290,3 +307,66 @@ def test_the_old_payload_comes_back_if_the_new_one_cannot_move_in(bi, monkeypatc
         bi.build_payload(out, tools_dir=tmp_path)
     assert (out / "old.txt").read_text() == "previous payload"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["payload"]
+
+
+def _staged_runtime(bi, monkeypatch, tmp_path, fail=()):
+    """A staged runtime-setup folder and a fake build_runtime that records its installs."""
+    setup = tmp_path / "setup"
+    (setup / "wheels").mkdir(parents=True)
+    (setup / "python").mkdir()
+    (setup / "python" / "python.exe").write_bytes(b"py")
+    calls = []
+
+    class FakeRuntime:
+        @staticmethod
+        def default_root():
+            return tmp_path / "root"
+
+        @staticmethod
+        def base_python(root):
+            return root / "python" / "python.exe"
+
+        @staticmethod
+        def build_base(root):
+            pass
+
+        @staticmethod
+        def install_engine(root, engine, requirements):
+            calls.append((engine, requirements.name, os.environ.get("PIP_NO_INDEX")))
+            if engine in fail:
+                raise RuntimeError("no network")
+            return f"{engine}-id"
+
+    monkeypatch.setattr(bi, "PROJECT", setup)
+    monkeypatch.setattr(bi, "_load", lambda name: FakeRuntime)
+    monkeypatch.delenv("PIP_NO_INDEX", raising=False)
+    return calls
+
+
+def test_setup_runtime_skips_spotdl_unless_asked(bi, monkeypatch, tmp_path):
+    calls = _staged_runtime(bi, monkeypatch, tmp_path)
+    result = bi.setup_runtime()
+    assert "spotdl" not in {engine for engine, *_ in calls}
+    assert set(result) == {f"{e}:{n}" for e, n in bi.ENGINE_INSTALLS}
+
+
+def test_setup_runtime_installs_spotdl_offline_last_when_asked(bi, monkeypatch, tmp_path):
+    calls = _staged_runtime(bi, monkeypatch, tmp_path)
+    result = bi.setup_runtime(with_spotdl=True)
+    assert calls[-1] == ("spotdl", "spotdl.txt", "1")
+    assert all(c[2] == "1" for c in calls)  # every engine offline, from the staged wheels
+    assert "PIP_NO_INDEX" not in os.environ
+    assert result["spotdl:spotdl.txt"] == "spotdl-id"
+
+
+def test_a_failed_spotdl_fetch_never_fails_the_setup(bi, monkeypatch, tmp_path, capsys):
+    _staged_runtime(bi, monkeypatch, tmp_path, fail=("spotdl",))
+    assert bi.main(["setup-runtime", "--with-spotdl"]) == 0
+    out = capsys.readouterr().out
+    assert "warn spotdl:spotdl.txt -> failed: RuntimeError: no network" in out
+    assert "ok   music:music.txt -> music-id" in out
+
+
+def test_a_failed_shipped_engine_still_fails_the_setup(bi, monkeypatch, tmp_path):
+    _staged_runtime(bi, monkeypatch, tmp_path, fail=("music",))
+    assert bi.main(["setup-runtime", "--with-spotdl"]) == 1

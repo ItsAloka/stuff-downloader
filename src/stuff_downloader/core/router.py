@@ -67,6 +67,41 @@ SPOTIFY_KIND_REASON = "Only Spotify songs, albums and playlists can be downloade
 SPOTIFY_INVALID_REASON = "No Spotify song, album or playlist found in that link."
 _NON_PUBLIC_SUFFIXES = (".local", ".internal", ".localhost", ".home.arpa", ".lan", ".test")
 
+# Plan §7 "Other music sites": Apple Music and Deezer links get the Spotify treatment, with their
+# song lists read from free public lookups (iTunes Lookup, the Deezer API; no keys). Each link is
+# rebuilt from its kind and numeric id. Tidal and Amazon Music are refused by name: their audio is
+# DRM-protected and they offer no public song information to match from.
+CATALOG_SERVICES = ("apple", "deezer")
+CATALOG_ID = re.compile(r"[1-9][0-9]{0,15}")
+_APPLE_HOSTS = {"music.apple.com", "geo.music.apple.com", "itunes.apple.com"}
+_APPLE_COUNTRY = re.compile(r"[a-z]{2}")
+_DEEZER_HOSTS = {"deezer.com", "www.deezer.com"}
+_DEEZER_SHORT_HOSTS = {"link.deezer.com", "deezer.page.link"}
+_DEEZER_LANG = re.compile(r"[a-z]{2}(?:-[a-z]{2})?", re.IGNORECASE)
+APPLE_INVALID_REASON = "No Apple Music song or album found in that link."
+APPLE_PLAYLIST_REASON = (
+    "Apple Music playlists cannot be read without an Apple account. Paste a song or album link."
+)
+DEEZER_INVALID_REASON = "No Deezer song, album or playlist found in that link."
+DEEZER_SHORT_REASON = (
+    "Open that Deezer share link in a browser, then copy the full deezer.com address."
+)
+TIDAL_REASON = (
+    "Tidal is not supported: its music is copy-protected and it has no public song information."
+)
+AMAZON_MUSIC_REASON = (
+    "Amazon Music is not supported: its music is copy-protected and it has no public song "
+    "information."
+)
+_REFUSED_MUSIC_HOSTS = {
+    "tidal.com": TIDAL_REASON,
+    "www.tidal.com": TIDAL_REASON,
+    "listen.tidal.com": TIDAL_REASON,
+    "embed.tidal.com": TIDAL_REASON,
+}
+_AMAZON_MUSIC_HOST = re.compile(r"music\.amazon\.[a-z.]{2,6}")
+_AMAZON_HOST = re.compile(r"(?:www\.)?amazon\.[a-z.]{2,6}")
+
 _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com"}
 _MUSIC_HOSTS = {"music.youtube.com"}
 _SHORT_HOSTS = {"youtu.be", "www.youtu.be"}
@@ -92,7 +127,7 @@ DIRECT_FILE_EXTENSIONS = frozenset(
 @dataclass(frozen=True)
 class Route:
     # "youtube" | "youtube_playlist" | "video" | "file" | "gallery" | "social" | "page"
-    # | "spotify" | "unsupported" | "invalid"
+    # | "spotify" | "catalog" | "unsupported" | "invalid"
     kind: str
     url: str = ""  # normalized watch or playlist URL (youtube only)
     video_id: str = ""
@@ -104,12 +139,21 @@ class Route:
     note: str = ""  # something the owner should know about how the link was read
     spotify_kind: str = ""  # "track" | "album" | "playlist" (spotify only)
     spotify_id: str = ""
+    service: str = ""  # "apple" | "deezer" (catalog only)
+    catalog_kind: str = ""  # "track" | "album" | "playlist" (catalog only)
+    catalog_id: str = ""
 
     @property
     def ok(self) -> bool:
         return self.kind in (
-            "youtube", "youtube_playlist", "video", "file", "gallery", "social", "page", "spotify"
+            "youtube", "youtube_playlist", "video", "file", "gallery", "social", "page", "spotify",
+            "catalog",
         )  # fmt: skip
+
+    @property
+    def is_catalog(self) -> bool:
+        """A music-service link whose songs are matched from YouTube Music (Spotify included)."""
+        return self.kind in ("spotify", "catalog")
 
     @property
     def is_file(self) -> bool:
@@ -141,6 +185,7 @@ class Route:
             "social": "social",
             "page": "social",  # the page's own og:image, last in the chain
             "spotify": "spotdl",
+            "catalog": "music",
         }
         return engines.get(self.kind, "ytdlp")
 
@@ -387,6 +432,78 @@ def _route_spotify(segments: list[str]) -> Route:
     return Route("spotify", url=url, spotify_kind=kind, spotify_id=spotify_id)
 
 
+def catalog_url(service: str, kind: str, catalog_id: str, country: str = "us") -> str:
+    """The canonical link core hands the music engine, built from validated parts only."""
+    if service == "apple":
+        path = "song" if kind == "track" else kind
+        return f"https://music.apple.com/{country}/{path}/{catalog_id}"
+    return f"https://www.deezer.com/{kind}/{catalog_id}"
+
+
+def _catalog(service: str, kind: str, catalog_id: str, country: str = "us") -> Route:
+    return Route(
+        "catalog",
+        url=catalog_url(service, kind, catalog_id, country),
+        service=service,
+        catalog_kind=kind,
+        catalog_id=catalog_id,
+    )
+
+
+def _route_apple(host: str, segments: list[str], query: dict[str, list[str]]) -> Route:
+    """An Apple Music song or album link. Playlists have no keyless lookup, so they are refused.
+
+    ``/<cc>/album/<slug>/<id>?i=<track>`` is one song on the album, and becomes a song link.
+    iTunes' old ``id123`` spelling is accepted too.
+    """
+    country = "us"
+    if segments[:1] and _APPLE_COUNTRY.fullmatch(segments[0]):
+        country, segments = segments[0], segments[1:]
+    if not segments:
+        return Route("invalid", reason=APPLE_INVALID_REASON)
+    kind = segments[0].lower()
+    if kind == "playlist":
+        return Route("unsupported", reason=APPLE_PLAYLIST_REASON)
+    if kind not in ("album", "song") or len(segments) not in (2, 3):
+        return Route("unsupported", reason=APPLE_INVALID_REASON)
+    raw_id = segments[-1]
+    raw_id = raw_id[2:] if host == "itunes.apple.com" and raw_id.startswith("id") else raw_id
+    if not CATALOG_ID.fullmatch(raw_id):
+        return Route("invalid", reason=APPLE_INVALID_REASON)
+    track = _first(query, "i")
+    if kind == "album" and track:
+        if not CATALOG_ID.fullmatch(track):
+            return Route("invalid", reason=APPLE_INVALID_REASON)
+        return _catalog("apple", "track", track, country)
+    return _catalog("apple", "track" if kind == "song" else "album", raw_id, country)
+
+
+def _route_deezer(segments: list[str]) -> Route:
+    """A Deezer track, album or playlist link, with or without its language prefix."""
+    if segments[:1] and _DEEZER_LANG.fullmatch(segments[0]) and len(segments) == 3:
+        segments = segments[1:]
+    if len(segments) != 2:
+        return Route("unsupported", reason=DEEZER_INVALID_REASON)
+    kind, catalog_id = segments[0].lower(), segments[1]
+    if kind not in ("track", "album", "playlist"):
+        return Route("unsupported", reason=DEEZER_INVALID_REASON)
+    if not CATALOG_ID.fullmatch(catalog_id):
+        return Route("invalid", reason=DEEZER_INVALID_REASON)
+    return _catalog("deezer", kind, catalog_id)
+
+
+def refused_music_site(host: str, path: str) -> str:
+    """Why a Tidal or Amazon Music link is refused by name, or "" for any other link."""
+    if host in _REFUSED_MUSIC_HOSTS:
+        return _REFUSED_MUSIC_HOSTS[host]
+    if _AMAZON_MUSIC_HOST.fullmatch(host):
+        return AMAZON_MUSIC_REASON
+    first = next((s for s in path.split("/") if s), "").lower()
+    if _AMAZON_HOST.fullmatch(host) and first == "music":
+        return AMAZON_MUSIC_REASON
+    return ""
+
+
 def _site_url(parts: Any) -> str:
     """A non-YouTube link reduced to the parts a video page needs.
 
@@ -407,6 +524,11 @@ def _route_site(parts: Any) -> Route:
     deferred = _DEFERRED_HOSTS.get(host)
     if deferred:
         return Route("unsupported", reason=deferred)
+    refused = refused_music_site(host, parts.path)
+    if refused:
+        return Route("unsupported", reason=refused)
+    if host in _DEEZER_SHORT_HOSTS:
+        return Route("unsupported", reason=DEEZER_SHORT_REASON)
     if not is_public_host(host):
         return Route("unsupported", reason=SITE_PRIVATE_HOST_REASON)
     if parts.path.strip("/") == "" and not parts.query:
@@ -517,6 +639,10 @@ def _route(raw: str) -> Route:
             )
     elif host in _SPOTIFY_HOSTS:
         return _route_spotify(segments)
+    elif host in _APPLE_HOSTS:
+        return _route_apple(host, segments, query)
+    elif host in _DEEZER_HOSTS:
+        return _route_deezer(segments)
     else:
         return _route_site(parts)
 

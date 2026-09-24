@@ -1,9 +1,11 @@
 """Thumbnails for rows and queue cards, loaded off the GUI thread.
 
 The GUI fetches only images whose URL it built itself from a validated id: a YouTube video's
-thumbnail (``i.ytimg.com``), a Spotify picture by its hash (``i.scdn.co/image/<hash>``), or a
+thumbnail (``i.ytimg.com``), a Spotify picture by its hash (``i.scdn.co/image/<hash>``), a
 Spotify track's oEmbed lookup (``open.spotify.com/oembed``), whose answer is read only for its
-picture's hash. Every other preview — a gallery tile, a direct image link, the analyzed video's
+picture's hash, or an Apple Music / Deezer cover in the exact form the music engine normalizes it
+to (``is<N>-ssl.mzstatic.com/image/thumb/…/<N>x<N>bb.jpg``, ``cdn-images.dzcdn.net/images/…``).
+Every other preview — a gallery tile, a direct image link, the analyzed video's
 cover — is fetched by the worker, behind its own address checks, and arrives as bytes.
 All image bytes, from either side, are decoded here with a byte cap and a pixel cap checked from
 the header before any pixels are allocated. Any failure just leaves the placeholder.
@@ -21,6 +23,8 @@ from urllib.parse import urlsplit
 from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QObject, QRunnable, QSize, Qt, QThreadPool
 from PyQt6.QtCore import pyqtSignal as Signal
 from PyQt6.QtGui import QImage, QImageReader
+
+from ..core.spotify import APPLE_IMAGE_URL, DEEZER_IMAGE_URL
 
 MAX_BYTES = 5 * 1024 * 1024
 MAX_SIDE = 8192
@@ -64,6 +68,8 @@ def allowed(url: str) -> bool:
     if not isinstance(url, str):
         return False
     if _SPOTIFY_IMAGE.fullmatch(url) or _SPOTIFY_OEMBED.fullmatch(url):
+        return True
+    if APPLE_IMAGE_URL.fullmatch(url) or DEEZER_IMAGE_URL.fullmatch(url):
         return True
     try:
         parts = urlsplit(url)

@@ -6,6 +6,7 @@ from .base import Engine
 from .fake import FakeEngine
 from .gallerydl import GalleryDlEngine
 from .http import HttpEngine
+from .music import MusicEngine
 from .probe import ProbeEngine
 from .social import SocialEngine
 from .spotdl import SpotDlEngine
@@ -15,6 +16,7 @@ ENGINES: dict[str, type] = {
     "fake": FakeEngine,
     "gallerydl": GalleryDlEngine,
     "http": HttpEngine,
+    "music": MusicEngine,
     "probe": ProbeEngine,
     "social": SocialEngine,
     "spotdl": SpotDlEngine,

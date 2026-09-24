@@ -166,3 +166,50 @@ def test_the_social_engine_runs_in_the_ytdlp_env(tmp_path, monkeypatch):
     monkeypatch.setattr(runner, "is_frozen", lambda: True)
     assert runner.default_worker_command("social")[0] == str(env / "python.exe")
     assert runner.default_worker_command("social") == runner.default_worker_command("ytdlp")
+
+
+def _runtime_with(tmp_path, monkeypatch, *engines):
+    """A frozen app's runtime root where exactly ``engines`` have an active env."""
+    import json
+
+    from stuff_downloader.core import runner
+
+    active = {}
+    pythons = {}
+    for engine in engines:
+        scripts = tmp_path / "envs" / engine / "1.0-abc" / "Scripts"
+        scripts.mkdir(parents=True)
+        (scripts / "python.exe").write_bytes(b"")
+        active[engine] = {"active": "1.0-abc"}
+        pythons[engine] = str(scripts / "python.exe")
+    (tmp_path / "active.json").write_text(json.dumps(active), encoding="utf-8")
+    monkeypatch.setenv(runner.RUNTIME_ENV_VAR, str(tmp_path))
+    monkeypatch.setattr(runner, "is_frozen", lambda: True)
+    return runner, pythons
+
+
+def test_with_the_optional_spotdl_env_spotify_uses_it_and_music_uses_its_own(
+    tmp_path, monkeypatch
+):
+    """R7: only the spotDL env can list Spotify playlists past 100 songs."""
+    runner, py = _runtime_with(tmp_path, monkeypatch, "music", "spotdl")
+    assert runner.default_worker_command("spotdl")[0] == py["spotdl"]
+    assert runner.default_worker_command("music")[0] == py["music"]
+
+
+def test_without_spotdl_the_spotify_engine_runs_in_the_music_env(tmp_path, monkeypatch):
+    runner, py = _runtime_with(tmp_path, monkeypatch, "music", "ytdlp")
+    assert runner.env_for("spotdl") == "music"
+    assert runner.default_worker_command("spotdl")[0] == py["music"]
+
+
+def test_an_install_from_before_1_1_0_runs_music_in_its_spotdl_env(tmp_path, monkeypatch):
+    runner, py = _runtime_with(tmp_path, monkeypatch, "spotdl")
+    assert runner.default_worker_command("music")[0] == py["spotdl"]
+
+
+def test_with_neither_env_the_missing_runtime_names_the_music_env(tmp_path, monkeypatch):
+    runner, _ = _runtime_with(tmp_path, monkeypatch, "ytdlp")
+    assert runner.env_for("spotdl") == "music"
+    with pytest.raises(runner.WorkerRuntimeMissing):
+        runner.default_worker_command("spotdl")

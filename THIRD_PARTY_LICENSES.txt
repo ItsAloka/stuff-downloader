@@ -100,6 +100,32 @@ yt-dlp==2026.7.4           Unlicense
 yt-dlp-ejs==0.8.0          Unlicense AND MIT AND ISC
 [end]
 
+[packaging/engine-requirements/music.txt]
+brotli==1.2.0              MIT
+certifi==2026.7.22         MPL-2.0
+cffi==2.1.1                MIT-0
+charset-normalizer==3.5.1  MIT
+curl-cffi==0.16.3          MIT (bundles libcurl-impersonate: curl licence, MIT-style)
+idna==3.19                 BSD-3-Clause
+mutagen==1.48.1            GPL-2.0-or-later
+pycparser==3.0             BSD-3-Clause
+pycryptodomex==3.23.0      BSD-2-Clause and public domain
+requests==2.34.2           Apache-2.0
+urllib3==2.7.0             MIT
+websockets==17.1           BSD-3-Clause
+yt-dlp==2026.8.19          Unlicense
+yt-dlp-ejs==0.8.0          Unlicense AND MIT AND ISC
+ytmusicapi==1.12.2         MIT (LICENSE file in the wheel)
+[end]
+
+The music environment (R7) runs Spotify, Apple Music and Deezer matching and tagging. It is the
+yt-dlp environment's packages plus ytmusicapi, so its combined terms are the same as that
+environment's (mutagen makes the process GPL-2.0-or-later). It is shipped in the payload.
+
+The spotDL environment below is optional since R7 (an installer task, ticked by default): only
+Spotify lists over 100 songs need it. Its wheels are still shipped in the payload and installed
+offline, so F2 and F5 apply to the installer.
+
 [packaging/engine-requirements/gallerydl.txt]
 certifi==2026.7.22         MPL-2.0
 charset-normalizer==3.5.1  MIT
@@ -215,6 +241,8 @@ F2  RESOLVED - the spotDL dependencies spotapi and spotipyfree do ship licences.
     MIT notice for spotipyfree must ship with it (F6). Both LICENSE files are staged by the
     payload builder into licences\spotapi-1.2.8 and licences\spotipyfree-1.9.14.
     Current build scope: personal use on the owner's machine only; the installer is not shared.
+    Since R7 (1.1.0) the spotDL environment is an optional installer task (ticked by default);
+    its wheels are still in the payload, so this obligation still applies to the installer.
 
 F3  OBLIGATION - FFmpeg is GPLv3.
     Shipping ffmpeg.exe or ffprobe.exe requires shipping this licence text and offering the
@@ -239,7 +267,7 @@ F5  OBLIGATION - the spotDL environment is effectively GPLv3.
     pykakasi (GPL-3.0-or-later), spotapi (GPL-3.0), mutagen and unidecode (GPL-2.0-or-later)
     load into one process with spotDL (MIT) and the worker code, so that process is governed by
     GPLv3. This is compatible with F1's permissive choice. Any distribution of that environment must include
-    the licence texts and a source offer.
+    the licence texts and a source offer. The installer ships it (an optional task since R7).
 
 F6  OBLIGATION - notices for every other component.
     MIT, BSD, ISC, Apache-2.0, MPL-2.0 and PSF all require their licence text and copyright
