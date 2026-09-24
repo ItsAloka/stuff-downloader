@@ -148,7 +148,7 @@ def test_picking_a_candidate_fixes_the_row_and_the_download_uses_it(
     assert card.uncertain_label.isHidden()
 
     card.set_all_checked(False)
-    card.checkbox(1).setChecked(True)
+    card.table.set_checked(1, True)
     (job,) = page.start_spotify_download()
     assert job.spec.url.endswith(T2)
     assert job.spec.options == spotify.download_options(VID3, archive=True)

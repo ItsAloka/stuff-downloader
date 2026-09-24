@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import sqlite3
+from pathlib import Path
 
 import pytest
 from PyQt6.QtCore import QItemSelectionModel
@@ -14,6 +15,7 @@ from stuff_downloader.core import history, protocol, settings, tools
 from stuff_downloader.core.protocol import Event
 from stuff_downloader.gui.main_window import MainWindow
 from stuff_downloader.gui.pages import DownloadsPage
+from stuff_downloader.gui.widgets import TrackTable
 
 VID = "dQw4w9WgXcQ"
 PLAYLIST_URL = "https://www.youtube.com/playlist?list=PLabc123_-XYZ"
@@ -88,11 +90,12 @@ def test_the_table_lists_every_entry_and_unavailable_ones_cannot_be_selected(win
     assert not card.isHidden() and page.result_card.isHidden()
     assert card.title_label.text() == "Chill Mix"
     assert card.table.rowCount() == 4
-    assert card.table.item(0, 2).text() == "Track 0"
-    assert card.table.item(3, 5).text() == "Private video"
-    assert card.checkbox(0).isChecked() and card.checkbox(0).isEnabled()
-    assert not card.checkbox(3).isEnabled() and not card.checkbox(3).isChecked()
+    assert card.table.item(0, TrackTable.TITLE).text() == "Track 0"
+    assert card.table.item(3, TrackTable.STATUS).text() == "Private video"
+    assert card.table.is_checked(0) and card.table.is_checkable(0)
+    assert not card.table.is_checkable(3) and not card.table.is_checked(3)
     assert card.selection_label.text() == "3 selected"
+    assert card.download_button.text() == "⬇  Download 3 selected"
 
 
 def test_select_all_none_and_filter(window, runs):
@@ -142,7 +145,8 @@ def test_selected_entries_become_numbered_jobs_behind_the_concurrency_limit(wind
     assert [s.options["playlist_index"] for s in specs] == [1, 2, 3]
     assert all(s.options["playlist_title"] == "Chill Mix" for s in specs)
     assert all(s.options["playlist_count"] == 4 for s in specs)
-    assert all(s.options["preset"] == "mp3_music" for s in specs)
+    # A video list defaults to video; the row id is one of the §5.4 formats (plan §8 R5).
+    assert all(s.options["row_id"] == "v:1080:mp4" for s in specs)
 
     started = [r for r in runs if r.started and r.spec.options.get("mode") == "download"]
     assert len(started) == page.scheduler.max_concurrent == 3
@@ -382,6 +386,8 @@ def test_history_filter_keeps_visible_selection_and_never_removes_hidden_rows(wi
 
 def test_history_filters_and_download_again_signal(window, runs, tmp_path, qtbot):
     page = expand(window, runs)
+    combo = page.playlist_card.format_combo
+    combo.setCurrentIndex(combo.findData("a:mp3:320"))
     jobs = page.start_playlist_download()
     audio = tmp_path / "song.mp3"
     audio.write_bytes(b"x")
@@ -613,3 +619,205 @@ def test_a_dropped_card_asks_the_page_to_reorder(window, runs):
     )
     page.jobs[target].card.dropEvent(other)
     assert not other.isAccepted()
+
+
+# ── R5: one track table, pictures, compact queue (plan §5.6a, §5.8, §8 R5) ────────────────
+MUSIC_URL = "https://music.youtube.com/playlist?list=PLabc123_-XYZ"
+
+
+def _red(width=160, height=90):
+    from PyQt6.QtGui import QColor, QImage
+
+    image = QImage(width, height, QImage.Format.Format_RGB32)
+    image.fill(QColor("#ff0000"))
+    return image
+
+
+def test_tables_use_model_check_states_never_checkbox_widgets(window, runs):
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtWidgets import QCheckBox
+
+    page = expand(window, runs)
+    for table in (page.playlist_card.table, page.spotify_card.table):
+        assert not table.findChildren(QCheckBox)
+    table = page.playlist_card.table
+    assert table.item(0, TrackTable.CHECK).flags() & Qt.ItemFlag.ItemIsUserCheckable
+    assert not any(
+        table.cellWidget(r, c) for r in range(table.rowCount()) for c in range(table.columnCount())
+    )
+    # Unticking through the model is what the selection count follows.
+    table.item(0, TrackTable.CHECK).setCheckState(Qt.CheckState.Unchecked)
+    assert page.playlist_card.selection_label.text() == "2 selected"
+
+
+def test_title_cells_edit_in_place_with_the_three_triggers(window, runs):
+    from PyQt6.QtWidgets import QAbstractItemView
+
+    triggers = expand(window, runs).playlist_card.table.editTriggers()
+    wanted = (
+        QAbstractItemView.EditTrigger.SelectedClicked,
+        QAbstractItemView.EditTrigger.DoubleClicked,
+        QAbstractItemView.EditTrigger.EditKeyPressed,
+    )
+    assert all(triggers & t for t in wanted)
+    assert not triggers & QAbstractItemView.EditTrigger.CurrentChanged
+
+
+def test_selected_titles_can_be_copied(window, runs):
+    from PyQt6.QtCore import Qt
+    from PyQt6.QtGui import QGuiApplication, QKeyEvent
+
+    table = expand(window, runs).playlist_card.table
+    table.setCurrentCell(1, TrackTable.TITLE)
+    table.item(1, TrackTable.ARTIST).setSelected(True)
+    table.keyPressEvent(
+        QKeyEvent(QKeyEvent.Type.KeyPress, Qt.Key.Key_C, Qt.KeyboardModifier.ControlModifier)
+    )
+    assert QGuiApplication.clipboard().text() == "Track 1\tA"
+
+
+def test_a_video_list_has_16_9_rows_and_a_song_list_square_rows(window, runs):
+    page = expand(window, runs)
+    table = page.playlist_card.table
+    assert not table.music and table.iconSize().width() == 96 and table.iconSize().height() == 54
+    assert table.rowHeight(0) >= 54
+    assert page.playlist_card.format_combo.currentData() == "v:1080:mp4"
+
+    page = expand(window, runs, url=MUSIC_URL)
+    assert table.music and table.iconSize().width() == table.iconSize().height() == 56
+    assert table.rowHeight(0) >= 56
+    assert page.playlist_card.header.music
+    assert page.playlist_card.format_combo.currentData() == "a:mp3:320"
+    assert "songs" in page.playlist_card.meta_label.text()
+
+
+def test_every_row_and_the_header_get_a_picture_that_follows_into_queue_and_history(
+    window, runs
+):
+    from stuff_downloader.gui.thumbs import youtube_thumb_url
+
+    page = expand(window, runs, url=MUSIC_URL)
+    card = page.playlist_card
+    assert not card.header.has_cover and not card.table.has_art(0)
+    for entry in page._listing.entries:
+        page._on_thumbnail(youtube_thumb_url(entry.video_id), _red())
+    assert card.header.has_cover
+    assert all(card.table.has_art(r) for r in range(card.table.rowCount()))
+    tip = card.table.item(0, TrackTable.ART).toolTip()
+    assert tip.startswith("<img src='data:image/png;base64,")
+
+    jobs = page.start_playlist_download()
+    assert jobs and all(not j.card.thumb.pixmap().isNull() for j in jobs)
+    assert jobs[0].card.thumb.width() == jobs[0].card.thumb.height()  # song art is square
+    record = page.store.get(jobs[0].spec.job_id)
+    assert record.thumb_url == youtube_thumb_url(page._listing.entries[0].video_id)
+
+    jobs[0].run.emit("result", files=[], total_bytes=1)
+    history_page = window.history_page
+    history_page.refresh()
+    history_page._on_thumbnail(record.thumb_url, _red())
+    row = next(i for i, r in enumerate(history_page._records) if r.job_id == record.job_id)
+    assert not history_page.table.item(row, 0).icon().isNull()
+
+
+def test_only_rows_on_screen_ask_for_their_picture(window, runs):
+    page = expand(window, runs, payload=listing(60, unavailable_last=False))
+    requested = []
+    page.thumbs.request = lambda url: requested.append(url) or True
+    page.playlist_card.table.resize(800, 300)
+    page._request_visible_playlist_thumbs()
+    assert 0 < len(requested) < 60
+
+
+def test_a_playlist_batch_sends_rows_that_keep_the_list_folder(window, runs):
+    page = expand(window, runs)
+    combo = page.playlist_card.format_combo
+    combo.setCurrentIndex(combo.findData("a:flac"))
+    jobs = page.start_playlist_download()
+    options = jobs[0].spec.options
+    assert (options["tab"], options["row_id"]) == ("audio", "a:flac")
+    assert options["playlist_title"] == "Chill Mix" and "album_order" not in options
+
+
+def test_an_album_list_asks_for_track_numbers(window, runs):
+    payload = dict(listing(), playlist_id="OLAK5uy_abc", music=True, is_album=True)
+    page = expand(window, runs, url=MUSIC_URL, payload=payload)
+    jobs = page.start_playlist_download()
+    assert jobs and all(j.spec.options["album_order"] is True for j in jobs)
+
+
+def test_the_queue_card_is_one_row_with_small_icon_buttons(window, runs):
+    page = expand(window, runs)
+    card = page.start_playlist_download()[0].card
+    for button in (card.pause_button, card.cancel_button, card.open_button, card.folder_button):
+        assert button.width() <= 32 and button.toolTip()
+    assert card.progress.maximumHeight() <= 6  # a thin bar
+    assert card.sizeHint().height() < 80
+    card.set_paused(True)
+    assert card.pause_button.text() == "▶" and "Resume" in card.pause_button.toolTip()
+
+
+def test_clear_done_menu_clears_by_kind(window, runs):
+    page = expand(window, runs)
+    jobs = page.start_playlist_download()
+    jobs[0].run.emit("result", files=[], total_bytes=1)
+    jobs[1].run.emit("error", code="download_error", message="Private video")
+    jobs[2].run.emit("result", files=[], total_bytes=1)
+    labels = [a.text() for a in page.clear_menu.actions()]
+    assert labels == ["Finished", "Cancelled && failed", "Everything not running"]
+    page.clear_finished_jobs("failed")
+    assert jobs[1].spec.job_id not in page.jobs and jobs[0].spec.job_id in page.jobs
+    page.clear_actions["finished"].trigger()
+    assert not page.jobs
+    assert page.store.get(jobs[0].spec.job_id) is not None  # History keeps everything
+
+
+def test_cancel_remaining_stops_every_unfinished_job(window, runs):
+    page = expand(window, runs, payload=listing(6, unavailable_last=False))
+    jobs = page.start_playlist_download()
+    jobs[0].run.emit("result", files=[], total_bytes=1)
+    assert page.cancel_remaining() == 5
+    for job in jobs[1:]:
+        if job.run is not None:
+            job.run.emit("cancelled")
+    assert jobs[0].state == "completed"
+    assert all(j.state == "cancelled" for j in jobs[1:])
+    assert not page.cancel_remaining_button.isEnabled()
+
+
+@pytest.mark.parametrize("scale", [1.0, 1.25, 1.5])
+def test_the_queue_has_no_horizontal_scrollbar_at_1280x720(qtbot, monkeypatch, scale):
+    """P18: at 1280×720, and the smaller logical size 125%/150% DPI leave, nothing scrolls
+    sideways, even with very long titles in the list and the queue."""
+    from PyQt6.QtGui import QFontDatabase
+    from PyQt6.QtWidgets import QScrollArea
+
+    from stuff_downloader.gui import pages
+    from stuff_downloader.gui.theme import STYLE
+
+    # Offscreen Qt has no system fonts and falls back to a much wider one; widths are only
+    # meaningful in the font the theme names, so load Windows' own Segoe UI.
+    fonts = [Path("C:/Windows/Fonts") / n for n in ("segoeui.ttf", "segoeuib.ttf", "seguisb.ttf")]
+    if not all(f.is_file() for f in fonts):
+        pytest.skip("measuring real widths needs the Segoe UI fonts")
+    for font in fonts:
+        QFontDatabase.addApplicationFont(str(font))
+    FakeRun.instances = []
+    monkeypatch.setattr(pages, "JobRun", FakeRun)
+    monkeypatch.setattr(tools, "check_all", lambda configured=None: [])
+    w = MainWindow(settings.Settings())
+    qtbot.addWidget(w)
+    w.setStyleSheet(STYLE)
+    w.resize(int(1280 / scale), int(720 / scale))
+    w.show()
+    long_title = "A very long song title that goes on and on " * 6
+    payload = listing(5, unavailable_last=False)
+    payload["title"] = long_title
+    for entry in payload["entries"]:
+        entry["title"] = long_title
+    page = expand(w, FakeRun.instances, payload=payload)
+    page.start_playlist_download()
+    qtbot.wait(20)
+    scroll = page.findChild(QScrollArea)
+    assert scroll.horizontalScrollBar().maximum() == 0
+    assert page.playlist_card.table.horizontalScrollBar().maximum() == 0

@@ -3,9 +3,20 @@
 from __future__ import annotations
 
 import html
+from dataclasses import dataclass
 
-from PyQt6.QtCore import QMimeData, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QDrag, QFont, QIcon, QImage, QPainter, QPixmap
+from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QMimeData, QSize, Qt, pyqtSignal
+from PyQt6.QtGui import (
+    QAction,
+    QColor,
+    QDrag,
+    QFont,
+    QIcon,
+    QImage,
+    QKeySequence,
+    QPainter,
+    QPixmap,
+)
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -37,6 +48,7 @@ from PyQt6.QtWidgets import (
 
 from ..core import cookies
 from ..core.gallery import GalleryItem
+from ..core.presets import BATCH_CHOICES
 from ..core.spotify import (
     UNCERTAIN_RULE,
     Candidate,
@@ -124,87 +136,138 @@ def section_title(text: str) -> QLabel:
     return label
 
 
-class JobCard(Card):
-    """One job row: thumbnail placeholder, title, stage chip, thin progress bar, details, cancel.
+class FitLabel(QLabel):
+    """A one-line label that paints "…" when it is short of room, and never asks for more.
 
-    A row is draggable only while its job is still queued — a running, paused or finished job
-    has no place in the pending order, so ``draggable`` stays False and both the drag and the
-    drop are refused.
+    ``text()`` is always the whole text (tests and copy read it); only the painting is cut, so
+    a long title can never push its card wider than the window (plan §5.8, P18).
+    """
+
+    def __init__(self, text: str = "") -> None:
+        super().__init__(text)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt override
+        super().setText(text)
+        self.setToolTip(plain_tooltip(text) if text else "")
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 - Qt override
+        return QSize(0, super().minimumSizeHint().height())
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt override
+        painter = QPainter(self)
+        painter.setPen(self.palette().color(self.foregroundRole()))
+        rect = self.contentsRect()
+        elide = Qt.TextElideMode.ElideRight
+        shown = self.fontMetrics().elidedText(self.text(), elide, rect.width())
+        painter.drawText(rect, int(self.alignment() | Qt.AlignmentFlag.AlignVCenter), shown)
+
+
+# Queue-card art: a video's 16:9 frame or a song's square cover, as on its playlist row.
+QUEUE_ART_VIDEO = QSize(64, 36)
+QUEUE_ART_MUSIC = QSize(36, 36)
+
+
+def _icon_button(text: str, tip: str) -> QPushButton:
+    button = QPushButton(text)
+    button.setObjectName("queueIcon")
+    button.setToolTip(tip)
+    button.setFixedSize(28, 26)
+    button.setStyleSheet("padding:0px;")
+    return button
+
+
+class JobCard(Card):
+    """One job: art · title · state · percent · small icon buttons, then details and a thin bar.
+
+    It is one row plus a progress bar (plan §5.8, P11); every text is cut to fit, so the card
+    never needs more width than the queue has (P18). A row is draggable only while its job is
+    still queued — a running, paused or finished job has no place in the pending order, so
+    ``draggable`` stays False and both the drag and the drop are refused.
     """
 
     reorder_requested = pyqtSignal(str, str)  # dragged job id, the id of the row it was dropped on
 
-    def __init__(self) -> None:
+    def __init__(self, music: bool = False) -> None:
         super().__init__()
         self.job_id = ""
         self.draggable = False
         self._press_pos = None
         self.setAcceptDrops(True)
+        self.body.setContentsMargins(10, 6, 10, 6)
+        self.body.setSpacing(3)
         top = QHBoxLayout()
-        top.setSpacing(12)
+        top.setSpacing(8)
 
-        self.thumb = QLabel("⬇")
-        self.thumb.setFixedSize(44, 44)
+        self.thumb = QLabel("🎵" if music else "🎞")
+        self.thumb.setFixedSize(QUEUE_ART_MUSIC if music else QUEUE_ART_VIDEO)
         self.thumb.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.thumb.setStyleSheet(
-            "background:#133247; color:#4cc2ff; border-radius:8px; font-size:16pt;"
-        )
+        self.thumb.setStyleSheet(f"background:{ART_PLACEHOLDER}; color:#4cc2ff; border-radius:4px;")
 
         text_col = QVBoxLayout()
-        text_col.setSpacing(2)
-        self.title_label = QLabel("")
+        text_col.setSpacing(0)
+        self.title_label = FitLabel("")
         self.title_label.setStyleSheet("font-weight:600;")
-        self.title_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.details_label = QLabel("")
-        self.details_label.setObjectName("muted")
-        self.details_label.setTextFormat(Qt.TextFormat.PlainText)  # carries worker text
+        self.title_label.setContextMenuPolicy(Qt.ContextMenuPolicy.ActionsContextMenu)
+        copy = QAction("Copy title", self.title_label)
+        copy.triggered.connect(lambda: QApplication.clipboard().setText(self.title_label.text()))
+        self.title_label.addAction(copy)
+        self.details_label = FitLabel("")
+        self.details_label.setObjectName("muted")  # carries worker text: plain text only
         text_col.addWidget(self.title_label)
         text_col.addWidget(self.details_label)
 
         self.chip = Chip("Idle")
-        self.cancel_button = QPushButton("✕  Cancel")
-        self.cancel_button.setObjectName("iconButton")
-        self.cancel_button.setToolTip("Cancel this job")
-        self.pause_button = QPushButton("⏸  Pause")
-        self.pause_button.setObjectName("iconButton")
-        self.pause_button.setToolTip("Pause this job; the partial file is kept")
-        self.retry_button = QPushButton("↻  Retry")
-        self.retry_button.setObjectName("iconButton")
-        self.open_button = QPushButton("Open")
-        self.open_button.setObjectName("iconButton")
-        self.folder_button = QPushButton("Show in folder")
-        self.folder_button.setObjectName("iconButton")
+        self.percent_label = QLabel("0%")
+        self.percent_label.setObjectName("muted")
+        self.percent_label.setFixedWidth(36)
+        self.percent_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.open_button = _icon_button("▶", "Open the file")
+        self.folder_button = _icon_button("📂", "Show in folder")
+        self.retry_button = _icon_button("↻", "Try again")
+        self.pause_button = _icon_button("⏸", "Pause; the partial file is kept")
+        self.cancel_button = _icon_button("✕", "Cancel this job")
         for button in (self.retry_button, self.open_button, self.folder_button):
             button.hide()
 
         top.addWidget(self.thumb)
         top.addLayout(text_col, 1)
-        top.addWidget(self.chip, 0, Qt.AlignmentFlag.AlignTop)
-        for button in (self.open_button, self.folder_button, self.retry_button):
-            top.addWidget(button, 0, Qt.AlignmentFlag.AlignTop)
-        top.addWidget(self.pause_button, 0, Qt.AlignmentFlag.AlignTop)
-        top.addWidget(self.cancel_button, 0, Qt.AlignmentFlag.AlignTop)
+        top.addWidget(self.chip)
+        top.addWidget(self.percent_label)
+        for button in (
+            self.open_button,
+            self.folder_button,
+            self.retry_button,
+            self.pause_button,
+            self.cancel_button,
+        ):
+            top.addWidget(button)
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setTextVisible(False)
-        self.percent_label = QLabel("0%")
-        self.percent_label.setObjectName("muted")
-        self.percent_label.setMinimumWidth(40)
-        self.percent_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        bar_row = QHBoxLayout()
-        bar_row.addWidget(self.progress, 1)
-        bar_row.addWidget(self.percent_label)
-
+        self.progress.setFixedHeight(3)
         self.body.addLayout(top)
-        self.body.addLayout(bar_row)
+        self.body.addWidget(self.progress)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 (Qt override)
+        """Full height, but only the width the fixed parts need: the texts give way (P18)."""
+        return QSize(super(Card, self).minimumSizeHint().width(), self.sizeHint().height())
 
     def set_state(self, text: str, state: str) -> None:
         self.chip.set(text, state)
         set_state(self.progress, state)
 
+    def set_paused(self, paused: bool) -> None:
+        """The pause button shows what a click does: pause a run, or resume a paused one."""
+        self.pause_button.setText("▶" if paused else "⏸")
+        self.pause_button.setToolTip(
+            "Resume this job" if paused else "Pause; the partial file is kept"
+        )
+
     def set_thumbnail(self, image: QImage | None) -> None:
-        """Show the item's picture in the square icon; ``None`` keeps the placeholder."""
+        """Show the item's picture, cropped to the art box; ``None`` keeps the placeholder."""
         if image is None or image.isNull():
             return
         size = self.thumb.size()
@@ -819,10 +882,11 @@ class GroupCard(Card):
     def __init__(self, title: str, count: int) -> None:
         super().__init__()
         self.setObjectName("card")
+        self.body.setContentsMargins(10, 6, 10, 6)
+        self.body.setSpacing(3)
         top = QHBoxLayout()
-        self.title_label = QLabel(f"☰  Playlist: {title}")
+        self.title_label = FitLabel(f"☰  Playlist: {title}")
         self.title_label.setStyleSheet("font-weight:600;")
-        self.title_label.setWordWrap(True)
         self.summary_label = QLabel(f"0 / {count} done")
         self.summary_label.setObjectName("muted")
         top.addWidget(self.title_label, 1)
@@ -830,8 +894,12 @@ class GroupCard(Card):
         self.progress = QProgressBar()
         self.progress.setRange(0, max(1, count))
         self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(3)
         self.body.addLayout(top)
         self.body.addWidget(self.progress)
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 (Qt override)
+        return QSize(super(Card, self).minimumSizeHint().width(), self.sizeHint().height())
 
     def set_counts(self, done: int, total: int, failed: int = 0, skipped: int = 0) -> None:
         parts = [f"{done} / {total} done"]
@@ -844,154 +912,431 @@ class GroupCard(Card):
         self.progress.setValue(min(done + failed + skipped, max(1, total)))
 
 
-class PlaylistCard(Card):
-    """The playlist expansion table: checkbox · # · title · artist · duration · state."""
+# ── the shared track table (plan §5.6a, §5.8, §8 R5) ─────────────────────────────────────
+ART_PLACEHOLDER = "#133247"
+ROW_ART_VIDEO = QSize(96, 54)  # a video list: the 16:9 frame
+ROW_ART_MUSIC = QSize(56, 56)  # a song list: the cover, centre-cropped square
+HEADER_ART_VIDEO = QSize(192, 108)
+HEADER_ART_MUSIC = QSize(160, 160)
+ART_TOOLTIP_SIDE = 240
 
-    COLUMNS = ("", "#", "Title (click to edit)", "Artist", "Length", "")
-    TITLE_COLUMN = 2
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.title_label = QLabel("")
-        self.title_label.setStyleSheet("font-weight:600; font-size:12pt;")
-        self.title_label.setWordWrap(True)
-        self.meta_label = QLabel("")
-        self.meta_label.setObjectName("muted")
-        self.meta_label.setWordWrap(True)
-        self.body.addWidget(self.title_label)
-        self.body.addWidget(self.meta_label)
+@dataclass(frozen=True)
+class TrackRow:
+    """What one table row shows. Every list — YouTube, YouTube Music, Spotify — is this."""
 
-        self.table = QTableWidget(0, len(self.COLUMNS))
-        self.table.setObjectName("playlistTable")  # compact rows for the name editors
-        self.table.setIconSize(ROW_THUMB)
-        self.table.setHorizontalHeaderLabels(list(self.COLUMNS))
-        self.table.verticalHeader().setVisible(False)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        # Only the Title cell is editable (its item flags); a click on it starts editing.
-        self.table.setEditTriggers(
+    index: int
+    title: str
+    artist: str = ""
+    duration: float | None = None
+    unavailable: str = ""  # why it cannot be ticked; "" when it can
+    explicit: bool = False
+
+
+def art_placeholder(size: QSize, music: bool) -> QPixmap:
+    """The fixed grey box a row shows until its picture arrives, so rows never jump."""
+    pixmap = QPixmap(size)
+    pixmap.fill(QColor(ART_PLACEHOLDER))
+    painter = QPainter(pixmap)
+    painter.setPen(QColor("#4cc2ff"))
+    font = QFont(painter.font())
+    font.setPointSizeF(max(8.0, size.height() / 3.2))
+    painter.setFont(font)
+    painter.drawText(pixmap.rect(), int(Qt.AlignmentFlag.AlignCenter), "🎵" if music else "🎞")
+    painter.end()
+    return pixmap
+
+
+def art_tooltip(image: QImage) -> str:
+    """The row picture again at about 240 px, to check a cover without opening anything.
+
+    The picture is our own decoded image, re-encoded here; nothing from the site is quoted.
+    """
+    scaled = image.scaled(
+        ART_TOOLTIP_SIDE,
+        ART_TOOLTIP_SIDE,
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+    data = QByteArray()
+    buffer = QBuffer(data)
+    buffer.open(QIODevice.OpenModeFlag.WriteOnly)
+    scaled.save(buffer, "PNG")
+    encoded = bytes(data.toBase64()).decode("ascii")
+    return f"<img src='data:image/png;base64,{encoded}' width='{scaled.width()}'>"
+
+
+class TrackTable(QTableWidget):
+    """Tick · # · picture · Title · Artist · Length · Status, plus any extra columns.
+
+    One table for every list (plan §8 R5). Ticks are the model's own check states, drawn by the
+    style in full, never checkbox widgets that a narrow cell can clip (P8). Cells are selectable
+    and Ctrl+C copies them (P16). An editable Title is edited in place — click it once it is
+    selected, double-click, or F2 — and the edit names the file only (plan §5.5, P4).
+    """
+
+    CHECK, INDEX, ART, TITLE, ARTIST, LENGTH, STATUS = range(7)
+    BASE_COLUMNS = ("", "#", "", "Title", "Artist", "Length", "Status")
+    EDIT_HINT = "Click the title again, double-click or press F2 to rename the file"
+
+    checks_changed = pyqtSignal()
+
+    EXPLICIT = "  🅴"
+
+    def __init__(self, extra_columns: tuple[str, ...] = ()) -> None:
+        columns = self.BASE_COLUMNS + extra_columns
+        super().__init__(0, len(columns))
+        self.setObjectName("trackTable")
+        self.music = False
+        self._art: dict[int, QImage] = {}
+        labels = list(columns)
+        labels[self.TITLE] = "Title (click to edit)"
+        self.setHorizontalHeaderLabels(labels)
+        self.verticalHeader().setVisible(False)
+        self.setWordWrap(False)
+        self.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.setEditTriggers(
             QAbstractItemView.EditTrigger.SelectedClicked
             | QAbstractItemView.EditTrigger.DoubleClicked
             | QAbstractItemView.EditTrigger.EditKeyPressed
-            | QAbstractItemView.EditTrigger.CurrentChanged
         )
-        self.table.setMinimumHeight(220)
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.setMinimumHeight(240)
+        header = self.horizontalHeader()
+        header.setMinimumSectionSize(24)
+        for column in range(len(columns)):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(self.TITLE, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(self.ARTIST, QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(self.ARTIST, 150)
+        header.setSectionResizeMode(self.ART, QHeaderView.ResizeMode.Fixed)
+        self.set_music(False)
+        self.itemChanged.connect(self._item_changed)
+
+    # ── layout ───────────────────────────────────────────────────────────────────────────
+    def art_size(self) -> QSize:
+        return ROW_ART_MUSIC if self.music else ROW_ART_VIDEO
+
+    def set_music(self, music: bool) -> None:
+        """Square song art or 16:9 video art; the row height follows the picture."""
+        self.music = bool(music)
+        size = self.art_size()
+        self.setIconSize(size)
+        self.horizontalHeader().resizeSection(self.ART, size.width() + 12)
+        self.verticalHeader().setMinimumSectionSize(size.height() + 8)
+        self.verticalHeader().setDefaultSectionSize(size.height() + 8)
+
+    # ── rows ─────────────────────────────────────────────────────────────────────────────
+    def set_rows(self, rows: list[TrackRow] | tuple[TrackRow, ...], music: bool) -> None:
+        self.blockSignals(True)
+        self.clearContents()
+        self._art = {}
+        self.set_music(music)
+        self.setRowCount(len(rows))
+        placeholder = QIcon(art_placeholder(self.art_size(), self.music))
+        for row, track in enumerate(rows):
+            ok = not track.unavailable
+            check = QTableWidgetItem()
+            flags = Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable
+            check.setFlags(flags | Qt.ItemFlag.ItemIsEnabled if ok else flags)
+            check.setCheckState(Qt.CheckState.Checked if ok else Qt.CheckState.Unchecked)
+            self.setItem(row, self.CHECK, check)
+            art = QTableWidgetItem()
+            art.setFlags(Qt.ItemFlag.ItemIsEnabled)
+            art.setIcon(placeholder)
+            self.setItem(row, self.ART, art)
+            title = f"{track.title}{self.EXPLICIT}" if track.explicit else track.title
+            cells = {
+                self.INDEX: str(track.index),
+                self.TITLE: title,
+                self.ARTIST: track.artist,
+                self.LENGTH: format_duration(track.duration),
+                self.STATUS: track.unavailable,
+            }
+            for column, text in cells.items():
+                item = QTableWidgetItem(text)
+                item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+                if column in (self.TITLE, self.ARTIST) and text:
+                    item.setToolTip(plain_tooltip(text))
+                if column == self.TITLE:
+                    item.setData(Qt.ItemDataRole.UserRole, title)
+                    if ok:
+                        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+                        item.setToolTip(plain_tooltip(f"{text}\n{self.EDIT_HINT}"))
+                if not ok:
+                    item.setForeground(QColor("#8aa0b4"))
+                self.setItem(row, column, item)
+        self.blockSignals(False)
+        self.checks_changed.emit()
+
+    def is_checkable(self, row: int) -> bool:
+        item = self.item(row, self.CHECK)
+        return item is not None and bool(item.flags() & Qt.ItemFlag.ItemIsEnabled)
+
+    def is_checked(self, row: int) -> bool:
+        item = self.item(row, self.CHECK)
+        return item is not None and item.checkState() == Qt.CheckState.Checked
+
+    def set_checked(self, row: int, checked: bool) -> None:
+        item = self.item(row, self.CHECK)
+        if item is not None and self.is_checkable(row):
+            item.setCheckState(Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
+
+    def checked_rows(self) -> list[int]:
+        return [r for r in range(self.rowCount()) if self.is_checkable(r) and self.is_checked(r)]
+
+    def set_all_checked(self, checked: bool) -> None:
+        """Tick or untick every row the filter shows."""
+        self.blockSignals(True)
+        for row in range(self.rowCount()):
+            if not self.isRowHidden(row):
+                self.set_checked(row, checked)
+        self.blockSignals(False)
+        self.viewport().update()
+        self.checks_changed.emit()
+
+    def apply_filter(self, text: str) -> None:
+        needle = text.strip().casefold()
+        for row in range(self.rowCount()):
+            haystack = f"{self.cell_text(row, self.TITLE)} {self.cell_text(row, self.ARTIST)}"
+            self.setRowHidden(row, bool(needle) and needle not in haystack.casefold())
+
+    def cell_text(self, row: int, column: int) -> str:
+        item = self.item(row, column)
+        return item.text() if item is not None else ""
+
+    def set_status(self, row: int, text: str, warn: bool = False, tip: str = "") -> None:
+        self.set_cell(row, self.STATUS, text, warn, tip)
+
+    def set_cell(self, row: int, column: int, text: str, warn: bool = False, tip: str = "") -> None:
+        """A read-only, selectable cell. ``tip`` (or the text) is shown literally on hover."""
+        item = QTableWidgetItem(text)
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        if warn:
+            item.setForeground(QColor("#e0a040"))
+        if tip or text:
+            item.setToolTip(plain_tooltip(tip or text))
+        self.setItem(row, column, item)
+
+    def edited_title(self, row: int) -> str | None:
+        """The title the owner typed for ``row``, or ``None`` to keep the default name.
+
+        An untouched (or restored) title is not a name: music keeps "Artist - Title".
+        """
+        item = self.item(row, self.TITLE)
+        if item is None:
+            return None
+        original = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        text = item.text()
+        if original.endswith(self.EXPLICIT):  # the badge is ours, never part of a name
+            original = original.removesuffix(self.EXPLICIT)
+            text = text.removesuffix(self.EXPLICIT)
+        text = text.strip()
+        return text if text and text != original else None
+
+    # ── pictures ─────────────────────────────────────────────────────────────────────────
+    def set_art(self, row: int, image: QImage) -> None:
+        item = self.item(row, self.ART)
+        if item is None or image.isNull():
+            return
+        self._art[row] = image
+        item.setIcon(row_icon(image, self.art_size()))
+        item.setToolTip(art_tooltip(image))
+
+    def has_art(self, row: int) -> bool:
+        return row in self._art
+
+    def art(self, row: int) -> QImage | None:
+        """The picture ``row`` shows, once it has arrived."""
+        return self._art.get(row)
+
+    def visible_rows(self) -> range:
+        """Rows on screen (plus a few below), for lazy picture loading."""
+        count = self.rowCount()
+        if not count:
+            return range(0)
+        first = max(self.rowAt(0), 0)
+        last = self.rowAt(self.viewport().height() - 1)
+        last = count - 1 if last < 0 else last
+        return range(first, min(count, last + 6))
+
+    # ── copy ─────────────────────────────────────────────────────────────────────────────
+    def copy_selection(self) -> str:
+        """Selected cells as tab-separated lines, like a spreadsheet; ticks and art skipped."""
+        cells: dict[int, dict[int, str]] = {}
+        for index in self.selectedIndexes():
+            if index.column() in (self.CHECK, self.ART):
+                continue
+            cells.setdefault(index.row(), {})[index.column()] = self.cell_text(
+                index.row(), index.column()
+            )
+        text = "\n".join(
+            "\t".join(row[c] for c in sorted(row)) for _, row in sorted(cells.items())
+        )
+        if text:
+            QApplication.clipboard().setText(text)
+        return text
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        editing = self.state() == QAbstractItemView.State.EditingState
+        if event.matches(QKeySequence.StandardKey.Copy) and not editing:
+            self.copy_selection()
+            return
+        super().keyPressEvent(event)
+
+    def _item_changed(self, item: QTableWidgetItem) -> None:
+        if item.column() == self.CHECK:
+            self.checks_changed.emit()
+
+
+class CollectionHeader(QWidget):
+    """A list's own cover beside its title, owner and count, like the Result card (§5.6a)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(14)
+        self.cover = QLabel()
+        self.cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.music = False
+        self.has_cover = False
+        text = QVBoxLayout()
+        text.setSpacing(4)
+        self.title_label = QLabel("")
+        self.title_label.setStyleSheet("font-weight:600; font-size:12pt;")
+        self.title_label.setWordWrap(True)
+        self.title_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.title_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.meta_label = QLabel("")
+        self.meta_label.setObjectName("muted")
+        self.meta_label.setWordWrap(True)
+        self.meta_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.meta_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        text.addWidget(self.title_label)
+        text.addWidget(self.meta_label)
+        text.addStretch(1)
+        row.addWidget(self.cover, 0, Qt.AlignmentFlag.AlignTop)
+        row.addLayout(text, 1)
+        self.set_music(False)
+
+    def art_size(self) -> QSize:
+        return HEADER_ART_MUSIC if self.music else HEADER_ART_VIDEO
+
+    def set_music(self, music: bool) -> None:
+        """Back to the placeholder, square for songs and 16:9 for videos."""
+        self.music = bool(music)
+        self.cover.setFixedSize(self.art_size())
+        self.cover.setPixmap(art_placeholder(self.art_size(), self.music))
+        self.has_cover = False
+
+    def set_cover(self, image: QImage | None) -> None:
+        if image is None or image.isNull():
+            return
+        self.cover.setPixmap(row_icon(image, self.art_size()).pixmap(self.art_size()))
+        self.has_cover = True
+
+
+def batch_combo() -> QComboBox:
+    """"Download selected as": the §5.4 formats every YouTube entry has."""
+    combo = QComboBox()
+    for label, _tab, row_id, _container in BATCH_CHOICES:
+        combo.addItem(label, row_id)
+    return combo
+
+
+def _add_download_rows(card: Card) -> None:
+    """The rows under a track table: format, skip-existing and the download button.
+
+    Three short rows rather than one long one, so a list still fits a 1280×720 window at
+    150% scaling with no sideways scrolling (plan §5.8).
+    """
+    card.format_combo.setSizeAdjustPolicy(
+        QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+    )
+    card.format_combo.setMinimumContentsLength(20)
+    formats = QHBoxLayout()
+    formats.addWidget(QLabel("Download selected as:"))
+    formats.addWidget(card.format_combo)
+    formats.addStretch(1)
+    card.body.addLayout(formats)
+    card.body.addWidget(card.archive_check)
+    buttons = QHBoxLayout()
+    card.selection_label = QLabel("")
+    card.selection_label.setObjectName("muted")
+    card.download_button = QPushButton("⬇  Download selected")
+    card.download_button.setObjectName("primary")
+    buttons.addWidget(card.selection_label, 1)
+    buttons.addWidget(card.download_button)
+    card.body.addLayout(buttons)
+
+
+class PlaylistCard(Card):
+    """A YouTube or YouTube Music list: cover header, the track table, "Download selected as"."""
+
+    TITLE_COLUMN = 3  # TrackTable.TITLE
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.header = CollectionHeader()
+        self.title_label = self.header.title_label
+        self.meta_label = self.header.meta_label
+        self.body.addWidget(self.header)
+        self.table = TrackTable()
         self.body.addWidget(self.table)
 
         controls = QHBoxLayout()
         self.select_all_button = QPushButton("Select all")
         self.select_none_button = QPushButton("Select none")
         self.filter_edit = QLineEdit()
-        self.filter_edit.setPlaceholderText("Filter by title…")
+        self.filter_edit.setPlaceholderText("Filter…")
         self.filter_edit.setClearButtonEnabled(True)
         controls.addWidget(self.select_all_button)
         controls.addWidget(self.select_none_button)
         controls.addWidget(self.filter_edit, 1)
         self.body.addLayout(controls)
 
-        options = QHBoxLayout()
-        self.preset_combo = QComboBox()
-        self.archive_check = QCheckBox("Skip songs already downloaded to this folder")
+        self.format_combo = batch_combo()
+        self.archive_check = QCheckBox("Skip songs already in this folder")
         self.archive_check.setChecked(True)
-        options.addWidget(QLabel("Preset"))
-        options.addWidget(self.preset_combo)
-        options.addWidget(self.archive_check, 1)
-        self.body.addLayout(options)
+        _add_download_rows(self)
 
-        buttons = QHBoxLayout()
-        self.selection_label = QLabel("")
-        self.selection_label.setObjectName("muted")
-        self.download_button = QPushButton("⬇  Download selected")
-        self.download_button.setObjectName("primary")
-        buttons.addWidget(self.selection_label, 1)
-        buttons.addWidget(self.download_button)
-        self.body.addLayout(buttons)
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 (Qt override)
+        return QSize(0, self.sizeHint().height())
 
-    def checkbox(self, row: int) -> QCheckBox | None:
-        widget = self.table.cellWidget(row, 0)
-        return widget if isinstance(widget, QCheckBox) else None
-
-    def set_entries(self, entries) -> None:
+    def set_entries(self, entries, music: bool = False) -> None:
         """Fill the table. Unavailable entries are listed with their reason, never dropped."""
-        self.table.setRowCount(len(entries))
-        for row, entry in enumerate(entries):
-            box = QCheckBox()
-            box.setChecked(entry.selectable)
-            box.setEnabled(entry.selectable)
-            self.table.setCellWidget(row, 0, box)
-            cells = (str(entry.index), entry.title, entry.uploader)
-            for column, text in enumerate(cells, start=1):
-                item = QTableWidgetItem(text)
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                if column == self.TITLE_COLUMN:
-                    item.setIcon(_placeholder_icon())
-                    item.setData(Qt.ItemDataRole.UserRole, entry.title)
-                    item.setToolTip("Click to change the file name")
-                    if entry.selectable:
-                        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
-                if not entry.selectable:
-                    item.setForeground(QColor("#8aa0b4"))
-                self.table.setItem(row, column, item)
-            for column, text in ((4, format_duration(entry.duration)), (5, entry.unavailable)):
-                item = QTableWidgetItem(text)
-                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
-                if not entry.selectable:
-                    item.setForeground(QColor("#8aa0b4"))
-                self.table.setItem(row, column, item)
+        rows = [
+            TrackRow(e.index, e.title, e.uploader, e.duration, e.unavailable) for e in entries
+        ]
+        self.header.set_music(music)
+        self.table.set_rows(rows, music)
 
     def selected_rows(self) -> list[int]:
-        rows = []
-        for row in range(self.table.rowCount()):
-            box = self.checkbox(row)
-            if box is not None and box.isChecked() and box.isEnabled():
-                rows.append(row)
-        return rows
+        return self.table.checked_rows()
 
     def set_all_checked(self, checked: bool) -> None:
-        for row in range(self.table.rowCount()):
-            box = self.checkbox(row)
-            if box is not None and box.isEnabled() and not self.table.isRowHidden(row):
-                box.setChecked(checked)
+        self.table.set_all_checked(checked)
 
     def apply_filter(self, text: str) -> None:
-        needle = text.strip().lower()
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, 2)
-            title = item.text().lower() if item is not None else ""
-            self.table.setRowHidden(row, bool(needle) and needle not in title)
+        self.table.apply_filter(text)
 
     def set_thumbnail(self, row: int, image: QImage) -> None:
-        item = self.table.item(row, self.TITLE_COLUMN)
-        if item is not None and not image.isNull():
-            item.setIcon(row_icon(image))
+        self.table.set_art(row, image)
 
     def visible_rows(self) -> range:
-        """Rows currently on screen (plus a few below), for lazy thumbnail loading."""
-        count = self.table.rowCount()
-        if not count:
-            return range(0)
-        first = max(self.table.rowAt(0), 0)
-        last = self.table.rowAt(self.table.viewport().height() - 1)
-        last = count - 1 if last < 0 else last
-        return range(first, min(count, last + 6))
+        return self.table.visible_rows()
 
     def output_name(self, row: int) -> str | None:
-        """The title the owner edited for ``row``, or ``None`` to keep the default name.
+        return self.table.edited_title(row)
 
-        An untouched (or restored) title is not a name: music keeps "Artist - Title".
-        """
-        item = self.table.item(row, self.TITLE_COLUMN)
-        if item is None:
-            return None
-        text = item.text().strip()
-        original = item.data(Qt.ItemDataRole.UserRole)
-        return text if text and text != original else None
+    def set_download_count(self, count: int) -> None:
+        self.selection_label.setText(f"{count} selected")
+        self.download_button.setText(f"⬇  Download {count} selected")
+        self.download_button.setEnabled(count > 0)
 
 
 class MatchDialog(QDialog):
@@ -1302,7 +1647,7 @@ ROW_THUMB = QSize(48, 27)
 
 def _placeholder_icon(size: QSize = ROW_THUMB) -> QIcon:
     pixmap = QPixmap(size)
-    pixmap.fill(QColor("#133247"))
+    pixmap.fill(QColor(ART_PLACEHOLDER))
     return QIcon(pixmap)
 
 
@@ -1361,11 +1706,12 @@ class SpotifyCard(Card):
     """A Spotify track/album/playlist: tick tracks, review their YouTube matches, download.
 
     Spotify's audio is DRM-protected and never downloaded. The card says so up front, because the
-    whole point of the match columns is that the audio comes from somewhere else.
+    whole point of the match columns is that the audio comes from somewhere else. The rows are
+    the shared track table; a row's picture is Spotify's art, never the YouTube match's (§5.6a).
     """
 
-    COLUMNS = ("", "#", "Title", "Artist", "Length", "YouTube match", "Diff", "Score", "")
-    MATCH_COLUMN, DIFF_COLUMN, SCORE_COLUMN, CHANGE_COLUMN = 5, 6, 7, 8
+    EXTRA = ("YouTube match", "Diff", "Score", "")
+    MATCH_COLUMN, DIFF_COLUMN, SCORE_COLUMN, CHANGE_COLUMN = 7, 8, 9, 10
     DISCLOSURE = (
         "Spotify's own audio is protected and is never downloaded. Each song is matched from "
         "YouTube Music, then tagged with Spotify's title, artist, album and cover. A match can "
@@ -1378,19 +1724,14 @@ class SpotifyCard(Card):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title_label = QLabel("")
-        self.title_label.setStyleSheet("font-weight:600; font-size:12pt;")
-        self.title_label.setWordWrap(True)
-        self.title_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.meta_label = QLabel("")
-        self.meta_label.setObjectName("muted")
-        self.meta_label.setWordWrap(True)
-        self.meta_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.header = CollectionHeader()
+        self.header.set_music(True)
+        self.title_label = self.header.title_label
+        self.meta_label = self.header.meta_label
         self.disclosure_label = QLabel(self.DISCLOSURE)
         self.disclosure_label.setWordWrap(True)
         self.disclosure_label.setTextFormat(Qt.TextFormat.PlainText)
-        self.body.addWidget(self.title_label)
-        self.body.addWidget(self.meta_label)
+        self.body.addWidget(self.header)
         self.body.addWidget(self.disclosure_label)
         # "3 uncertain matches — …": counted before anything downloads (item 9).
         self.uncertain_label = QLabel("")
@@ -1400,26 +1741,13 @@ class SpotifyCard(Card):
         self.uncertain_label.hide()
         self.body.addWidget(self.uncertain_label)
 
-        self.table = QTableWidget(0, len(self.COLUMNS))
-        self.table.setObjectName("spotifyTable")  # compact rows for the Change… buttons
-        self.table.setHorizontalHeaderLabels(list(self.COLUMNS))
-        self.table.verticalHeader().setVisible(False)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setMinimumHeight(260)
-        self.table.verticalHeader().setDefaultSectionSize(36)
-        self.table.setIconSize(ROW_THUMB)
+        self.table = TrackTable(self.EXTRA)
         header = self.table.horizontalHeader()
-        for column in range(len(self.COLUMNS)):
-            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
-        # Title and match share the spare width; a long artist list must not starve them.
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
-        header.resizeSection(3, 170)
+        header.setSectionHidden(TrackTable.STATUS, True)
         header.setSectionResizeMode(self.MATCH_COLUMN, QHeaderView.ResizeMode.Stretch)
         # ResizeToContents measures items, not cell widgets, so the button column is sized here.
         header.setSectionResizeMode(self.CHANGE_COLUMN, QHeaderView.ResizeMode.Fixed)
-        header.resizeSection(self.CHANGE_COLUMN, 104)
+        header.resizeSection(self.CHANGE_COLUMN, 96)
         self.body.addWidget(self.table)
 
         controls = QHBoxLayout()
@@ -1429,44 +1757,33 @@ class SpotifyCard(Card):
         self.match_button.setToolTip(
             "Look up the YouTube recording for each selected song (about half a minute each)"
         )
-        self.archive_check = QCheckBox("Skip songs already downloaded to this folder")
-        self.archive_check.setChecked(True)
         controls.addWidget(self.select_all_button)
         controls.addWidget(self.select_none_button)
         controls.addWidget(self.match_button)
-        controls.addWidget(self.archive_check, 1)
+        controls.addStretch(1)
         self.body.addLayout(controls)
 
-        buttons = QHBoxLayout()
-        self.selection_label = QLabel("")
-        self.selection_label.setObjectName("muted")
-        self.download_button = QPushButton("⬇  Download selected as MP3")
-        self.download_button.setObjectName("primary")
-        buttons.addWidget(self.selection_label, 1)
-        buttons.addWidget(self.download_button)
-        self.body.addLayout(buttons)
+        self.archive_check = QCheckBox("Skip songs already in this folder")
+        self.archive_check.setChecked(True)
+        # Spotify songs are tagged MP3s (§7); other formats come with Spotify v2 (R6).
+        self.format_combo = QComboBox()
+        self.format_combo.addItem("MP3", "mp3")
+        self.format_combo.setEnabled(False)
+        _add_download_rows(self)
 
-    def checkbox(self, row: int) -> QCheckBox | None:
-        widget = self.table.cellWidget(row, 0)
-        return widget if isinstance(widget, QCheckBox) else None
+    def minimumSizeHint(self) -> QSize:  # noqa: N802 (Qt override)
+        return QSize(0, self.sizeHint().height())
 
     def change_button(self, row: int) -> QPushButton | None:
         widget = self.table.cellWidget(row, self.CHANGE_COLUMN)
         return widget if isinstance(widget, QPushButton) else None
 
     def set_tracks(self, tracks: tuple[SpotifyTrack, ...] | list[SpotifyTrack]) -> None:
-        self.table.setRowCount(len(tracks))
-        for row, track in enumerate(tracks):
-            box = QCheckBox()
-            box.setChecked(True)
-            self.table.setCellWidget(row, 0, box)
-            title = f"{track.title}  🅴" if track.explicit else track.title
-            cells = (str(track.index), title, track.artist, format_duration(track.duration))
-            for column, text in enumerate(cells, start=1):
-                item = QTableWidgetItem(text)
-                if column in (2, 3):
-                    item.setToolTip(plain_tooltip(text))  # the columns that get cut short
-                self.table.setItem(row, column, item)
+        rows = [
+            TrackRow(t.index, t.title, t.artist, t.duration, explicit=t.explicit) for t in tracks
+        ]
+        self.table.set_rows(rows, music=True)
+        for row in range(len(rows)):
             change = QPushButton("Change…")
             change.setObjectName("rowButton")
             change.setToolTip("Pick another YouTube Music result, or paste a link")
@@ -1477,9 +1794,7 @@ class SpotifyCard(Card):
     def set_status(self, row: int, text: str, warn: bool = False, tip: str = "") -> None:
         """A row with no match to show: not checked yet, checking, or why none was found."""
         self._set_match_cells(row, text, "", "", warn)
-        item = self.table.item(row, self.MATCH_COLUMN)
-        if item is not None:
-            item.setToolTip(plain_tooltip(tip or text))
+        self.table.set_cell(row, self.MATCH_COLUMN, text, warn, tip or text)
 
     def set_match(self, row: int, match: Match) -> None:
         if match.manual and not match.title:
@@ -1495,17 +1810,18 @@ class SpotifyCard(Card):
         if warn:
             score = f"⚠ {score}"  # the row badge
         self._set_match_cells(row, label, format_diff(match.duration_diff), score, warn)
-        item = self.table.item(row, self.MATCH_COLUMN)
-        if item is not None:
-            item.setIcon(_placeholder_icon())
-            # The video id, not a link: one more copyable URL is one more way around the router.
-            item.setToolTip(plain_tooltip(f"{label}\nYouTube video {match.video_id}"))
-        badge = self.table.item(row, self.SCORE_COLUMN)
-        if badge is not None:
-            tip = f"Uncertain: {UNCERTAIN_RULE}. Use Change… to pick another." if warn else ""
-            if match.confidence is not None:
-                tip = f"{tip}\nspotDL's own score: {match.confidence:.0f}%".strip()
-            badge.setToolTip(plain_tooltip(tip) if tip else "")
+        # The video id, not a link: one more copyable URL is one more way around the router.
+        self.table.set_cell(
+            row, self.MATCH_COLUMN, label, warn, f"{label}\nYouTube video {match.video_id}"
+        )
+        tip = f"Uncertain: {UNCERTAIN_RULE}. Use Change… to pick another." if warn else ""
+        if match.confidence is not None:
+            tip = f"{tip}\nspotDL's own score: {match.confidence:.0f}%".strip()
+        self.table.set_cell(row, self.SCORE_COLUMN, score, warn, tip)
+        if not tip:
+            item = self.table.item(row, self.SCORE_COLUMN)
+            if item is not None:
+                item.setToolTip("")
 
     def set_uncertain_count(self, count: int) -> None:
         if count:
@@ -1517,9 +1833,8 @@ class SpotifyCard(Card):
         self.uncertain_label.setVisible(bool(count))
 
     def set_thumbnail(self, row: int, image: QImage) -> None:
-        item = self.table.item(row, self.MATCH_COLUMN)
-        if item is not None and not image.isNull():
-            item.setIcon(row_icon(image))
+        """Spotify's own art for the row. A YouTube match's picture never comes here."""
+        self.table.set_art(row, image)
 
     def _set_match_cells(self, row: int, label: str, diff: str, score: str, warn: bool) -> None:
         for column, text in (
@@ -1527,25 +1842,18 @@ class SpotifyCard(Card):
             (self.DIFF_COLUMN, diff),
             (self.SCORE_COLUMN, score),
         ):
-            item = QTableWidgetItem(text)
-            if warn:
-                item.setForeground(QColor("#e0a040"))
-            self.table.setItem(row, column, item)
+            self.table.set_cell(row, column, text, warn)
 
     def cell_text(self, row: int, column: int) -> str:
-        item = self.table.item(row, column)
-        return item.text() if item is not None else ""
+        return self.table.cell_text(row, column)
 
     def selected_rows(self) -> list[int]:
-        rows = []
-        for row in range(self.table.rowCount()):
-            box = self.checkbox(row)
-            if box is not None and box.isChecked():
-                rows.append(row)
-        return rows
+        return self.table.checked_rows()
 
     def set_all_checked(self, checked: bool) -> None:
-        for row in range(self.table.rowCount()):
-            box = self.checkbox(row)
-            if box is not None:
-                box.setChecked(checked)
+        self.table.set_all_checked(checked)
+
+    def set_download_count(self, count: int) -> None:
+        self.selection_label.setText(f"{count} selected")
+        self.download_button.setText(f"⬇  Download {count} selected")
+        self.download_button.setEnabled(count > 0)

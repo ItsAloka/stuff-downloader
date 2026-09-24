@@ -15,8 +15,16 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from PyQt6.QtCore import QItemSelectionModel, Qt, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QColor, QDesktopServices, QGuiApplication, QImage, QPixmap
+from PyQt6.QtCore import QItemSelectionModel, QSize, Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import (
+    QAction,
+    QColor,
+    QDesktopServices,
+    QGuiApplication,
+    QIcon,
+    QImage,
+    QPixmap,
+)
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -28,6 +36,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLayout,
     QLineEdit,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -35,6 +44,7 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -61,6 +71,7 @@ from ..core.runner import JobRun, WorkerRuntimeMissing
 from . import theme
 from .bridge import EventBridge
 from .thumbs import PREVIEW_BOX, ThumbnailLoader, decode_image, youtube_thumb_url
+from .thumbs import allowed as thumbs_allowed
 from .widgets import (
     Card,
     Chip,
@@ -72,13 +83,27 @@ from .widgets import (
     ResultCard,
     SiteLoginDialog,
     SpotifyCard,
+    art_placeholder,
     format_bytes,
     format_duration,
     format_eta,
     page_header,
     plain_tooltip,
+    row_icon,
     section_title,
 )
+
+# "Clear done ▾" (plan §5.8): what each choice removes from the queue. History keeps all.
+CLEAR_CHOICES = (
+    ("finished", "Finished"),
+    ("failed", "Cancelled && failed"),
+    ("all", "Everything not running"),
+)
+CLEAR_STATES = {
+    "finished": frozenset({"completed", "skipped"}),
+    "failed": frozenset({"failed", "cancelled"}),
+    "all": frozenset({"completed", "skipped", "failed", "cancelled"}),
+}
 
 JOB_CHIPS = {
     "queued": "Queued",
@@ -557,6 +582,29 @@ class GroupState:
     skipped: int = 0
 
 
+def unique_names(typed) -> dict:
+    """``{key: file name}`` for the (key, typed title) pairs that name a file (plan §5.5).
+
+    Untyped rows are left out, so they keep the default template. Two typed names that
+    sanitize to the same file (``a:b`` and ``a?b``) get ``(2)``… here, so the queue shows what
+    will be written; the worker still never overwrites.
+    """
+    names: dict = {}
+    used: set[str] = set()
+    for key, raw in typed:
+        base = safe_output_name(raw)
+        if base is None:
+            continue
+        name, n = base, 1
+        while name.casefold() in used:
+            n += 1
+            suffix = f" ({n})"
+            name = base[: MAX_STEM - len(suffix)].rstrip(" .") + suffix
+        used.add(name.casefold())
+        names[key] = name
+    return names
+
+
 class DownloadsPage(QWidget):
     # (title, message, state) for whoever owns a tray icon. The page never reaches for one
     # itself: it is constructed standalone in tests and must work without a window.
@@ -594,7 +642,7 @@ class DownloadsPage(QWidget):
         self.thumbs = ThumbnailLoader(parent=self)
         self.thumbs.loaded.connect(self._on_thumbnail)
         self._playlist_thumb_urls: list[str | None] = []
-        self._spotify_thumb_rows: dict[str, set[int]] = {}
+        self._playlist_cover_url: str | None = None
         self._job_thumbs: dict[str, str] = {}  # job id -> thumbnail url
         self._analyze_timer = QTimer(self)
         self._analyze_timer.setSingleShot(True)
@@ -667,15 +715,10 @@ class DownloadsPage(QWidget):
 
         self.playlist_card = PlaylistCard()
         self.playlist_card.hide()
-        for preset in presets.PRESETS:
-            if preset.kind == "audio":
-                self.playlist_card.preset_combo.addItem(preset.label, preset.id)
-        self.playlist_card.preset_combo.setCurrentIndex(
-            self.playlist_card.preset_combo.findData("mp3_music")
-        )
         self.playlist_card.table.verticalScrollBar().valueChanged.connect(
             self._request_visible_playlist_thumbs
         )
+        self.playlist_card.table.checks_changed.connect(self._update_playlist_selection)
         layout.addWidget(self.playlist_card)
 
         self.gallery_card = GalleryCard()
@@ -684,19 +727,34 @@ class DownloadsPage(QWidget):
 
         self.spotify_card = SpotifyCard()
         self.spotify_card.hide()
+        self.spotify_card.table.checks_changed.connect(self._update_spotify_selection)
         layout.addWidget(self.spotify_card)
 
         queue_header = QHBoxLayout()
         queue_header.addWidget(section_title("Queue"))
-        queue_header.addStretch(1)
         self.queue_summary = QLabel("Nothing running")
         self.queue_summary.setObjectName("muted")
+        self.queue_summary.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         self.pause_all_button = QPushButton("⏸  Pause all")
         self.pause_all_button.setObjectName("iconButton")
-        self.clear_queue_button = QPushButton("Clear finished")
+        self.cancel_remaining_button = QPushButton("✕  Cancel remaining")
+        self.cancel_remaining_button.setObjectName("iconButton")
+        self.cancel_remaining_button.setToolTip("Cancel every job that has not finished")
+        # "Clear done ▾" (plan §5.8): a click clears finished jobs; the arrow offers the rest.
+        self.clear_queue_button = QToolButton()
+        self.clear_queue_button.setText("Clear done")
+        self.clear_queue_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.clear_menu = QMenu(self.clear_queue_button)
+        self.clear_actions: dict[str, QAction] = {}
+        for which, label in CLEAR_CHOICES:
+            action = self.clear_menu.addAction(label)
+            action.triggered.connect(lambda _=False, w=which: self.clear_finished_jobs(w))
+            self.clear_actions[which] = action
+        self.clear_queue_button.setMenu(self.clear_menu)
         self.clear_queue_button.setEnabled(False)
-        queue_header.addWidget(self.queue_summary)
+        queue_header.addWidget(self.queue_summary, 1)
         queue_header.addWidget(self.pause_all_button)
+        queue_header.addWidget(self.cancel_remaining_button)
         queue_header.addWidget(self.clear_queue_button)
         layout.addLayout(queue_header)
 
@@ -722,7 +780,8 @@ class DownloadsPage(QWidget):
         self.login_button.clicked.connect(self.offer_site_login)
         self.result_card.download_requested.connect(self.start_row_download)
         self.result_card.playlist_button.clicked.connect(self.open_playlist)
-        self.clear_queue_button.clicked.connect(self.clear_finished_jobs)
+        self.clear_queue_button.clicked.connect(lambda: self.clear_finished_jobs("finished"))
+        self.cancel_remaining_button.clicked.connect(self.cancel_remaining)
         self.playlist_card.download_button.clicked.connect(self.start_playlist_download)
         self.gallery_card.download_button.clicked.connect(self.start_gallery_download)
         self.gallery_card.select_all_button.clicked.connect(
@@ -1105,32 +1164,47 @@ class DownloadsPage(QWidget):
         listing = playlist.parse_listing(data)
         self._listing = listing
         card = self.playlist_card
+        music = self._listing_is_music(listing)
         card.title_label.setText(listing.title)
-        meta = [listing.uploader, f"{len(listing.entries)} items"]
+        count = len(listing.entries)
+        noun = ("song" if music else "video") + ("" if count == 1 else "s")
+        meta = [listing.uploader, f"{count} {noun}"]
+        total = sum(e.duration or 0 for e in listing.entries)
+        if total:
+            meta.append(format_duration(total))
         if listing.truncated:
             meta.append(f"showing the first {playlist.MAX_ENTRIES}")
         card.meta_label.setText("  ·  ".join(m for m in meta if m))
-        card.set_entries(listing.entries)
+        card.set_entries(listing.entries, music=music)
         self._playlist_thumb_urls = [youtube_thumb_url(e.video_id) for e in listing.entries]
+        # The list's own cover: its first video's picture (square-cropped for a song list).
+        self._playlist_cover_url = next((u for u in self._playlist_thumb_urls if u), None)
+        self._show_playlist_cover()
         self._request_visible_playlist_thumbs()
-        self._reset_route_preset(card.preset_combo, playlist_mode=True)
+        default = presets.DEFAULT_MUSIC_BATCH if music else presets.DEFAULT_VIDEO_BATCH
+        card.format_combo.setCurrentIndex(card.format_combo.findData(default))
         card.filter_edit.clear()
         self._update_playlist_selection()
-        for row in range(card.table.rowCount()):
-            box = card.checkbox(row)
-            if box is not None:
-                box.toggled.connect(self._update_playlist_selection)
         self.result_card.hide()
         card.show()
+
+    def _listing_is_music(self, listing: playlist.Listing) -> bool:
+        """Songs (square art, MP3) or videos (16:9 art, MP4), from the listing and the link."""
+        return listing.music or (self._route is not None and self._route.music)
+
+    def _show_playlist_cover(self) -> None:
+        image = self.thumbs.cached(self._playlist_cover_url)
+        if image is not None:
+            self.playlist_card.header.set_cover(image)
+        else:
+            self.thumbs.request(self._playlist_cover_url)
 
     def _set_playlist_selection(self, checked: bool) -> None:
         self.playlist_card.set_all_checked(checked)
         self._update_playlist_selection()
 
     def _update_playlist_selection(self) -> None:
-        count = len(self.playlist_card.selected_rows())
-        self.playlist_card.selection_label.setText(f"{count} selected")
-        self.playlist_card.download_button.setEnabled(count > 0)
+        self.playlist_card.set_download_count(len(self.playlist_card.selected_rows()))
 
     def selected_playlist_entries(self) -> list[playlist.PlaylistEntry]:
         if self._listing is None:
@@ -1148,9 +1222,9 @@ class DownloadsPage(QWidget):
             listing,
             entries,
             output_dir,
-            self.playlist_card.preset_combo.currentData() or "mp3_music",
+            self.playlist_card.format_combo.currentData() or presets.DEFAULT_MUSIC_BATCH,
             archive=self.playlist_card.archive_check.isChecked(),
-            output_names=self._playlist_output_names(entries),
+            edited_titles=self._playlist_output_names(entries),
         )
         group_id = uuid.uuid4().hex
         source_url = self._route.playlist_url if self._route else ""
@@ -1159,9 +1233,17 @@ class DownloadsPage(QWidget):
         self.queue_layout.insertWidget(0, group_card)
         self._groups[group_id] = GroupState(group_card, len(specs), listing.title)
         jobs = []
+        table = self.playlist_card.table
+        rows = {value.index: i for i, value in enumerate(listing.entries)}
         for spec, entry in zip(specs, entries, strict=True):
-            job = self._add_job(spec, entry.title, group_id)
-            self._set_job_thumb(job, youtube_thumb_url(entry.video_id))
+            # The row's own picture follows it into the queue and History (plan §5.6a).
+            thumb = youtube_thumb_url(entry.video_id)
+            job = self._add_job(spec, entry.title, group_id, thumb_url=thumb, music=table.music)
+            art = table.art(rows.get(entry.index, -1))
+            if art is not None:
+                job.card.set_thumbnail(art)
+            else:
+                self._set_job_thumb(job, thumb)
             jobs.append(job)
         self.empty_state.hide()
         self.scheduler.submit_all(specs)
@@ -1169,27 +1251,12 @@ class DownloadsPage(QWidget):
         return jobs
 
     def _playlist_output_names(self, entries: list[playlist.PlaylistEntry]) -> dict[int, str]:
-        """Only the names the user typed; untouched rows keep the default template.
-
-        Two typed names that sanitize to the same file (``a:b`` and ``a?b``) get ``(2)``…
-        here, so the queue shows what will be written; the worker still never overwrites.
-        """
+        """Only the names the user typed, by entry index; untouched rows keep the default."""
         rows = {value.index: i for i, value in enumerate(self._listing.entries)}
-        names: dict[int, str] = {}
-        used: set[str] = set()
-        for entry in entries:
-            row = rows.get(entry.index, -1)
-            base = safe_output_name(self.playlist_card.output_name(row) if row >= 0 else None)
-            if base is None:
-                continue
-            name, n = base, 1
-            while name.casefold() in used:
-                n += 1
-                suffix = f" ({n})"
-                name = base[: MAX_STEM - len(suffix)].rstrip(" .") + suffix
-            used.add(name.casefold())
-            names[entry.index] = name
-        return names
+        return unique_names(
+            (entry.index, self.playlist_card.output_name(rows.get(entry.index, -1)))
+            for entry in entries
+        )
 
     # ── galleries (plan §M4) ─────────────────────────────────────────────────────────────
     def show_gallery(self, data: dict[str, Any]) -> None:
@@ -1253,7 +1320,6 @@ class DownloadsPage(QWidget):
         listing = spotify.parse_listing(data)
         self._spotify = listing
         self._spotify_matches = {}
-        self._spotify_thumb_rows = {}
         card = self.spotify_card
         card.title_label.setText(listing.title)
         kind = {"track": "Song", "album": "Album", "playlist": "Playlist"}.get(listing.kind, "")
@@ -1266,10 +1332,6 @@ class DownloadsPage(QWidget):
         card.meta_label.setText("  ·  ".join(m for m in meta if m))
         card.set_tracks(listing.tracks)
         card.set_uncertain_count(0)
-        for row in range(card.table.rowCount()):
-            box = card.checkbox(row)
-            if box is not None:
-                box.toggled.connect(self._update_spotify_selection)
         self._update_spotify_selection()
         self.result_card.hide()
         self.playlist_card.hide()
@@ -1284,7 +1346,6 @@ class DownloadsPage(QWidget):
         self._cancel_matches()
         self._spotify = None
         self._spotify_matches = {}
-        self._spotify_thumb_rows = {}
         self.spotify_card.hide()
 
     def _set_spotify_selection(self, checked: bool) -> None:
@@ -1298,8 +1359,8 @@ class DownloadsPage(QWidget):
         text = f"{count} selected"
         if checking:
             text += f"  ·  checking {checking} match{'es' if checking != 1 else ''}…"
+        card.set_download_count(count)
         card.selection_label.setText(text)
-        card.download_button.setEnabled(count > 0)
         card.match_button.setEnabled(count > 0)
 
     def selected_spotify_tracks(self) -> list[spotify.SpotifyTrack]:
@@ -1372,7 +1433,6 @@ class DownloadsPage(QWidget):
                 else:
                     self._spotify_matches[track.track_id] = match
                     self.spotify_card.set_match(row, match)
-                    self._request_spotify_thumb(row, match)
                     self._update_uncertain()
             else:
                 code = event.data.get("code")
@@ -1431,7 +1491,6 @@ class DownloadsPage(QWidget):
         match = spotify.with_candidates(match, candidates)
         self._spotify_matches[track.track_id] = match
         self.spotify_card.set_match(row, match)
-        self._request_spotify_thumb(row, match)
         self._update_uncertain()
         self._show_message("")
         return match
@@ -1460,6 +1519,10 @@ class DownloadsPage(QWidget):
             self._spotify_matches,
             str(self._settings.effective_download_dir()),
             archive=self.spotify_card.archive_check.isChecked(),
+            edited_titles=unique_names(
+                (t.track_id, self.spotify_card.table.edited_title(self._spotify_row(t)))
+                for t in tracks
+            ),
         )
         group_id = ""
         if len(specs) > 1:
@@ -1470,11 +1533,12 @@ class DownloadsPage(QWidget):
             self._groups[group_id] = GroupState(group_card, len(specs), listing.title)
         jobs = []
         for spec, track in zip(specs, tracks, strict=True):
-            title = f"{track.artist} - {track.title}" if track.artist else track.title
-            job = self._add_job(spec, title, group_id)
-            match = self._spotify_matches.get(track.track_id)
-            self._set_job_thumb(job, youtube_thumb_url(match.video_id) if match else None)
-            jobs.append(job)
+            title = spec.options.get("edited_title") or (
+                f"{track.artist} - {track.title}" if track.artist else track.title
+            )
+            # Spotify's art, not the YouTube match's picture, is the song's (plan §5.6a); it
+            # arrives with Spotify v2 (R6), so until then the card keeps its placeholder.
+            jobs.append(self._add_job(spec, title, group_id, music=True))
         self.empty_state.hide()
         self.scheduler.submit_all(specs)
         self._update_summary()
@@ -1492,19 +1556,6 @@ class DownloadsPage(QWidget):
             else:
                 self.thumbs.request(url)
 
-    def _request_spotify_thumb(self, row: int, match: spotify.Match) -> None:
-        url = youtube_thumb_url(match.video_id)
-        if url is None:
-            return
-        for rows in self._spotify_thumb_rows.values():
-            rows.discard(row)  # a changed match replaces the row's picture
-        self._spotify_thumb_rows.setdefault(url, set()).add(row)
-        image = self.thumbs.cached(url)
-        if image is not None:
-            self.spotify_card.set_thumbnail(row, image)
-        else:
-            self.thumbs.request(url)
-
     def _set_job_thumb(self, job: QueuedJob, url: str | None) -> None:
         if url is None:
             return
@@ -1516,23 +1567,26 @@ class DownloadsPage(QWidget):
             self.thumbs.request(url)
 
     def _on_thumbnail(self, url: str, image: QImage) -> None:
+        if url == self._playlist_cover_url:
+            self.playlist_card.header.set_cover(image)
         for row, row_url in enumerate(self._playlist_thumb_urls):
             if row_url == url:
                 self.playlist_card.set_thumbnail(row, image)
-        for row in self._spotify_thumb_rows.get(url, ()):
-            self.spotify_card.set_thumbnail(row, image)
         for job_id, job_url in self._job_thumbs.items():
             job = self.jobs.get(job_id)
             if job_url == url and job is not None:
                 job.card.set_thumbnail(image)
 
     # ── queue ────────────────────────────────────────────────────────────────────────────
-    def _clearable(self) -> list[str]:
-        """Finished cards the queue may drop: done, failed, cancelled or skipped.
+    def _clearable(self, which: str = "all") -> list[str]:
+        """Finished cards the queue may drop, for one "Clear done ▾" choice (plan §5.8).
 
-        A playlist's rows go only once the whole playlist has finished: its group row and final
-        notification are counted from the jobs still in the queue.
+        ``which`` is "finished" (done or already had), "failed" (cancelled or failed) or
+        "all" (everything not running). A playlist's rows go only once the whole playlist has
+        finished: its group row and final notification are counted from the jobs still in
+        the queue.
         """
+        states = CLEAR_STATES[which]
         open_groups = {
             job.group_id
             for job in self.jobs.values()
@@ -1541,12 +1595,12 @@ class DownloadsPage(QWidget):
         return [
             job_id
             for job_id, job in self.jobs.items()
-            if job.state in TERMINAL_STATES and job.group_id not in open_groups
+            if job.state in states and job.group_id not in open_groups
         ]
 
-    def clear_finished_jobs(self) -> None:
+    def clear_finished_jobs(self, which: str = "all") -> None:
         """Remove finished queue cards only; durable history is intentionally retained."""
-        for job_id in self._clearable():
+        for job_id in self._clearable(which):
             self._cancel_retry_timer(job_id)
             self._job_thumbs.pop(job_id, None)
             job = self.jobs.pop(job_id)
@@ -1561,9 +1615,20 @@ class DownloadsPage(QWidget):
             self.empty_state.show()
         self._update_summary()
 
-    def _new_card(self, title: str, job_id: str) -> JobCard:
+    def cancel_remaining(self) -> int:
+        """Cancel every job that has not finished. Returns how many were asked to stop."""
+        open_ids = [
+            job_id
+            for job_id, job in self.jobs.items()
+            if job.state in ("active", "queued", "retrying", "paused")
+        ]
+        for job_id in open_ids:
+            self.cancel_job(job_id)
+        return len(open_ids)
+
+    def _new_card(self, title: str, job_id: str, music: bool = False) -> JobCard:
         """A queue row wired to the actions for one job id."""
-        job_card = JobCard()
+        job_card = JobCard(music)
         job_card.job_id = job_id
         job_card.title_label.setText(title)
         job_card.reorder_requested.connect(self.reorder_queue)
@@ -1574,7 +1639,14 @@ class DownloadsPage(QWidget):
         job_card.folder_button.clicked.connect(lambda: self.show_in_folder(job_id))
         return job_card
 
-    def _add_job(self, spec: JobSpec, title: str, group_id: str = "") -> QueuedJob:
+    def _add_job(
+        self,
+        spec: JobSpec,
+        title: str,
+        group_id: str = "",
+        thumb_url: str | None = None,
+        music: bool | None = None,
+    ) -> QueuedJob:
         """Create the row and record the job as queued. The scheduler decides when it runs.
 
         Every job that reaches history passes through here, so the title is made safe here
@@ -1582,13 +1654,17 @@ class DownloadsPage(QWidget):
         """
         job_id = spec.job_id
         title = safe_job_title(title, spec.url)
-        job_card = self._new_card(title, job_id)
+        if music is None:
+            music = job_kind(spec.options) == "audio"
+        job_card = self._new_card(title, job_id, music)
         job = QueuedJob(spec, title, job_card, state="queued", group_id=group_id)
         self.jobs[job_id] = job
         self.queue_layout.insertWidget(0, job_card)
         job_card.set_state(JOB_CHIPS["queued"], "queued")
         job_card.set_draggable(True)
         job_card.details_label.setText(job_label(spec.options))
+        if thumb_url:
+            self._job_thumbs[job_id] = thumb_url
         self._record_job(spec, title, group_id)
         return job
 
@@ -1611,6 +1687,8 @@ class DownloadsPage(QWidget):
             title=safe_job_title(title, spec.url),
             group_id=group_id,
             url_redacted=redacted,
+            # Only a link this page built from a validated video id (thumbs.youtube_thumb_url).
+            thumb_url=self._job_thumbs.get(spec.job_id, ""),
         )
 
     def _start_run(self, spec: JobSpec) -> None:
@@ -1686,14 +1764,17 @@ class DownloadsPage(QWidget):
                 options=record.options,
             )
             title = safe_job_title(record.title, record.url)
+            music = job_kind(record.options) == "audio"
             job = QueuedJob(
                 spec,
                 title,
-                self._new_card(title, spec.job_id),
+                self._new_card(title, spec.job_id, music),
                 state="paused",
                 group_id=record.group_id,
             )
             self.jobs[spec.job_id] = job
+            if thumbs_allowed(record.thumb_url):
+                self._set_job_thumb(job, record.thumb_url)
             self.queue_layout.insertWidget(0, job.card)
             self.scheduler.submit_paused(spec)
             self._apply_finished_card(job, "paused", "Paused — resume to continue")
@@ -1725,12 +1806,26 @@ class DownloadsPage(QWidget):
             options=options,
         )
         title = edited or self._info.get("title")
-        job = self._add_job(spec, safe_job_title(title, self._route.url))
+        job = self._add_job(
+            spec, safe_job_title(title, self._route.url), thumb_url=self._result_thumb_url()
+        )
         if self._thumb is not None:  # the analyzed cover, or the direct image itself
             job.card.set_thumbnail(self._thumb.toImage())
         self.empty_state.hide()
         self.scheduler.submit(spec)
         return job
+
+    def _result_thumb_url(self) -> str | None:
+        """The History picture for a YouTube result: its thumbnail, from the validated id.
+
+        Other sites' pictures reach the app only as worker-fetched bytes, never as a link the
+        app may fetch again later, so their History rows keep the placeholder.
+        """
+        host = (urlsplit(self._route.url).hostname or "").lower() if self._route else ""
+        if host == "youtu.be" or host == "youtube.com" or host.endswith(".youtube.com"):
+            video_id = self._info.get("id")
+            return youtube_thumb_url(video_id if isinstance(video_id, str) else None)
+        return None
 
     def start_download(self) -> QueuedJob | None:
         """Download the ★ row of the tab on show (the first row when none is marked)."""
@@ -1763,7 +1858,9 @@ class DownloadsPage(QWidget):
             output_dir=record.output_dir or str(self._settings.effective_download_dir()),
             options=dict(record.options),
         )
-        job = self._add_job(spec, safe_job_title(record.title, record.url))
+        thumb = record.thumb_url if thumbs_allowed(record.thumb_url) else None
+        job = self._add_job(spec, safe_job_title(record.title, record.url), thumb_url=thumb)
+        self._set_job_thumb(job, thumb)
         self.empty_state.hide()
         self.scheduler.submit(spec)
         self._update_summary()
@@ -1772,7 +1869,7 @@ class DownloadsPage(QWidget):
     def _launch(self, job: QueuedJob) -> None:
         self.jobs[job.spec.job_id] = job
         card = job.card
-        card.pause_button.setText("⏸  Pause")
+        card.set_paused(False)
         card.pause_button.show()
         job.files = []
         card.set_progress(0)
@@ -1888,7 +1985,7 @@ class DownloadsPage(QWidget):
         card.cancel_button.setVisible(True)
         card.cancel_button.setEnabled(True)
         card.pause_button.setVisible(True)
-        card.pause_button.setText("⏸  Pause")
+        card.set_paused(False)
         card.retry_button.hide()
         card.open_button.hide()
         card.folder_button.hide()
@@ -1980,7 +2077,7 @@ class DownloadsPage(QWidget):
         card.cancel_button.setVisible(state == "paused")
         card.cancel_button.setEnabled(True)
         card.pause_button.setVisible(state == "paused")
-        card.pause_button.setText("▶  Resume")
+        card.set_paused(True)
         card.retry_button.setVisible(state in ("failed", "cancelled"))
         # A completed job always shows its file actions; they are disabled, with the reason
         # as a tooltip, when the final file is not there.
@@ -2065,6 +2162,11 @@ class DownloadsPage(QWidget):
             bool(counts.get("active") or counts.get("queued"))
         )
         self.clear_queue_button.setEnabled(bool(self._clearable()))
+        for which, action in self.clear_actions.items():
+            action.setEnabled(bool(self._clearable(which)))
+        self.cancel_remaining_button.setEnabled(
+            any(counts.get(k) for k in ("active", "queued", "retrying", "paused"))
+        )
 
     def _on_event(self, event: Event) -> None:
         if self._analyze_job_id and event.job_id == self._analyze_job_id:
@@ -2167,6 +2269,10 @@ HISTORY_STATE_LABELS = {
 }
 
 
+HISTORY_ART = QSize(64, 36)
+HISTORY_ART_MUSIC = QSize(36, 36)
+
+
 class HistoryPage(QWidget):
     """Finished jobs: search, open the file, or remove the entry (never the file)."""
 
@@ -2221,6 +2327,13 @@ class HistoryPage(QWidget):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         for column in range(1, len(self.COLUMNS)):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        # The picture the job had in the queue (plan §5.6a), beside its title.
+        self.table.setIconSize(HISTORY_ART)
+        self.table.verticalHeader().setDefaultSectionSize(HISTORY_ART.height() + 10)
+        self.table.setWordWrap(False)
+        self.thumbs = ThumbnailLoader(parent=self)
+        self.thumbs.loaded.connect(self._on_thumbnail)
+        self.table.verticalScrollBar().valueChanged.connect(lambda _: self._request_visible_art())
         layout.addWidget(self.table, 1)
 
         actions = QHBoxLayout()
@@ -2273,6 +2386,8 @@ class HistoryPage(QWidget):
             )
             for column, text in enumerate(cells):
                 self.table.setItem(row, column, QTableWidgetItem(text))
+            self.table.item(row, 0).setIcon(self._placeholder(record))
+        self._request_visible_art()
         self.table.clearSelection()
         select_row = (
             QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
@@ -2283,6 +2398,41 @@ class HistoryPage(QWidget):
                     self.table.model().index(row, 0), select_row
                 )
         self.empty_label.setVisible(not self._records)
+
+    def _placeholder(self, record: history.JobRecord) -> QIcon:
+        music = self._record_type(record) == "audio"
+        return QIcon(art_placeholder(self._art_size(record), music))
+
+    def _art_size(self, record: history.JobRecord) -> QSize:
+        return HISTORY_ART_MUSIC if self._record_type(record) == "audio" else HISTORY_ART
+
+    def _request_visible_art(self) -> None:
+        """Lazy, like the playlist rows: only rows on screen fetch their picture."""
+        count = self.table.rowCount()
+        if not count:
+            return
+        first = max(self.table.rowAt(0), 0)
+        last = self.table.rowAt(self.table.viewport().height() - 1)
+        last = count - 1 if last < 0 else last
+        for row in range(first, min(count, last + 6, len(self._records))):
+            url = self._records[row].thumb_url
+            if not thumbs_allowed(url):
+                continue
+            image = self.thumbs.cached(url)
+            if image is not None:
+                self._set_art(row, image)
+            else:
+                self.thumbs.request(url)
+
+    def _set_art(self, row: int, image: QImage) -> None:
+        item = self.table.item(row, 0)
+        if item is not None and row < len(self._records):
+            item.setIcon(row_icon(image, self._art_size(self._records[row])))
+
+    def _on_thumbnail(self, url: str, image: QImage) -> None:
+        for row, record in enumerate(self._records):
+            if record.thumb_url == url:
+                self._set_art(row, image)
 
     @staticmethod
     def _record_type(record: history.JobRecord) -> str:

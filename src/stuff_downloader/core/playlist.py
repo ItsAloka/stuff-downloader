@@ -42,6 +42,8 @@ class Listing:
     entries: tuple[PlaylistEntry, ...]
     uploader: str = ""
     truncated: bool = False
+    music: bool = False  # songs: square art, MP3 by default (plan §5.6a)
+    album: bool = False  # an album: positions are track numbers (plan §5.7)
 
     @property
     def selectable(self) -> tuple[PlaylistEntry, ...]:
@@ -88,6 +90,8 @@ def parse_listing(data: Any) -> Listing:
         entries=tuple(entries),
         uploader=_text(data.get("uploader")),
         truncated=bool(data.get("truncated")),
+        music=data.get("music") is True,
+        album=data.get("is_album") is True,
     )
 
 
@@ -95,23 +99,29 @@ def batch_specs(
     listing: Listing,
     entries: list[PlaylistEntry],
     output_dir: str,
-    preset_id: str,
+    row_id: str,
     archive: bool = True,
-    crop_cover: bool = True,
-    output_names: dict[int, str] | None = None,
+    edited_titles: dict[int, str] | None = None,
 ) -> list[JobSpec]:
-    """One JobSpec per selected entry. Each is an ordinary single-video job."""
+    """One JobSpec per selected entry: an ordinary row download in the playlist's folder.
+
+    ``row_id`` is one of ``presets.BATCH_CHOICES``. An edited title names the file only; the
+    tags keep the source's own title and album (plan §5.5, §5.7).
+    """
+    _, tab, row_id, container = presets.batch_choice(row_id)
     count = len(listing.entries)
     specs = []
     for entry in entries:
-        options = presets.download_options(
-            preset_id,
-            crop_cover=crop_cover,
+        options = presets.row_download_options(
+            tab,
+            row_id,
+            container,
+            (edited_titles or {}).get(entry.index),
             playlist_index=entry.index,
             playlist_title=listing.title,
             playlist_count=count,
+            album_order=listing.album,
             archive=archive,
-            output_name=(output_names or {}).get(entry.index),
         )
         specs.append(
             JobSpec(

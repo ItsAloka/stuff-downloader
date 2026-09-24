@@ -565,8 +565,18 @@ def sanitize_entry(entry: Any, index: int) -> dict[str, Any] | None:
     return row
 
 
-def sanitize_playlist(info: dict[str, Any]) -> dict[str, Any]:
-    """A flat playlist extraction, reduced to fields the GUI can safely display."""
+# YouTube Music album lists ("OLAK5uy_…") keep the album's own order; auto-generated music
+# mixes ("RDCLAK…") are songs too, but in no album order.
+_ALBUM_LIST_PREFIX = "OLAK5uy_"
+_MUSIC_LIST_PREFIXES = (_ALBUM_LIST_PREFIX, "RDCLAK")
+
+
+def sanitize_playlist(info: dict[str, Any], url: str = "") -> dict[str, Any]:
+    """A flat playlist extraction, reduced to fields the GUI can safely display.
+
+    ``music`` picks the table layout (square song art rather than 16:9 video art) and
+    ``is_album`` says the positions are album track numbers (plan §5.6a, §5.7).
+    """
     raw_entries = info.get("entries") or []
     entries = []
     for raw in raw_entries[:MAX_PLAYLIST_ENTRIES]:
@@ -574,9 +584,17 @@ def sanitize_playlist(info: dict[str, Any]) -> dict[str, Any]:
         if row is not None:
             entries.append(row)
     playlist_id = info.get("id")
+    playlist_id = playlist_id if isinstance(playlist_id, str) else ""
+    try:
+        host = (urlsplit(url).hostname or "").lower()
+    except ValueError:
+        host = ""
+    album = playlist_id.startswith(_ALBUM_LIST_PREFIX)
     return {
         "kind": "playlist",
-        "playlist_id": playlist_id if isinstance(playlist_id, str) else "",
+        "playlist_id": playlist_id,
+        "music": album or host in _MUSIC_HOSTS or playlist_id.startswith(_MUSIC_LIST_PREFIXES),
+        "is_album": album,
         "title": _short_text(info.get("title")) or "Playlist",
         "uploader": _short_text(info.get("uploader") or info.get("channel")),
         "entries": entries,
@@ -715,7 +733,7 @@ class YtDlpEngine:
                 if mode == "playlist":
                     if not is_playlist:
                         raise EngineError("unsupported", "that link is not a playlist")
-                    listing = sanitize_playlist(info)
+                    listing = sanitize_playlist(info, job.url)
                     listing["engine_version"] = yt_dlp.version.__version__
                     emit("stage", {"stage": "completed"})
                     return playlist_result(listing, job.url)
@@ -852,6 +870,8 @@ class YtDlpEngine:
             )
             return skipped
         stage("downloading")
+        if request.preset in ("mp3_music", "audio_original"):
+            tagging.fill_artist(info)
         claim = YtDlpEngine._claim_name(ydl, info)
         try:
             done = ydl.process_ie_result(info, download=True)
@@ -893,12 +913,12 @@ class YtDlpEngine:
                 if p.lower().endswith(".mp3") and (not claim or Path(p).stem == claim[0])
             ]
             if mp3s:
+                album = request.album_order
                 result["tags"] = tagging.verify_mp3(
                     mp3s[0],
                     info,
-                    album=request.playlist_title,
-                    track_number=request.playlist_index,
-                    track_total=request.playlist_count,
+                    track_number=request.playlist_index if album else None,
+                    track_total=request.playlist_count if album else None,
                 )
         stage("completed")
         return result

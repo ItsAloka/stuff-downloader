@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import QScrollArea, QSizePolicy
 
 from stuff_downloader.core import playlist, router, settings
 from stuff_downloader.gui.pages import DownloadsPage
-from stuff_downloader.gui.widgets import JobCard, PlaylistCard, ResultCard, SpotifyCard
+from stuff_downloader.gui.widgets import JobCard, PlaylistCard, ResultCard, SpotifyCard, TrackTable
 from stuff_downloader_worker.engines import ytdlp as worker_ytdlp
 
 FIXTURE = Path(__file__).resolve().parents[1] / "unit" / "fixtures" / "youtube_video.json"
@@ -98,7 +98,7 @@ def test_playlist_controls_are_below_a_six_row_table(qtbot):
     assert card.table.height() >= card.table.horizontalHeader().height() + 6 * 30
     assert card.select_all_button.geometry().top() > table_bottom
     assert card.filter_edit.geometry().top() > table_bottom
-    assert card.preset_combo.geometry().top() > table_bottom
+    assert card.format_combo.geometry().top() > table_bottom
     assert card.download_button.geometry().top() > table_bottom
 
 
@@ -147,7 +147,7 @@ def test_playlist_titles_are_edited_in_place_and_there_is_no_file_name_column(qt
     assert "File name" not in headers
     title = card.table.item(0, card.TITLE_COLUMN)
     assert title.flags() & Qt.ItemFlag.ItemIsEditable
-    assert not card.table.item(0, 3).flags() & Qt.ItemFlag.ItemIsEditable
+    assert not card.table.item(0, TrackTable.ARTIST).flags() & Qt.ItemFlag.ItemIsEditable
     assert card.output_name(0) is None
     title.setText("My name")
     assert card.output_name(0) == "My name"

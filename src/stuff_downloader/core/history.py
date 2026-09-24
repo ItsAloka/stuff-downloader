@@ -86,6 +86,9 @@ class JobRecord:
     # True when the stored url had a query or fragment removed before it was written, so it
     # identifies the page but cannot be replayed. See Store._migrate and DownloadsPage.
     url_redacted: bool = False
+    # The picture the queue card showed (plan §5.6a). Only ever an https link the GUI built
+    # itself from a validated id; the GUI checks it again before fetching it.
+    thumb_url: str = ""
     total_bytes: int = 0
     files: list[str] = field(default_factory=list)
     created_at: float = 0.0
@@ -147,6 +150,11 @@ class Store:
                     "ALTER TABLE jobs ADD COLUMN url_redacted INTEGER NOT NULL DEFAULT 0"
                 )
                 self._redact_existing_urls()
+        # Row pictures (R5) live beside the jobs rather than in a new column, so the schema
+        # version, which older builds refuse to open when newer, does not move for them.
+        self._conn.execute(
+            "CREATE TABLE IF NOT EXISTS job_thumbs (job_id TEXT PRIMARY KEY, url TEXT NOT NULL)"
+        )
         self._conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
         self._conn.commit()
 
@@ -202,6 +210,7 @@ class Store:
         group_id: str = "",
         state: str = "queued",
         url_redacted: bool = False,
+        thumb_url: str = "",
     ) -> None:
         now = time.time()
         with self._lock:
@@ -230,6 +239,11 @@ class Store:
                     now,
                 ),
             )
+            if thumb_url.startswith("https://"):
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO job_thumbs (job_id, url) VALUES (?, ?)",
+                    (job_id, thumb_url[:500]),
+                )
             self._conn.commit()
 
     def set_state(
@@ -311,6 +325,7 @@ class Store:
         with self._lock:
             rows = [(job_id,) for job_id in ids]
             self._conn.executemany("DELETE FROM job_files WHERE job_id = ?", rows)
+            self._conn.executemany("DELETE FROM job_thumbs WHERE job_id = ?", rows)
             self._conn.executemany("DELETE FROM jobs WHERE job_id = ?", rows)
             self._conn.commit()
 
@@ -351,6 +366,10 @@ class Store:
                         "SELECT path FROM job_files WHERE job_id = ?", (record.job_id,)
                     )
                 ]
+                thumb = self._conn.execute(
+                    "SELECT url FROM job_thumbs WHERE job_id = ?", (record.job_id,)
+                ).fetchone()
+                record.thumb_url = thumb["url"] if thumb else ""
         return records
 
     def get(self, job_id: str) -> JobRecord | None:

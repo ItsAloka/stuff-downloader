@@ -138,7 +138,7 @@ def test_batch_specs_number_each_item_and_carry_the_playlist_name():
     listing = playlist.parse_listing(
         listing_payload(entries=[{"id": VID, "title": f"t{i}"} for i in range(3)])
     )
-    specs = playlist.batch_specs(listing, list(listing.entries), "C:/dl", "mp3_music")
+    specs = playlist.batch_specs(listing, list(listing.entries), "C:/dl", "a:mp3:320")
     assert len(specs) == 3
     assert len({s.job_id for s in specs}) == 3  # each item is its own job
     assert [s.options["playlist_index"] for s in specs] == [1, 2, 3]
@@ -151,21 +151,60 @@ def test_batch_specs_number_each_item_and_carry_the_playlist_name():
 def test_batch_specs_can_re_download_ignoring_the_archive():
     listing = playlist.parse_listing(listing_payload())
     specs = playlist.batch_specs(
-        listing, [listing.entries[0]], "C:/dl", "mp3_music", archive=False
+        listing, [listing.entries[0]], "C:/dl", "a:mp3:320", archive=False
     )
     assert "archive" not in specs[0].options
 
 
-def test_batch_options_match_what_a_single_video_job_sends():
+def test_batch_options_match_what_a_single_row_job_sends():
     listing = playlist.parse_listing(listing_payload())
-    spec = playlist.batch_specs(listing, [listing.entries[0]], "C:/dl", "mp3_music")[0]
-    single = presets.download_options("mp3_music")
+    spec = playlist.batch_specs(listing, [listing.entries[0]], "C:/dl", "a:mp3:320")[0]
+    single = presets.row_download_options("audio", "a:mp3:320")
+    assert {k: spec.options[k] for k in single} == single
     assert set(spec.options) - set(single) == {
         "playlist_index",
         "playlist_title",
         "playlist_count",
         "archive",
     }
+
+
+@pytest.mark.parametrize("label, tab, row_id, container", presets.BATCH_CHOICES)
+def test_every_batch_format_is_a_row_the_worker_accepts(label, tab, row_id, container):
+    from stuff_downloader_worker import presets as worker_presets
+
+    listing = playlist.parse_listing(listing_payload())
+    spec = playlist.batch_specs(listing, [listing.entries[0]], "C:/dl", row_id)[0]
+    request = worker_presets.parse_row_request(spec.options)
+    assert (request.tab, request.row_id, request.container) == (tab, row_id, container)
+    assert request.in_playlist and request.playlist_title == "Chill Mix"
+
+
+def test_an_unknown_batch_format_is_refused():
+    listing = playlist.parse_listing(listing_payload())
+    with pytest.raises(ValueError, match="unknown batch format"):
+        playlist.batch_specs(listing, list(listing.entries), "C:/dl", "mp3_music")
+
+
+def test_an_edited_title_names_the_file_only():
+    listing = playlist.parse_listing(listing_payload())
+    entry = listing.entries[0]
+    spec = playlist.batch_specs(
+        listing, [entry], "C:/dl", "a:mp3:320", edited_titles={entry.index: "My name"}
+    )[0]
+    assert spec.options["edited_title"] == "My name"
+    assert "output_name" not in spec.options  # no second naming path
+
+
+def test_only_an_album_list_asks_for_track_numbers():
+    plain = playlist.parse_listing(listing_payload())
+    album = playlist.parse_listing(listing_payload(is_album=True, music=True))
+    assert not plain.album and not plain.music
+    assert album.album and album.music
+    plain_spec = playlist.batch_specs(plain, [plain.entries[0]], "C:/dl", "a:mp3:320")[0]
+    album_spec = playlist.batch_specs(album, [album.entries[0]], "C:/dl", "a:mp3:320")[0]
+    assert "album_order" not in plain_spec.options
+    assert album_spec.options["album_order"] is True
 
 
 def test_core_refuses_an_out_of_range_playlist_index():

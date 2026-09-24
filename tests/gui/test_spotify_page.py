@@ -8,7 +8,7 @@ from stuff_downloader.core import protocol, settings, spotify, tools
 from stuff_downloader.core.protocol import Event
 from stuff_downloader.gui import pages
 from stuff_downloader.gui.main_window import MainWindow
-from stuff_downloader.gui.widgets import SpotifyCard
+from stuff_downloader.gui.widgets import SpotifyCard, TrackTable
 
 T1, T2, T3 = "6OmhkSOpvYBokMKQxpIGx2", "2iblMMIgSznA464mNov7A8", "4yOn1TEcfsKHUJCL2h1r8I"
 ALBUM = "4aawyAB9vmqN3uQ7FjRGTy"
@@ -127,8 +127,9 @@ def test_the_listing_shows_every_track_ticked_and_says_the_audio_is_matched(page
     assert card.title_label.text() == "Global Warming"
     assert "Album" in card.meta_label.text() and "3 songs" in card.meta_label.text()
     assert card.table.rowCount() == 3 and card.selected_rows() == [0, 1, 2]
-    assert card.cell_text(0, 2) == "Global Warming  🅴"
-    assert card.cell_text(1, 3) == "Pitbull, TJR" and card.cell_text(1, 4) == "3:26"
+    assert card.cell_text(0, TrackTable.TITLE) == "Global Warming  🅴"
+    assert card.cell_text(1, TrackTable.ARTIST) == "Pitbull, TJR"
+    assert card.cell_text(1, TrackTable.LENGTH) == "3:26"
     assert card.cell_text(0, SpotifyCard.MATCH_COLUMN) == SpotifyCard.NOT_CHECKED
     # The disclosure is not optional small print: it is in the card, in plain words.
     text = card.disclosure_label.text()
@@ -192,7 +193,7 @@ def test_checking_matches_runs_a_few_lookups_at_a_time_and_fills_rows_as_they_la
 def test_matches_are_not_looked_up_twice(page, runs, qtbot):
     _analyzed(page, runs, qtbot)
     page.spotify_card.set_all_checked(False)
-    page.spotify_card.checkbox(0).setChecked(True)
+    page.spotify_card.table.set_checked(0, True)
     assert page.check_spotify_matches() == 1
     assert page.check_spotify_matches() == 0  # already running
     _match_runs(runs)[0].emit("result", **match_result(T1))
@@ -212,7 +213,7 @@ def test_matches_are_not_looked_up_twice(page, runs, qtbot):
 def test_a_failed_or_unusable_lookup_says_so_on_its_row(page, runs, qtbot, event, data, expected):
     _analyzed(page, runs, qtbot)
     page.spotify_card.set_all_checked(False)
-    page.spotify_card.checkbox(0).setChecked(True)
+    page.spotify_card.table.set_checked(0, True)
     page.check_spotify_matches()
     _match_runs(runs)[0].emit(event, **data)
     qtbot.waitUntil(lambda: not page._match_runs)
@@ -223,7 +224,7 @@ def test_a_failed_or_unusable_lookup_says_so_on_its_row(page, runs, qtbot, event
 def test_a_suspicious_match_is_flagged(page, runs, qtbot):
     _analyzed(page, runs, qtbot)
     page.spotify_card.set_all_checked(False)
-    page.spotify_card.checkbox(0).setChecked(True)
+    page.spotify_card.table.set_checked(0, True)
     page.check_spotify_matches()
     _match_runs(runs)[0].emit("result", **match_result(T1, duration=3600.0, confidence=40))
     qtbot.waitUntil(lambda: T1 in page._spotify_matches)
@@ -301,7 +302,7 @@ def test_ticked_songs_queue_as_one_group_carrying_their_reviewed_matches(
     page, runs, qtbot, monkeypatch
 ):
     _analyzed(page, runs, qtbot)
-    page.spotify_card.checkbox(1).setChecked(False)
+    page.spotify_card.table.set_checked(1, False)
     page.check_spotify_matches()
     _match_runs(runs)[0].emit("result", **match_result(T1))
     qtbot.waitUntil(lambda: T1 in page._spotify_matches)
@@ -333,7 +334,7 @@ def test_ticked_songs_queue_as_one_group_carrying_their_reviewed_matches(
 def test_an_unreviewed_song_is_queued_for_the_worker_to_match(page, runs, qtbot):
     _analyzed(page, runs, qtbot)
     page.spotify_card.set_all_checked(False)
-    page.spotify_card.checkbox(1).setChecked(True)
+    page.spotify_card.table.set_checked(1, True)
     page.spotify_card.archive_check.setChecked(False)
     (job,) = page.start_spotify_download()
     assert job.spec.options == {"mode": "download", "preset": "spotify_mp3", "archive": False}
@@ -351,7 +352,7 @@ def test_nothing_ticked_means_no_download(page, runs, qtbot):
 def test_a_spotify_job_restores_after_a_restart_and_downloads_again(page, runs, qtbot):
     _analyzed(page, runs, qtbot)
     page.spotify_card.set_all_checked(False)
-    page.spotify_card.checkbox(0).setChecked(True)
+    page.spotify_card.table.set_checked(0, True)
     (job,) = page.start_spotify_download()
     # What the next start-up does: unfinished jobs come back paused, and a Spotify one must not
     # be dropped for having a preset the video presets do not know.
@@ -376,10 +377,10 @@ def test_tooltips_show_uploader_text_literally(page, runs, qtbot):
     )
     from PyQt6.QtGui import QTextDocument
 
-    tip = page.spotify_card.table.item(0, 2).toolTip()
+    tip = page.spotify_card.table.item(0, TrackTable.TITLE).toolTip()
     doc = QTextDocument()
     doc.setHtml(tip)
-    assert doc.toPlainText() == hostile  # rendered as the characters it is
+    assert doc.toPlainText().splitlines()[0] == hostile  # rendered as the characters it is
     assert "<img" not in tip and "<a " not in tip
 
 
@@ -401,3 +402,45 @@ def test_tooltips_show_uploader_text_literally(page, runs, qtbot):
 def test_a_youtube_stream_403_is_retried_but_a_page_403_is_not(message, expected):
     """Seen live: one playlist song failed with the first, then downloaded on a retry."""
     assert pages.is_retryable(message) is expected
+
+
+# ── R5 §5.5: a Spotify title is edited in place and names the file only ─────────────────────
+def test_every_spotify_title_is_editable_in_place(page, runs, qtbot):
+    from PyQt6.QtCore import Qt
+
+    from stuff_downloader.gui.widgets import TrackTable
+
+    _analyzed(page, runs, qtbot)
+    table = page.spotify_card.table
+    header = table.horizontalHeaderItem(TrackTable.TITLE).text()
+    assert header == "Title (click to edit)"
+    for row in range(table.rowCount()):
+        assert table.item(row, TrackTable.TITLE).flags() & Qt.ItemFlag.ItemIsEditable
+
+
+def test_an_edited_spotify_title_reaches_its_job_and_nothing_else(page, runs, qtbot):
+    from stuff_downloader.gui.widgets import TrackTable
+
+    _analyzed(page, runs, qtbot)
+    table = page.spotify_card.table
+    table.item(0, TrackTable.TITLE).setText("My name  🅴")  # the explicit badge is not a name
+    table.item(1, TrackTable.TITLE).setText("  ")
+    table.item(2, TrackTable.TITLE).setText("a:b")
+    assert table.edited_title(0) == "My name"
+    specs = [j.spec for j in page.start_spotify_download()]
+    assert specs[0].options["edited_title"] == "My name"
+    assert "edited_title" not in specs[1].options
+    assert specs[2].options["edited_title"] == "a_b"
+    assert specs[1].options == spotify.download_options(archive=True)
+
+
+def test_the_spotify_worker_names_the_file_from_the_edit_but_validates_it():
+    from stuff_downloader_worker.engines import spotdl
+    from stuff_downloader_worker.engines.base import EngineError
+
+    opts = spotify.download_options(archive=False, edited_title="My name")
+    assert spotdl.parse_download_options(opts) == (None, False)
+    assert spotdl.edited_stem(opts) == "My name"
+    assert spotdl.edited_stem(spotify.download_options()) is None
+    with pytest.raises(EngineError, match="edited_title"):
+        spotdl.parse_download_options({**opts, "edited_title": "x" * 301})

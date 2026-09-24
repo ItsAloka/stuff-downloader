@@ -5,6 +5,8 @@ from __future__ import annotations
 from test_main_window import _analyzed
 from test_playlist_queue import expand, listing, runs, window  # noqa: F401  (fixtures)
 
+from stuff_downloader.gui.widgets import TrackTable
+
 
 def _download_playlist(page):
     return [job.spec for job in page.start_playlist_download()]
@@ -45,8 +47,9 @@ def test_an_edited_playlist_row_reaches_its_job_spec(window, runs):  # noqa: F81
     _edit_title(page, 2, " ")
     specs = _download_playlist(page)
     by_index = {s.options["playlist_index"]: s.options for s in specs}
-    assert by_index[2]["output_name"] == "Renamed"
-    assert "output_name" not in by_index[1] and "output_name" not in by_index[3]
+    assert by_index[2]["edited_title"] == "Renamed"
+    assert "edited_title" not in by_index[1] and "edited_title" not in by_index[3]
+    assert not any("output_name" in options for options in by_index.values())
 
 
 def test_a_title_edited_back_to_the_original_is_not_a_name(window, runs):  # noqa: F811
@@ -89,4 +92,4 @@ def test_no_file_name_column_or_field_appears_anywhere(window, runs, qtbot):  # 
         assert label.text().strip().lower() != "file name"
     for edit in window.findChildren(QLineEdit):
         assert "file name" not in edit.placeholderText().lower()
-    assert page.playlist_card.table.columnCount() == len(page.playlist_card.COLUMNS)
+    assert page.playlist_card.table.columnCount() == len(TrackTable.BASE_COLUMNS)

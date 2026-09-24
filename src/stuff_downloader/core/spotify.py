@@ -318,8 +318,12 @@ def match_options() -> dict[str, Any]:
     return {"mode": "match"}
 
 
-def download_options(video_id: str | None = None, archive: bool = True) -> dict[str, Any]:
+def download_options(
+    video_id: str | None = None, archive: bool = True, edited_title: str | None = None
+) -> dict[str, Any]:
     """The job ``options`` for one track's download. Mirrors the worker's validation exactly.
+
+    ``edited_title`` names the file only (plan §5.5); the tags stay Spotify's.
 
     Nothing about the listing travels: unlike a YouTube playlist, every Spotify track carries its
     own album, track number and cover, and those are what the file is tagged with.
@@ -329,6 +333,9 @@ def download_options(video_id: str | None = None, archive: bool = True) -> dict[
         if not isinstance(video_id, str) or not VIDEO_ID.fullmatch(video_id):
             raise ValueError(f"invalid video id: {video_id!r}")
         options["video_id"] = video_id
+    title = (edited_title or "").strip()
+    if title:
+        options["edited_title"] = title[:300]
     return options
 
 
@@ -348,6 +355,7 @@ def batch_specs(
     matches: dict[str, Match],
     output_dir: str,
     archive: bool = True,
+    edited_titles: dict[str, str] | None = None,
 ) -> list[JobSpec]:
     """One ordinary download job per selected track, carrying its reviewed match if any.
 
@@ -357,7 +365,9 @@ def batch_specs(
     for track in tracks:
         match = matches.get(track.track_id)
         options = download_options(
-            video_id=match.video_id if match is not None else None, archive=archive
+            video_id=match.video_id if match is not None else None,
+            archive=archive,
+            edited_title=(edited_titles or {}).get(track.track_id),
         )
         specs.append(
             JobSpec(

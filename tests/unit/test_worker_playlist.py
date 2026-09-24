@@ -191,3 +191,149 @@ def test_sanitize_playlist_survives_a_junk_payload():
     listing = sanitize_playlist({})
     assert listing["entries"] == [] and listing["title"] == "Playlist"
     assert listing["playlist_id"] == "" and listing["truncated"] is False
+
+
+# ── R5: metadata comes from the track, never from the list (plan §5.7) ───────────────────
+def _tags(path):
+    from mutagen.id3 import ID3
+
+    tags = ID3(str(path))
+    return {k: str(tags[k]) for k in ("TIT2", "TPE1", "TALB", "TRCK") if tags.getall(k)}
+
+
+def test_a_playlist_download_keeps_the_real_album_and_no_list_position(tmp_path):
+    pytest.importorskip("mutagen")
+    from stuff_downloader_worker import tagging
+
+    song = tmp_path / "song.mp3"
+    song.write_bytes(b"")
+    info = {"track": "Midnight City", "artist": "M83", "album": "Hurry Up, We're Dreaming"}
+    report = tagging.verify_mp3(song, info)
+    assert _tags(song) == {
+        "TIT2": "Midnight City",
+        "TPE1": "M83",
+        "TALB": "Hurry Up, We're Dreaming",
+    }
+    assert report["album"] == "Hurry Up, We're Dreaming" and report["track"] is None
+
+
+def test_an_unknown_album_is_left_empty(tmp_path):
+    pytest.importorskip("mutagen")
+    from stuff_downloader_worker import tagging
+
+    song = tmp_path / "song.mp3"
+    song.write_bytes(b"")
+    tagging.verify_mp3(song, {"title": "Clip", "uploader": "Someone - Topic"})
+    assert _tags(song) == {"TIT2": "Clip", "TPE1": "Someone"}
+
+
+def test_an_album_download_numbers_the_track(tmp_path):
+    pytest.importorskip("mutagen")
+    from stuff_downloader_worker import tagging
+
+    song = tmp_path / "song.mp3"
+    song.write_bytes(b"")
+    tagging.verify_mp3(song, {"title": "Two", "album": "LP"}, track_number=2, track_total=9)
+    assert _tags(song)["TRCK"] == "2/9" and _tags(song)["TALB"] == "LP"
+
+
+@pytest.mark.parametrize(
+    "uploader, artist",
+    [
+        ("Justine Skye - Topic", "Justine Skye"),
+        ("M83VEVO", "M83"),
+        ("Plain", "Plain"),
+        (None, None),
+    ],
+)
+def test_a_youtube_uploader_becomes_a_clean_artist(uploader, artist):
+    from stuff_downloader_worker import tagging
+
+    assert tagging.artist_from_uploader(uploader) == artist
+    info = {"uploader": uploader}
+    tagging.fill_artist(info)
+    assert info.get("artist") == artist
+    named = {"uploader": "X - Topic", "artist": "Real"}
+    tagging.fill_artist(named)
+    assert named["artist"] == "Real"  # the site's own artist always wins
+
+
+def _mp3_run(tmp_path, monkeypatch, request):
+    from stuff_downloader_worker.engines import ytdlp
+
+    calls = []
+    monkeypatch.setattr(ytdlp.tagging, "verify_mp3", lambda path, info, **k: calls.append(k))
+    out = tmp_path / "Artist - Song.mp3"
+
+    class Ydl:
+        params = {"outtmpl": {"default": "x"}}
+
+        def in_download_archive(self, info):
+            return False
+
+        def prepare_filename(self, info):
+            return str(tmp_path / "Artist - Song.webm")
+
+        def process_ie_result(self, info, download):
+            out.write_bytes(b"a")
+            return {}
+
+    ytdlp.YtDlpEngine._download(
+        Ydl(), {"album": "Real"}, request, {"title": "t"}, [str(out)], lambda s: None,
+        lambda *a: None,
+    )
+    return calls[0]
+
+
+def test_a_playlist_row_download_never_passes_the_list_position_as_a_track(tmp_path, monkeypatch):
+    request = presets.parse_row_request(
+        {"tab": "audio", "row_id": "a:mp3:320", "playlist_index": 4, "playlist_title": "Mix",
+         "playlist_count": 9}
+    )
+    assert _mp3_run(tmp_path, monkeypatch, request) == {"track_number": None, "track_total": None}
+
+
+def test_an_album_row_download_passes_its_position(tmp_path, monkeypatch):
+    request = presets.parse_row_request(
+        {"tab": "audio", "row_id": "a:mp3:320", "playlist_index": 4, "playlist_title": "LP",
+         "playlist_count": 9, "album_order": True}
+    )
+    assert _mp3_run(tmp_path, monkeypatch, request) == {"track_number": 4, "track_total": 9}
+
+
+def test_row_playlist_fields_are_validated():
+    base = {"tab": "audio", "row_id": "a:mp3:320"}
+    with pytest.raises(EngineError, match="album_order"):
+        presets.parse_row_request({**base, "album_order": True})
+    with pytest.raises(EngineError, match="needs 'playlist_index'"):
+        presets.parse_row_request({**base, "playlist_title": "Mix"})
+    with pytest.raises(EngineError, match="unknown options"):
+        presets.parse_row_request({**base, "playlist_index": 1}, original_only=True)
+    request = presets.parse_row_request(base)
+    assert not request.in_playlist and not request.album_order
+
+
+def test_a_playlist_row_lands_in_the_list_folder_with_its_archive(tmp_path):
+    request = presets.parse_row_request(
+        {"tab": "video", "row_id": "v:1080:mp4", "container": "mp4", "playlist_index": 1,
+         "playlist_title": "Road/Trip", "archive": True}
+    )
+    opts = presets.build_row_opts(request, str(tmp_path))
+    home = tmp_path / "Road_Trip"
+    assert opts["paths"]["home"] == str(home)
+    assert opts["download_archive"] == str(home / presets.ARCHIVE_FILENAME)
+
+
+@pytest.mark.parametrize(
+    "url, list_id, music, album",
+    [
+        ("https://www.youtube.com/playlist?list=PL1", "PL1", False, False),
+        ("https://music.youtube.com/playlist?list=PL1", "PL1", True, False),
+        ("https://music.youtube.com/playlist?list=OLAK5uy_abc", "OLAK5uy_abc", True, True),
+        ("https://www.youtube.com/playlist?list=OLAK5uy_abc", "OLAK5uy_abc", True, True),
+        ("https://www.youtube.com/playlist?list=RDCLAKabc", "RDCLAKabc", True, False),
+    ],
+)
+def test_a_listing_says_whether_it_is_songs_and_whether_it_is_an_album(url, list_id, music, album):
+    listing = sanitize_playlist({"id": list_id, "title": "L", "entries": []}, url)
+    assert (listing["music"], listing["is_album"]) == (music, album)

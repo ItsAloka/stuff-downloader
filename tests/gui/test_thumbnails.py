@@ -8,14 +8,13 @@ import threading
 import pytest
 from PyQt6.QtCore import QBuffer, QByteArray, QIODevice
 from PyQt6.QtGui import QColor, QImage
-from PyQt6.QtWidgets import QTableWidgetItem
 from test_main_window import _analyzed
 from test_playlist_queue import expand, listing, runs, window  # noqa: F401  (fixtures)
 
 from stuff_downloader.core import protocol
 from stuff_downloader.core.gallery import GalleryItem
 from stuff_downloader.core.protocol import Event
-from stuff_downloader.core.spotify import Match
+from stuff_downloader.core.spotify import Match, SpotifyTrack
 from stuff_downloader.gui import thumbs
 from stuff_downloader_worker.engines import http as worker_http
 
@@ -193,18 +192,19 @@ def test_an_oversized_preview_falls_back_to_the_placeholder(window, runs, qtbot)
     assert page._thumb is None
 
 
-def test_spotify_matches_show_the_matched_video(window, qtbot):  # noqa: F811
+def test_a_spotify_match_never_replaces_the_row_picture(window, qtbot):  # noqa: F811
+    """Plan §5.6a: a Spotify row keeps Spotify's art; the YouTube match's picture is not
+    fetched for the row, and nothing is drawn into the match column."""
     page = window.downloads_page
-    page.thumbs.fetcher = FakeFetch()
-    table = page.spotify_card.table
-    table.setRowCount(1)
-    for column in range(table.columnCount()):
-        table.setItem(0, column, QTableWidgetItem(""))
-    match = Match(track_id="t1", video_id=VID, manual=True)
-    page.spotify_card.set_match(0, match)
-    page._request_spotify_thumb(0, match)
-    item = table.item(0, page.spotify_card.MATCH_COLUMN)
-    qtbot.waitUntil(lambda: _icon_colour(item) == RED, timeout=3000)
+    fetch = FakeFetch()
+    page.thumbs.fetcher = fetch
+    card = page.spotify_card
+    card.set_tracks([SpotifyTrack("t1" * 11, 1, "Song", ("Artist",), duration=200.0)])
+    card.set_match(0, Match(track_id="t1" * 11, video_id=VID, manual=True))
+    qtbot.wait(50)
+    assert fetch.calls == []
+    assert not card.table.has_art(0)
+    assert card.table.item(0, card.MATCH_COLUMN).icon().isNull()
 
 
 def test_gallery_tiles_decode_capped_and_tooltips_are_plain_text(window):  # noqa: F811

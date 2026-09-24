@@ -37,6 +37,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from stuff_downloader_worker import tagging
 from stuff_downloader_worker.engines.base import Emit, EngineError
+from stuff_downloader_worker.names import safe_output_name
 from stuff_downloader_worker.protocol import JobSpec, media_result
 
 PRESET_ID = "spotify_mp3"
@@ -46,6 +47,7 @@ MAX_ARTISTS = 20
 MAX_COVER_BYTES = 5_000_000
 COVER_TIMEOUT = 20
 ARCHIVE_FILENAME = ".stuff-downloader-spotify-archive.txt"
+MAX_EDITED_TITLE = 300
 MAX_NAME = 150  # characters of "Artist - Title" before the extension
 
 SPOTIFY_ID = re.compile(r"[A-Za-z0-9]{22}")
@@ -95,7 +97,8 @@ def parse_url(url: str) -> tuple[str, str]:
 
 def parse_download_options(opts: dict[str, Any]) -> tuple[str | None, bool]:
     """(video_id or None, archive). Mirrors core.spotify.download_options exactly."""
-    if set(opts) - {"mode", "preset", "video_id", "archive"} or opts.get("preset") != PRESET_ID:
+    allowed = {"mode", "preset", "video_id", "archive", "edited_title"}
+    if set(opts) - allowed or opts.get("preset") != PRESET_ID:
         raise EngineError("bad_options", f"a Spotify download takes preset={PRESET_ID}")
     archive = opts.get("archive", True)
     if not isinstance(archive, bool):
@@ -103,7 +106,18 @@ def parse_download_options(opts: dict[str, Any]) -> tuple[str | None, bool]:
     video_id = opts.get("video_id")
     if video_id is not None and (not isinstance(video_id, str) or not VIDEO_ID.fullmatch(video_id)):
         raise EngineError("bad_options", "'video_id' must be a YouTube video id")
+    edited = opts.get("edited_title")
+    if edited is not None and (not isinstance(edited, str) or len(edited) > MAX_EDITED_TITLE):
+        raise EngineError("bad_options", "'edited_title' must be a short string")
     return video_id, archive
+
+
+def edited_stem(opts: dict[str, Any]) -> str | None:
+    """The file name the owner typed (plan §5.5), made Windows-safe; None keeps the default.
+
+    It names the file only: the tags stay Spotify's own title, artists and album.
+    """
+    return safe_output_name(opts.get("edited_title"))
 
 
 def video_id_of(url: Any) -> str | None:
@@ -720,7 +734,7 @@ class SpotDlEngine:
         if cover is None:
             emit("log", {"level": "warning", "message": "the Spotify cover could not be loaded"})
         tags = tag_mp3(mp3s[0], fields, cover)
-        stem = file_stem(fields["artists"], fields["name"])
+        stem = edited_stem(job.options) or file_stem(fields["artists"], fields["name"])
         final = move_no_overwrite(mp3s[0], folder, stem, ".mp3")
         if archive:
             ledger.add(track_id)

@@ -365,8 +365,8 @@ def test_the_result_card_has_no_file_name_field_and_no_crop_checkbox(window, run
 
 def test_youtube_music_playlist_resets_to_mp3(window):
     page = window.downloads_page
-    page.playlist_card.preset_combo.setCurrentIndex(
-        page.playlist_card.preset_combo.findData("audio_original")
+    page.playlist_card.format_combo.setCurrentIndex(
+        page.playlist_card.format_combo.findData("a:flac")
     )
     page._route = router.route("https://music.youtube.com/playlist?list=PL1234567890")
     page.show_playlist(
@@ -377,7 +377,7 @@ def test_youtube_music_playlist_resets_to_mp3(window):
             "entries": [{"id": "dQw4w9WgXcQ", "title": "Song"}],
         }
     )
-    assert page.playlist_card.preset_combo.currentData() == "mp3_music"
+    assert page.playlist_card.format_combo.currentData() == "a:mp3:320"
 
 
 def test_analyze_error_timeout_and_cancel(window, runs, qtbot):

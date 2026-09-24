@@ -199,10 +199,50 @@ _ROW_ID = {
 _AUDIO_NAMES = {"m4a": "M4A", "opus": "Opus", "flac": "FLAC", "wav": "WAV", "orig": "Original"}
 
 
+# "Download selected as" for a playlist (plan §8 R5): the §5.4 rows every YouTube entry has.
+# (label, tab, row_id, container). A height is the most it may be; lower is taken when absent.
+BATCH_CHOICES: tuple[tuple[str, str, str, str | None], ...] = (
+    ("MP3 320 kbps", "audio", "a:mp3:320", None),
+    ("MP3 256 kbps", "audio", "a:mp3:256", None),
+    ("MP3 192 kbps", "audio", "a:mp3:192", None),
+    ("MP3 128 kbps", "audio", "a:mp3:128", None),
+    ("M4A (AAC)", "audio", "a:m4a", None),
+    ("Opus", "audio", "a:opus", None),
+    ("FLAC", "audio", "a:flac", None),
+    ("WAV", "audio", "a:wav", None),
+    ("MP4 video, up to 2160p", "video", "v:2160:mp4", "mp4"),
+    ("MP4 video, up to 1080p", "video", "v:1080:mp4", "mp4"),
+    ("MP4 video, up to 720p", "video", "v:720:mp4", "mp4"),
+    ("MP4 video, up to 480p", "video", "v:480:mp4", "mp4"),
+)
+DEFAULT_MUSIC_BATCH = "a:mp3:320"
+DEFAULT_VIDEO_BATCH = "v:1080:mp4"
+
+
+def batch_choice(row_id: str) -> tuple[str, str, str, str | None]:
+    for choice in BATCH_CHOICES:
+        if choice[2] == row_id:
+            return choice
+    raise ValueError(f"unknown batch format {row_id!r}")
+
+
 def row_download_options(
-    tab: str, row_id: str, container: str | None = None, edited_title: str | None = None
+    tab: str,
+    row_id: str,
+    container: str | None = None,
+    edited_title: str | None = None,
+    *,
+    playlist_index: int | None = None,
+    playlist_title: str | None = None,
+    playlist_count: int | None = None,
+    album_order: bool = False,
+    archive: bool = False,
 ) -> dict[str, Any]:
-    """The job ``options`` for one Result-card row. Mirrors the worker's validation."""
+    """The job ``options`` for one Result-card row. Mirrors the worker's validation.
+
+    A playlist batch adds the entry's place in the list: its folder comes from the title, and
+    only an album (``album_order``) may turn the place into a track number (plan §5.7).
+    """
     if tab not in ROW_TABS:
         raise ValueError(f"unknown tab {tab!r}")
     if not isinstance(row_id, str) or not _ROW_ID[tab].fullmatch(row_id):
@@ -221,6 +261,20 @@ def row_download_options(
     title = (edited_title or "").strip()
     if title:
         options["edited_title"] = title[:MAX_EDITED_TITLE]
+    if archive:
+        options["archive"] = True
+    if playlist_index is not None:
+        if not 1 <= playlist_index <= MAX_PLAYLIST_INDEX:
+            raise ValueError(f"playlist index out of range: {playlist_index}")
+        options["playlist_index"] = int(playlist_index)
+        if playlist_title:
+            options["playlist_title"] = str(playlist_title)[:300]
+        if playlist_count is not None:
+            options["playlist_count"] = max(int(playlist_count), int(playlist_index))
+        if album_order:
+            options["album_order"] = True
+    elif album_order:
+        raise ValueError("album order needs a playlist index")
     return options
 
 
