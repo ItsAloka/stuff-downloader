@@ -120,7 +120,6 @@ def test_unusable_youtube_links_are_unsupported(text):
     "text",
     [
         "https://vimeo.com/123456789",
-        "https://www.tiktok.com/@someone/video/7123456789012345678",
         "https://www.facebook.com/watch/?v=1234567890",
         # A lookalike host is not YouTube, but it is still a public site we may try.
         f"https://www.youtube.com.example.test.example/watch?v={VID}",
@@ -195,7 +194,7 @@ def test_sites_we_do_not_serve_yet_are_refused_by_name(text):
 @pytest.mark.parametrize(
     ("message", "expected"),
     [
-        ("ERROR: Unsupported URL: https://example.test/x", "not a video page"),
+        ("ERROR: Unsupported URL: https://example.test/x", "video, photo or file"),
         ("ERROR: [generic] video: No video formats found", "No downloadable video"),
         ("This video is DRM protected", "DRM"),
         ("ERROR: [instagram] Login required to access this post", "not public"),
@@ -431,16 +430,72 @@ def test_the_analyze_chain_is_decided_in_core():
     page = route("https://www.example.com/post/123")
     assert page.kind == "video"
     chain = _router.analyze_fallbacks(page)
-    assert [(r.kind, r.engine) for r in chain] == [("gallery", "gallerydl"), ("file", "http")]
+    assert [(r.kind, r.engine) for r in chain] == [
+        ("gallery", "gallerydl"),
+        ("file", "http"),
+        ("page", "social"),  # R4: the page's own og:image, last
+    ]
     assert all(r.url == page.url for r in chain)
     # Nothing else falls back, and a direct file is only ever probed after the page engines.
     for text in (
         "https://cdn.example.com/a.mp4",
-        "https://www.instagram.com/p/C0ffee123/",
+        "https://www.instagram.com/some.user/",
         "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
         f"https://open.spotify.com/track/{SPOTIFY_TRACK}",
     ):
         assert _router.analyze_fallbacks(route(text)) == []
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://www.instagram.com/p/DdHWXPMyCL0/",
+        "https://instagram.com/p/C0ffee123/?img_index=2",
+        "https://www.instagram.com/some.user/p/C0ffee123/",
+        "https://www.instagram.com/reel/C0ffee123/",
+        "https://www.instagram.com/tv/C0ffee123/",
+        "https://www.tiktok.com/@someone/photo/7300000000000000000",
+        "https://www.tiktok.com/@someone/video/7300000000000000000",
+        "https://vt.tiktok.com/ZSabc123/",
+        "https://vm.tiktok.com/ZMabc123/",
+        "https://x.com/AnimeePost/status/2102612420057292860",
+        "https://twitter.com/someone/status/1700000000000000000/photo/1",
+        "https://www.reddit.com/r/pics/comments/abc123/some_title/",
+        "https://www.reddit.com/r/pics/s/AbCdEf123",
+        "https://www.reddit.com/gallery/abc123",
+        "https://redd.it/abc123",
+        "https://www.instagram.com/stories/some.user/3141592653/",
+        "https://www.instagram.com/stories/highlights/17900000000000000/",
+    ],
+)
+def test_social_posts_try_the_no_login_extractor_then_ytdlp_then_gallery_dl(text):
+    """R4 (plan §6): public posts go to social first; the chain is core's, not the GUI's."""
+    r = route(text)
+    assert r.kind == "social" and r.ok and r.engine == "social"
+    chain = _router.analyze_fallbacks(r)
+    assert [(c.kind, c.engine) for c in chain] == [("video", "ytdlp"), ("gallery", "gallerydl")]
+    assert all(c.url == r.url for c in chain)
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "https://www.instagram.com/some.user/",
+        "https://x.com/someone/media",
+        "https://www.tiktok.com/@someone",
+        "https://www.reddit.com/r/pics/",
+        "https://www.instagram.com/p/",
+        "https://x.com/someone/status/notanumber",
+    ],
+)
+def test_profiles_and_malformed_posts_do_not_go_to_social(text):
+    assert route(text).kind != "social"
+
+
+def test_social_hosts_share_their_site_rate_limit_group():
+    assert _router.social_group("https://vt.tiktok.com/ZSabc/") == "tiktok"
+    assert _router.social_group("https://redd.it/abc123") == "reddit"
+    assert _router.social_group("https://www.reddit.com/r/a/comments/b/") == "reddit"
 
 
 @pytest.mark.parametrize(

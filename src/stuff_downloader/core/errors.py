@@ -21,14 +21,15 @@ _SECRET = re.compile(
 def redact_secrets(text: str) -> str:
     return _SECRET.sub(lambda m: f"{m.group(1)}: [removed]", text)
 
-NOT_PUBLIC = "That video is not public on the site."
+# Neutral on purpose (R3 carry-forward): the link may be a photo post, not a video.
+NOT_PUBLIC = "That post is not public on the site. It needs a signed-in account."
 
 # (substring in the engine message, lower-case) -> message shown to the owner
 _MESSAGE_RULES: tuple[tuple[str, str], ...] = (
     # Not public. Most specific first: "Private video. Sign in" is a private video, not a login.
     ("private video", "This video is private on the site."),
     ("sign in to confirm your age", "This video is age-restricted and needs a signed-in account."),
-    ("account is private", "That account is private, so its videos cannot be downloaded."),
+    ("account is private", "That account is private, so its posts cannot be downloaded."),
     ("members-only", "This video is for channel members only."),
     ("join this channel", "This video is for channel members only."),
     ("login required", NOT_PUBLIC),
@@ -57,7 +58,7 @@ _MESSAGE_RULES: tuple[tuple[str, str], ...] = (
     ("rate-limit", "The site is rate-limiting requests. Wait a bit and retry."),
     ("http error 5", "The site had a server error. Try again later."),
     # No extractor, or the extractor found nothing. Last, so a reason above wins over these.
-    ("unsupported url", "That link is not a video page we can read."),
+    ("unsupported url", "We couldn't find a video, photo or file at that link."),
     ("no video formats found", "No downloadable video was found on that page."),
     ("no media information found", "No downloadable video was found on that page."),
     ("unable to extract", "That page did not give us a video. The site may have changed."),

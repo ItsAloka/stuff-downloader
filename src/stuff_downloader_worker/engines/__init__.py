@@ -7,6 +7,7 @@ from .fake import FakeEngine
 from .gallerydl import GalleryDlEngine
 from .http import HttpEngine
 from .probe import ProbeEngine
+from .social import SocialEngine
 from .spotdl import SpotDlEngine
 from .ytdlp import YtDlpEngine
 
@@ -15,6 +16,7 @@ ENGINES: dict[str, type] = {
     "gallerydl": GalleryDlEngine,
     "http": HttpEngine,
     "probe": ProbeEngine,
+    "social": SocialEngine,
     "spotdl": SpotDlEngine,
     "ytdlp": YtDlpEngine,
 }

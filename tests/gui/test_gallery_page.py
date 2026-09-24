@@ -1,4 +1,4 @@
-"""M4 in the GUI: gallery grid, exact selection, queueing, and the site login for gallery-dl."""
+"""M4/R4 in the GUI: gallery grid, exact selection, queueing, the site login, social posts."""
 
 from __future__ import annotations
 
@@ -13,7 +13,9 @@ from stuff_downloader.core.protocol import Event, JobSpec
 from stuff_downloader.gui import pages
 from stuff_downloader.gui.main_window import MainWindow
 
-URL = "https://www.instagram.com/p/C0ffee123/?img_index=1"
+# A profile: gallery-dl's kind of link. A single post goes to the social extractor first (R4).
+URL = "https://www.instagram.com/some.user/?hl=en"
+POST_URL = "https://www.instagram.com/p/C0ffee123/?img_index=1"
 
 
 class FakeRun:
@@ -124,7 +126,7 @@ def test_download_sends_exactly_the_ticked_positions(page, runs, qtbot):
     assert job.title == "Sunset at the beach (2)"
     assert runs[-1].spec.job_id == job.spec.job_id  # the scheduler started it
     ((options, url, engine),) = _stored(page)
-    assert engine == "gallerydl" and url == "https://www.instagram.com/p/C0ffee123/"  # no query
+    assert engine == "gallerydl" and url == "https://www.instagram.com/some.user/"  # no query
     assert "site_login" not in options
 
 
@@ -148,7 +150,7 @@ def test_two_galleries_from_one_site_run_one_at_a_time(page, runs, qtbot):
     _analyzed(page, runs, qtbot)
     first = page.start_gallery_download()
     count = len(runs)
-    _analyzed(page, runs, qtbot, url="https://www.instagram.com/p/Other456/")
+    _analyzed(page, runs, qtbot, url="https://www.instagram.com/other.user/")
     second = page.start_gallery_download()
     assert len(runs) == count + 1  # only the analyze started; the download waits
     assert page.scheduler.queued_ids() == [second.spec.job_id]
@@ -174,9 +176,11 @@ def test_a_private_gallery_offers_the_login(page, runs, qtbot):
     assert not page.login_button.isHidden() and page._login_site == "instagram.com"
 
 
-def test_a_photo_only_tweet_falls_back_from_ytdlp_to_gallery_dl(page, runs):
+def test_a_tweet_walks_social_then_ytdlp_then_gallery_dl(page, runs):
     page.url_edit.setText("https://x.com/someone/status/1700000000000000000")
     page.analyze()
+    assert runs[-1].spec.engine == "social"
+    runs[-1].emit("error", code="unsupported", message="no media information found")
     assert runs[-1].spec.engine == "ytdlp"
     runs[-1].emit("error", code="unsupported", message="No video could be found in this tweet")
     assert runs[-1].spec.engine == "gallerydl"
@@ -204,14 +208,14 @@ def test_restored_gallery_jobs_come_back_paused(qtbot, monkeypatch, runs, tmp_pa
     assert isinstance(job.spec, JobSpec) and runs == []
 
 
-def test_a_one_photo_post_opens_in_the_result_card_and_downloads_through_gallery_dl(
+def test_a_one_photo_post_opens_in_the_result_card_and_downloads_through_social(
     page, runs, qtbot
 ):
     """kind "image": the card is chosen by what the post holds, not by the engine (R2)."""
-    page.url_edit.setText(URL)
+    page.url_edit.setText(POST_URL)
     page.analyze()
     result = protocol.media_result(
-        "image", ["image"], "One photo", URL, site="Instagram", extractor="Instagram",
+        "image", ["image"], "One photo", POST_URL, site="Instagram", extractor="Instagram",
         items=[{"index": 1, "kind": "image", "ext": "jpg"}], truncated=False,
         image_rows=[{"id": "i:orig", "original": True, "ext": "jpg", "default": True}],
     )  # fmt: skip
@@ -221,10 +225,73 @@ def test_a_one_photo_post_opens_in_the_result_card_and_downloads_through_gallery
     card = page.result_card
     card.image_format_combo.setCurrentIndex(card.image_format_combo.findData("png"))
     job = page.start_row_download("image", "i:orig")
-    assert job.spec.engine == "gallerydl"
+    assert job.spec.engine == "social"
     assert job.spec.options == {
         "mode": "download",
         "tab": "image",
         "row_id": "i:orig",
         "container": "png",
     }
+
+
+# ── R4: social posts ────────────────────────────────────────────────────────────────────────
+def _social_gallery(page, runs, qtbot):
+    page.url_edit.setText(POST_URL)
+    page.analyze()
+    run = runs[-1]
+    assert run.spec.engine == "social" and run.spec.options == {"mode": "analyze"}
+    result = gallery_result()
+    result["items"][1]["preview"] = {"data": _png()}  # the video's poster frame
+    run.emit("result", **result)
+    qtbot.waitUntil(lambda: not page.gallery_card.isHidden())
+
+
+def test_a_social_carousel_badges_videos_even_with_a_preview(page, runs, qtbot):
+    _social_gallery(page, runs, qtbot)
+    video = page.gallery_card.grid.item(1)
+    assert not video.icon().isNull() and video.text().startswith("🎞")
+    assert "🎞" not in page.gallery_card.grid.item(0).text()
+
+
+def test_a_social_carousel_downloads_positions_through_social_as_webp(page, runs, qtbot):
+    _social_gallery(page, runs, qtbot)
+    card = page.gallery_card
+    card.archive_check.setChecked(False)
+    card.image_format_combo.setCurrentIndex(card.image_format_combo.findData("webp"))
+    assert "WEBP" in card.download_button.text()
+    card.grid.item(2).setCheckState(Qt.CheckState.Unchecked)
+    job = page.start_gallery_download()
+    assert job.spec.engine == "social"
+    assert job.spec.options == {
+        "mode": "download",
+        "preset": "gallery_original",
+        "items": [1, 2, 4],
+        "image_format": "webp",
+    }
+    ((options, url, engine),) = _stored(page)
+    assert engine == "social" and url == "https://www.instagram.com/p/C0ffee123/"
+    assert "http" not in json.dumps(options)  # positions only, never an item URL
+
+
+def test_a_private_social_post_offers_the_login_with_neutral_wording(page, runs, qtbot):
+    page.url_edit.setText(POST_URL)
+    page.analyze()
+    runs[-1].emit(
+        "error",
+        code="download_error",
+        message="login required: this post is only visible to signed-in accounts",
+    )
+    assert not page.login_button.isHidden() and page._login_site == "instagram.com"
+    assert "video" not in page.message_label.text().lower()
+
+
+def test_a_site_login_goes_to_the_social_worker_so_it_can_step_aside(page, runs, qtbot):
+    firefox = cookies.SiteLogin("browser", browser="firefox")
+    page.set_site_login("instagram.com", firefox)
+    page.url_edit.setText(POST_URL)
+    page.analyze()
+    assert runs[-1].spec.engine == "social"
+    assert runs[-1].spec.options["site_login"] == firefox.to_dict()
+    runs[-1].emit("error", code="unsupported", message="a site login is set")
+    assert runs[-1].spec.engine == "ytdlp"
+    assert runs[-1].spec.options["site_login"] == firefox.to_dict()

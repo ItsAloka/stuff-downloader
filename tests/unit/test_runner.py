@@ -148,3 +148,21 @@ def test_worker_self_test_and_bad_spec():
         timeout=30,
     )
     assert bad.returncode == 1 and '"bad_job_spec"' in bad.stdout
+
+
+def test_the_social_engine_runs_in_the_ytdlp_env(tmp_path, monkeypatch):
+    """R4: social has no env of its own; it needs the yt-dlp env's curl_cffi (plan §6)."""
+    import json
+
+    from stuff_downloader.core import runner
+
+    env = tmp_path / "envs" / "ytdlp" / "2026.8.19-abc" / "Scripts"
+    env.mkdir(parents=True)
+    (env / "python.exe").write_bytes(b"")
+    (tmp_path / "active.json").write_text(
+        json.dumps({"ytdlp": {"active": "2026.8.19-abc"}}), encoding="utf-8"
+    )
+    monkeypatch.setenv(runner.RUNTIME_ENV_VAR, str(tmp_path))
+    monkeypatch.setattr(runner, "is_frozen", lambda: True)
+    assert runner.default_worker_command("social")[0] == str(env / "python.exe")
+    assert runner.default_worker_command("social") == runner.default_worker_command("ytdlp")

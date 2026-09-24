@@ -130,7 +130,7 @@ def download_options(
     return options
 
 
-IMAGE_FORMATS = ("original", "jpg", "png")
+IMAGE_FORMATS = ("original", "jpg", "png", "webp")
 IMAGE_EXTENSIONS = frozenset({"jpg", "jpeg", "png", "gif", "webp", "avif", "bmp"})
 
 

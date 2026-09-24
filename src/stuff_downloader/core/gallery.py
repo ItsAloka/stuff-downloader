@@ -16,7 +16,7 @@ from typing import Any
 MAX_ITEMS = 500
 MAX_TITLE = 300
 MAX_PREVIEW_B64 = 2_800_000  # ~2 MB of image, the worker's own cap, as base64
-KINDS = ("image", "video", "file")
+KINDS = ("image", "video", "audio", "file")  # audio: a TikTok slideshow's sound
 _EXT = re.compile(r"[a-z0-9]{1,6}")
 
 

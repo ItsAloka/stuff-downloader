@@ -134,8 +134,11 @@ def test_an_unknown_page_falls_back_to_gallery_then_direct_engine_once_each(page
     assert len(runs) == 3
     assert runs[2].spec.engine == "http" and runs[2].spec.url == runs[0].spec.url
     runs[2].emit("error", code="unsupported", message="unsupported url: not a media file")
-    assert len(runs) == 3  # no fourth attempt
-    assert "not a video page" in page.message_label.text()
+    assert len(runs) == 4
+    assert runs[3].spec.engine == "social" and runs[3].spec.url == runs[0].spec.url  # og:image
+    runs[3].emit("error", code="unsupported", message="unsupported url: no picture found")
+    assert len(runs) == 4  # no fifth attempt
+    assert "video, photo or file" in page.message_label.text()
 
 
 def test_youtube_never_falls_back_to_the_direct_engine(page, runs):

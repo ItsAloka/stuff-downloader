@@ -15,18 +15,12 @@ from stuff_downloader.core.scheduler import Scheduler
 @pytest.mark.parametrize(
     "url",
     [
-        "https://www.instagram.com/p/C0ffee123/",
-        "https://instagram.com/p/C0ffee123/?img_index=2",
-        "https://www.instagram.com/stories/some.user/3141592653/",
-        "https://www.instagram.com/stories/highlights/17900000000000000/",
         "https://www.instagram.com/some.user/",
-        "https://www.tiktok.com/@someone/photo/7300000000000000000",
         "https://www.facebook.com/photo/?fbid=10150000000000000",
         "https://www.facebook.com/photo.php?fbid=1",
         "https://www.facebook.com/media/set/?set=a.10150000000000000",
         "https://www.facebook.com/someone/photos",
         "https://x.com/someone/media",
-        "https://twitter.com/someone/status/1700000000000000000/photo/1",
     ],
 )
 def test_photo_links_on_social_sites_go_to_gallery_dl(url):
@@ -38,10 +32,7 @@ def test_photo_links_on_social_sites_go_to_gallery_dl(url):
 @pytest.mark.parametrize(
     "url",
     [
-        "https://www.instagram.com/reel/C0ffee123/",
         "https://www.instagram.com/explore/",
-        "https://www.tiktok.com/@someone/video/7300000000000000000",
-        "https://x.com/someone/status/1700000000000000000",
         "https://www.facebook.com/watch/?v=1",
         "https://vimeo.com/123456789",
     ],

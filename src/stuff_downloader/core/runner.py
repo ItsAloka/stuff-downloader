@@ -79,9 +79,13 @@ def runtime_python(engine: str = "fake") -> Path:
 
 
 DEV_ENGINES = frozenset({"fake", "probe"})
+# Engines with no env of their own run in another engine's env: the social extractor needs
+# only the stdlib and the yt-dlp env's curl_cffi (plan §6).
+ENV_OF = {"social": "ytdlp"}
 
 
 def default_worker_command(engine: str = "fake") -> list[str]:
+    engine = ENV_OF.get(engine, engine)
     if not is_frozen():
         # From source, real engines use the installed engine env when there is one, because the
         # dev venv deliberately does not contain yt-dlp.

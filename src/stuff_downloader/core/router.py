@@ -91,8 +91,8 @@ DIRECT_FILE_EXTENSIONS = frozenset(
 
 @dataclass(frozen=True)
 class Route:
-    # "youtube" | "youtube_playlist" | "video" | "file" | "gallery" | "spotify"
-    # | "unsupported" | "invalid"
+    # "youtube" | "youtube_playlist" | "video" | "file" | "gallery" | "social" | "page"
+    # | "spotify" | "unsupported" | "invalid"
     kind: str
     url: str = ""  # normalized watch or playlist URL (youtube only)
     video_id: str = ""
@@ -107,7 +107,9 @@ class Route:
 
     @property
     def ok(self) -> bool:
-        return self.kind in ("youtube", "youtube_playlist", "video", "file", "gallery", "spotify")
+        return self.kind in (
+            "youtube", "youtube_playlist", "video", "file", "gallery", "social", "page", "spotify"
+        )  # fmt: skip
 
     @property
     def is_file(self) -> bool:
@@ -133,7 +135,14 @@ class Route:
     def engine(self) -> str:
         if not self.ok:
             return ""
-        return {"file": "http", "gallery": "gallerydl", "spotify": "spotdl"}.get(self.kind, "ytdlp")
+        engines = {
+            "file": "http",
+            "gallery": "gallerydl",
+            "social": "social",
+            "page": "social",  # the page's own og:image, last in the chain
+            "spotify": "spotdl",
+        }
+        return engines.get(self.kind, "ytdlp")
 
 
 # Plan §5.3 step 3: photo posts, carousels, stories, albums and media timelines go to gallery-dl.
@@ -143,6 +152,11 @@ _INSTAGRAM_HOSTS = {"instagram.com", "www.instagram.com", "m.instagram.com"}
 _TIKTOK_HOSTS = {"tiktok.com", "www.tiktok.com", "m.tiktok.com"}
 _FACEBOOK_HOSTS = {"facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com"}
 _X_HOSTS = {"x.com", "www.x.com", "twitter.com", "www.twitter.com", "mobile.twitter.com"}
+_TIKTOK_SHORT_HOSTS = {"vt.tiktok.com", "vm.tiktok.com"}
+_REDDIT_HOSTS = {"reddit.com", "www.reddit.com", "old.reddit.com", "new.reddit.com"}
+_REDDIT_SHORT_HOSTS = {"redd.it"}
+_NUMERIC = re.compile(r"\d{5,25}")
+_SHORTCODE = re.compile(r"[A-Za-z0-9_-]{5,40}")
 # Instagram paths that are site pages, not a profile name.
 _INSTAGRAM_RESERVED = frozenset(
     {"explore", "accounts", "direct", "about", "developer", "legal", "reels", "reel", "tv",
@@ -153,9 +167,10 @@ _INSTAGRAM_USER = re.compile(r"[A-Za-z0-9._]{1,30}")
 # gets an account throttled.
 SOCIAL_HOST_GROUPS = {
     **{h: "instagram" for h in _INSTAGRAM_HOSTS},
-    **{h: "tiktok" for h in _TIKTOK_HOSTS},
+    **{h: "tiktok" for h in _TIKTOK_HOSTS | _TIKTOK_SHORT_HOSTS},
     **{h: "facebook" for h in _FACEBOOK_HOSTS},
     **{h: "x" for h in _X_HOSTS},
+    **{h: "reddit" for h in _REDDIT_HOSTS | _REDDIT_SHORT_HOSTS},
     # Spotify metadata is read by scraping its web player, which throttles bursts.
     **{h: "spotify" for h in _SPOTIFY_HOSTS},
 }
@@ -168,6 +183,44 @@ def social_group(url: str) -> str:
     except ValueError:
         return ""
     return SOCIAL_HOST_GROUPS.get(host, "")
+
+
+def is_social_post(host: str, path: str) -> bool:
+    """Whether a link names one public post the social extractor reads first (plan §6).
+
+    Instagram posts, reels and IGTV; TikTok videos, photo posts and vt./vm. short links; X
+    statuses; Reddit posts. Instagram stories and highlights come here too: anonymously they
+    only ever need a login, and gallery-dl reports that as "user not found". Profiles stay
+    with gallery-dl.
+    """
+    segments = [s for s in path.split("/") if s]
+    if host in _INSTAGRAM_HOSTS:
+        if segments[:1] == ["stories"] and len(segments) >= 2:
+            return True
+        if len(segments) >= 3 and segments[1] in ("p", "reel", "tv"):
+            segments = segments[1:]  # /<user>/p/<code>/
+        return (
+            len(segments) >= 2
+            and segments[0] in ("p", "reel", "reels", "tv")
+            and bool(_SHORTCODE.fullmatch(segments[1]))
+        )
+    if host in _TIKTOK_HOSTS:
+        return any(
+            seg in ("video", "photo") and _NUMERIC.fullmatch(nxt)
+            for seg, nxt in zip(segments, segments[1:], strict=False)
+        )
+    if host in _TIKTOK_SHORT_HOSTS or host in _REDDIT_SHORT_HOSTS:
+        return len(segments) == 1
+    if host in _X_HOSTS:
+        return any(
+            seg == "status" and _NUMERIC.fullmatch(nxt)
+            for seg, nxt in zip(segments, segments[1:], strict=False)
+        )
+    if host in _REDDIT_HOSTS:
+        if segments[:1] == ["gallery"] and len(segments) >= 2:
+            return True
+        return len(segments) >= 4 and segments[0] == "r" and segments[2] in ("comments", "s")
+    return False
 
 
 def is_gallery_link(host: str, path: str, query: str) -> bool:
@@ -358,6 +411,8 @@ def _route_site(parts: Any) -> Route:
         return Route("unsupported", reason=SITE_PRIVATE_HOST_REASON)
     if parts.path.strip("/") == "" and not parts.query:
         return Route("unsupported", reason=SITE_UNSUPPORTED_REASON)
+    if is_social_post(host, parts.path):
+        return Route("social", url=_site_url(parts))
     if is_gallery_link(host, parts.path, parts.query):
         return Route("gallery", url=_site_url(parts))
     if is_direct_file_path(parts.path):
@@ -365,12 +420,13 @@ def _route_site(parts: Any) -> Route:
     return Route("video", url=_site_url(parts))
 
 
-# Plan §5.3: which engines analyze a link, in order. The first is the route's own engine; the
-# rest get a turn only when the one before reports the link unsupported. A page on an unknown
-# site may be a photo post (gallery-dl) or, last, a file served without an extension (the direct
-# engine, which checks the Content-Type before calling it one). Nothing probes a link as a
-# direct file before its own engine has answered.
-_ANALYZE_FALLBACKS = {"video": ("gallery", "file")}
+# Plan §5.3, §6: which engines analyze a link, in order. The first is the route's own engine;
+# the rest get a turn only when the one before reports the link unsupported. A social post goes
+# to the no-login extractor, then yt-dlp (videos), then gallery-dl. A page on an unknown site may
+# be a photo post (gallery-dl), a file served without an extension (the direct engine, which
+# checks the Content-Type before calling it one) or, last, a page with only its own picture
+# (og:image). Nothing probes a link as a direct file before its own engine has answered.
+_ANALYZE_FALLBACKS = {"social": ("video", "gallery"), "video": ("gallery", "file", "page")}
 
 
 def analyze_fallbacks(route_: Route) -> list[Route]:

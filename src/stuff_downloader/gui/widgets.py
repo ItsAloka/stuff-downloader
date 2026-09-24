@@ -1193,7 +1193,7 @@ class SiteLoginDialog(QDialog):
 
 
 GALLERY_ICON = QSize(128, 128)
-_KIND_GLYPH = {"image": "🖼", "video": "🎞", "file": "📄"}
+_KIND_GLYPH = {"image": "🖼", "video": "🎞", "audio": "🎵", "file": "📄"}
 
 
 class GalleryCard(Card):
@@ -1258,7 +1258,10 @@ class GalleryCard(Card):
     def set_items(self, items: tuple[GalleryItem, ...] | list[GalleryItem]) -> None:
         self.grid.clear()
         for item in items:
-            tile = QListWidgetItem(item.label)
+            # Videos and sounds carry their badge even with a picture (plan §5.4): a video's
+            # preview is only its poster frame, and it always saves as the original file.
+            badge = "" if item.kind == "image" else f"{_KIND_GLYPH.get(item.kind, '📄')} "
+            tile = QListWidgetItem(badge + item.label)
             tile.setData(Qt.ItemDataRole.UserRole, item.index)
             tile.setFlags(
                 Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsUserCheckable
@@ -1319,6 +1322,7 @@ IMAGE_FORMAT_CHOICES = (
     ("Original format", "original"),
     ("JPG (transparency on white)", "jpg"),
     ("PNG", "png"),
+    ("WebP", "webp"),
 )
 
 

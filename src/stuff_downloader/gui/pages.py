@@ -303,8 +303,9 @@ LINK_REDACTED_REASON = (
 )
 AUTO_HEIGHT = None
 # Engines that can use the owner's advanced site login (plan §6.4). The direct HTTP engine
-# never gets one: a plain file link has no business needing a session.
-LOGIN_ENGINES = frozenset({"ytdlp", "gallerydl"})
+# never gets one: a plain file link has no business needing a session. The social extractor never
+# uses one; it only steps aside when one is set, so the engines that can use it read the post.
+LOGIN_ENGINES = frozenset({"ytdlp", "gallerydl", "social"})
 
 # The Advanced view (plan §M3): what the site actually offers, read from the metadata the worker
 # already sanitized. Every cell is rebuilt here from a known field, never passed through, and the
@@ -1226,7 +1227,7 @@ class DownloadsPage(QWidget):
         chosen = self.gallery_card.selected_indices()
         known = {item.index for item in listing.items} if listing else set()
         chosen = [i for i in chosen if i in known]
-        if listing is None or route is None or not route.is_gallery or not chosen:
+        if listing is None or route is None or not route.ok or not chosen:
             return None
         options = presets.gallery_download_options(
             chosen,
