@@ -124,7 +124,7 @@ the milestone named.
 | **P4** | The "File name" field or column appears everywhere. The owner wants to click the title and edit it. | `PreviewCard.name_edit`, `PlaylistCard` col 6, Spotify col 9. **S + C** | ✅ R2 (single item, playlist table), R5 |
 | **P5** | Most non-YouTube videos (Instagram, TikTok, X, Vimeo…) show a blank preview. | `ytdlp._thumbnail_url` only accepts `*.ytimg.com`, `*.ggpht.com`, `*.googleusercontent.com` (`_THUMB_HOST_SUFFIXES`). Everything else is dropped. **S** | ✅ R3 |
 | **P6** | Direct video/audio file links show no preview and no info (duration, resolution, bitrate). | `HttpEngine` analyze builds a preview only for images. **S** | ✅ R3 |
-| **P7** | **Social-media images are blocked while videos work** (Instagram photos/carousels, TikTok photo slideshows, Facebook photos). | They go to gallery-dl, which now needs a login for Instagram ("HTTP redirect to login page", gallery-dl issue #9564, June 2026). TikTok returns 403. yt-dlp ignores photos ("no video in this post"). Our knowledge notes confirm: *"Instagram redirects to login, TikTok profiles 403 (Sept 2026)"*. **S** | R4 |
+| **P7** ✅ R4 | **Social-media images are blocked while videos work** (Instagram photos/carousels, TikTok photo slideshows, Facebook photos). | They go to gallery-dl, which now needs a login for Instagram ("HTTP redirect to login page", gallery-dl issue #9564, June 2026). TikTok returns 403. yt-dlp ignores photos ("no video in this post"). Our knowledge notes confirm: *"Instagram redirects to login, TikTok profiles 403 (Sept 2026)"*. **S** | R4 |
 | **P8** | The blue tick in playlist and Spotify tables is clipped. | `QCheckBox` placed as a *cell widget* in a narrow column with the theme's padding, in compact 30–36 px rows (plus R-6). **S + C** | R5 |
 | **P9** | Spotify album art does not load in the table or queue. | spotDL's free client returns **no cover for playlist rows** (header note in `engines/spotdl.py`). The table only showed the *YouTube match* thumbnail after "Check matches". **S** | R6 |
 | **P10** | **Album metadata replaced by the playlist name.** | `tagging.verify_mp3(album=request.playlist_title)` *always overwrites* `TALB` with the YouTube playlist title. `TRCK` is set to the playlist position. **S** | R5 |
@@ -562,6 +562,24 @@ page video all show a preview. A direct mp3 shows duration and bitrate.
 slideshow, an X post with 4 photos and a Reddit gallery all download at original quality.
 Stories and private accounts give a clear "needs a login" message with the optional login offer.
 Include the owner's Instagram photo link that failed in R3: `https://www.instagram.com/p/DdHWXPMyCL0/`.
+
+> **✅ Done (2026-09-24), approved by Codex, marked done by the owner.** Code commit `e9ce961` on `rebuild`.
+> Tests: **1439 passed, 1 skipped, 20 deselected (network), ruff clean.**
+> - New worker engine `social` (`engines/social.py`). It runs in the yt-dlp env (`core.runner.ENV_OF`) and uses `curl_cffi` with a Chrome
+>   fingerprint. Every hop goes through `http.check_url(https_only)` and is DNS-pinned (`CURLOPT_RESOLVE`); redirects are re-checked by hand.
+>   Item URLs stay in the worker, and downloads go by position.
+> - Instagram: `embed/captioned` (contextJSON, or the 1440w srcset for a single photo), then GraphQL `doc_id`. Stories and highlights answer
+>   "needs a signed-in account" straight away. TikTok: rehydration JSON `imagePost` plus `music` as a 🎵 item, with vt./vm. links resolved.
+>   X: syndication `?name=orig`, and the best mp4 for video. Reddit: `.json` `gallery_data`. Any other page: `og:image`, last in the chain.
+> - Routing: social posts try social, then yt-dlp, then gallery-dl. A post that is a single video goes on to yt-dlp, so it keeps its full format rows.
+>   An unknown page tries yt-dlp, then gallery-dl, then the direct engine, then og:image. When a site login is set, social steps aside for the engines that use it.
+> - Gallery: WebP added (R2 carry-forward closed). 🎞/🎵 badges stay even when a preview exists. "Skip already downloaded" works by position name.
+> - Wording (R3 carry-forward closed): "That post is not public on the site. It needs a signed-in account."; "We couldn't find a video, photo or file at that link."
+> - Live, no login: Instagram photo `DdHWXPMyCL0` ✅ (1440×1920 JPG); X `2102612420057292860` ✅ (1193×1502, **a single photo, not 4**);
+>   Instagram story → login message ✅.
+> - **Not verified live:** Instagram mixed carousel, TikTok slideshow and an X post with 4 photos (no links yet); Reddit gallery (Reddit blocks
+>   anonymous requests from this machine with a captcha, and we did not work around it). Mocked tests cover all of them. Instagram GraphQL rate-limits
+>   after a few calls. The X guest-GraphQL fallback was not built; gallery-dl covers that case.
 
 ### R5 — Playlists, metadata, queue
 One shared track-table widget for YouTube, YTM and Spotify, with model checkboxes (P8). Title cell
