@@ -134,7 +134,7 @@ the milestone named.
 | **P14** | A pasted fragment (e.g. `pbs.twimg.com/media/…` with no `https://`) gets a video-only error. | The router rejects it with video wording. It could add `https://` itself when the host is valid. **S** | R1 |
 | **P15** | Uncertain Spotify matches block the whole batch, or silently become "No match". | R-4, R-5. **C** | R6 |
 | **P16** | Titles in tables cannot be copied. | Table text is not selectable. **S** (Codex fix kept) | R5 |
-| **P17** | Converters tab is clutter. | `8969ee1`. **C** | R0 |
+| **P17** | Converters tab is clutter. | `8969ee1`. **C** | ✅ R0 |
 | **P18** | Queue layout does not fit narrow windows with long titles. | Fixed minimum widths. **S** | R5 |
 | **P19** | Playlist row pictures are tiny (48×27) and exist only for YouTube. Spotify rows are blank until matched, and then show the *YouTube* image. There is no playlist cover in the header. | `ROW_THUMB = QSize(48, 27)`. Row URLs are built only from YouTube video ids. `_request_spotify_thumb` uses the match's video id. **S** | R5, R6 |
 
@@ -463,7 +463,14 @@ test count is recorded.
 > 20 deselected (network), ruff clean.** The other §1.2 keepers are tied to the broken Sep 23 UI,
 > so each is ported in its own milestone instead: thumbnail fetcher → R3, `IMAGE_TYPES` → R1,
 > bulk queue logic and Copy → R5, Spotify `cover_url` → R6.
-> Still open: build and side-by-side check against installed 1.0.0 (§1.1 step 2), then Codex review.
+>
+> **✅ Done (2026-09-24), accepted by the owner.** Code commit `e652efb`. Tests: 1153 passed,
+> 1 skipped, 20 deselected (network), ruff clean. §1.1 step 2: the payload rebuilt from `e652efb`
+> has the same inputs and wheel hashes as installed 1.0.0. 25 of 27 app modules are byte-identical;
+> only `core.history` and `gui.pages` differ, and the installed copies of both match `2171346`
+> bytecode exactly. The rebuilt app shows About "Version 1.0.0", and multi-select History removal
+> keeps the files. Screenshots (outside the repo): `%TEMP%\sdr0\evidence\`. The independent Codex
+> review was not run (Codex was offline); the owner accepted on this evidence.
 
 ### R1 — Media model and detection
 `MediaResult` schema in `core/protocol.py` and `worker/protocol.py` (kept identical by the existing test).
