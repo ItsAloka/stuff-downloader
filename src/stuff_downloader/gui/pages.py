@@ -698,6 +698,17 @@ class DownloadsPage(QWidget):
         self._spotify_matches: dict[str, spotify.Match] = {}
         self._match_waiting: list[spotify.SpotifyTrack] = []
         self._match_runs: dict[str, tuple[Any, spotify.SpotifyTrack, QTimer]] = {}
+        # Spotify v2 (plan §7 item 4). A ticked song with no match yet is looked up first and
+        # downloads as soon as a certain match arrives: _spotify_pending maps it to the queue
+        # group it joins. An uncertain one waits in _spotify_held until the owner reviews it or
+        # asks for all of them. _spotify_sent is what this listing has already queued.
+        self._spotify_pending: dict[str, str] = {}
+        self._spotify_held: set[str] = set()
+        self._spotify_sent: set[str] = set()
+        self._spotify_archive = True
+        # Each row's picture: Spotify's own, from the listing or the track's oEmbed lookup.
+        self._spotify_art_urls: list[str] = []
+        self._spotify_cover_url: str | None = None
         login_row = QHBoxLayout()
         login_row.setContentsMargins(0, 0, 0, 0)
         login_row.addWidget(self.login_button)
@@ -728,6 +739,9 @@ class DownloadsPage(QWidget):
         self.spotify_card = SpotifyCard()
         self.spotify_card.hide()
         self.spotify_card.table.checks_changed.connect(self._update_spotify_selection)
+        self.spotify_card.table.verticalScrollBar().valueChanged.connect(
+            self._request_visible_spotify_art
+        )
         layout.addWidget(self.spotify_card)
 
         queue_header = QHBoxLayout()
@@ -794,6 +808,7 @@ class DownloadsPage(QWidget):
         self.spotify_card.download_button.clicked.connect(self.start_spotify_download)
         self.spotify_card.match_button.clicked.connect(self.check_spotify_matches)
         self.spotify_card.change_requested.connect(self.change_spotify_match)
+        self.spotify_card.uncertain_button.clicked.connect(self.download_uncertain_anyway)
         self.spotify_card.select_all_button.clicked.connect(
             lambda: self._set_spotify_selection(True)
         )
@@ -1027,7 +1042,7 @@ class DownloadsPage(QWidget):
         self._analyze_job_id = spec.job_id
         self._analyze_timed_out = False
         if route.is_spotify:
-            self._show_message("Reading Spotify… this can take up to a minute.")
+            self._show_message("Reading Spotify…")
         else:
             reading = "Reading the playlist…" if route.is_playlist else "Analyzing link…"
             self._show_message(f"{route.note} {reading}" if route.note else reading)
@@ -1331,7 +1346,15 @@ class DownloadsPage(QWidget):
             meta.append(f"showing the first {spotify.MAX_TRACKS}")
         card.meta_label.setText("  ·  ".join(m for m in meta if m))
         card.set_tracks(listing.tracks)
+        self._forget_spotify_batch()
         card.set_uncertain_count(0)
+        # Spotify's own pictures, before any match is looked up (plan §5.6a, §7 item 2).
+        card.header.set_music(True)
+        self._spotify_art_urls = [t.art_url for t in listing.tracks]
+        self._spotify_cover_url = listing.cover or next(
+            (t.art for t in listing.tracks if t.art), None
+        )
+        self._show_spotify_cover()
         self._update_spotify_selection()
         self.result_card.hide()
         self.playlist_card.hide()
@@ -1341,12 +1364,45 @@ class DownloadsPage(QWidget):
             card.hide()
             return
         card.show()
+        # Once the table is laid out, so only the rows on screen are looked up.
+        QTimer.singleShot(0, self._request_visible_spotify_art)
 
     def _reset_spotify(self) -> None:
         self._cancel_matches()
         self._spotify = None
         self._spotify_matches = {}
+        self._forget_spotify_batch()
+        self._spotify_art_urls = []
+        self._spotify_cover_url = None
         self.spotify_card.hide()
+
+    def _forget_spotify_batch(self) -> None:
+        """A new listing starts with nothing waiting to download; queued jobs keep running."""
+        for group_id in list(self._spotify_pending.values()):
+            self._shrink_group(group_id)
+        self._spotify_pending = {}
+        self._spotify_held = set()
+        self._spotify_sent = set()
+
+    def _show_spotify_cover(self) -> None:
+        image = self.thumbs.cached(self._spotify_cover_url)
+        if image is not None:
+            self.spotify_card.header.set_cover(image)
+        else:
+            self.thumbs.request(self._spotify_cover_url)
+
+    def _request_visible_spotify_art(self, *_: Any) -> None:
+        """Lazy, like a playlist: only the rows on screen look up their picture."""
+        if self._spotify is None or not self.spotify_card.isVisible():
+            return
+        urls = self._spotify_art_urls
+        for row in self.spotify_card.visible_rows():
+            url = urls[row] if row < len(urls) else None
+            image = self.thumbs.cached(url)
+            if image is not None:
+                self.spotify_card.set_thumbnail(row, image)
+            else:
+                self.thumbs.request(url)
 
     def _set_spotify_selection(self, checked: bool) -> None:
         self.spotify_card.set_all_checked(checked)
@@ -1394,9 +1450,13 @@ class DownloadsPage(QWidget):
             try:
                 run = self._new_run(spec)
             except WorkerRuntimeMissing as exc:
+                stranded = [track, *self._match_waiting]
                 self._match_waiting.clear()
                 self._show_message(f"Cannot start the downloader: {exc}", error=True)
-                self.spotify_card.set_status(self._spotify_row(track), "Not checked", warn=True)
+                for waiting in stranded:
+                    row = self._spotify_row(waiting)
+                    self.spotify_card.set_status(row, "Not checked", warn=True)
+                    self._settle_pending(waiting)
                 break
             timer = QTimer(self)
             timer.setSingleShot(True)
@@ -1433,7 +1493,6 @@ class DownloadsPage(QWidget):
                 else:
                     self._spotify_matches[track.track_id] = match
                     self.spotify_card.set_match(row, match)
-                    self._update_uncertain()
             else:
                 code = event.data.get("code")
                 if code == "cancelled":
@@ -1445,8 +1504,44 @@ class DownloadsPage(QWidget):
                         errors.friendly_message(code, event.data.get("message"))
                     )
                 self.spotify_card.set_status(row, text, warn=True)
+            self._settle_pending(track)
+            self._update_uncertain()
         self._pump_matches()
         self._update_spotify_selection()
+
+    def _settle_pending(self, track: spotify.SpotifyTrack) -> None:
+        """A song the owner asked to download has its lookup back (plan §7 item 4).
+
+        A certain match downloads now, in the batch it was asked for with. An uncertain one is
+        held for review, and a song with no match at all is left for Change…; neither holds up
+        the batch, which simply counts one song fewer.
+        """
+        group_id = self._spotify_pending.pop(track.track_id, None)
+        if group_id is None:
+            return
+        match = self._spotify_matches.get(track.track_id)
+        if match is not None and not spotify.is_uncertain(match):
+            self._send_spotify([track], group_id)
+            return
+        self._shrink_group(group_id)
+        if match is not None:
+            self._spotify_held.add(track.track_id)
+
+    def _shrink_group(self, group_id: str) -> None:
+        """One song fewer in a queue group, because it waits (or failed) before being queued."""
+        group = self._groups.get(group_id)
+        if group is None:
+            return
+        group.total = max(0, group.total - 1)
+        members = [j for j in self.jobs.values() if j.group_id == group_id]
+        if not members and not group.total:
+            self._groups.pop(group_id)
+            self.queue_layout.removeWidget(group.card)
+            group.card.deleteLater()
+            return
+        group.card.set_counts(group.done, group.total, group.failed, group.skipped)
+        if members and group.done + group.failed + group.skipped >= group.total:
+            self._notify_finished(members[-1], members[-1].state, "")
 
     def _cancel_matches(self) -> None:
         self._match_waiting.clear()
@@ -1459,7 +1554,9 @@ class DownloadsPage(QWidget):
         self, track: spotify.SpotifyTrack, candidates: tuple[spotify.Candidate, ...]
     ) -> spotify.Candidate | str | None:
         """The owner's choice for one song: a looked-up result, a pasted link, or None."""
-        dialog = MatchDialog(track, candidates, self)
+        # Spotify's cover beside the YouTube picture of the selected result (plan §5.6a).
+        art = self.spotify_card.art(self._spotify_row(track))
+        dialog = MatchDialog(track, candidates, self, art=art, thumbs=self.thumbs)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
         return dialog.choice()
@@ -1491,54 +1588,131 @@ class DownloadsPage(QWidget):
         match = spotify.with_candidates(match, candidates)
         self._spotify_matches[track.track_id] = match
         self.spotify_card.set_match(row, match)
+        # A held song the owner has now reviewed is what they asked for: it downloads.
+        if track.track_id in self._spotify_held:
+            self._spotify_held.discard(track.track_id)
+            self._send_spotify([track], "")
         self._update_uncertain()
         self._show_message("")
         return match
 
-    def _update_uncertain(self) -> None:
-        """The header count of matches to check, over the songs in the current listing."""
+    def _waiting_uncertain(self) -> list[spotify.SpotifyTrack]:
+        """Songs with an uncertain match that have not been queued: they wait for review."""
         listing = self._spotify
-        tracks = listing.tracks if listing is not None else ()
-        count = sum(
-            1
-            for track in tracks
-            if (m := self._spotify_matches.get(track.track_id)) is not None
+        return [
+            track
+            for track in (listing.tracks if listing is not None else ())
+            if track.track_id not in self._spotify_sent
+            and (m := self._spotify_matches.get(track.track_id)) is not None
             and spotify.is_uncertain(m)
-        )
-        self.spotify_card.set_uncertain_count(count)
+        ]
+
+    def _update_uncertain(self) -> None:
+        """The header count of uncertain matches still waiting, over the current listing."""
+        self.spotify_card.set_uncertain_count(len(self._waiting_uncertain()))
 
     def start_spotify_download(self) -> list[QueuedJob]:
-        """One ordinary MP3 job per ticked song, each carrying its reviewed match if any."""
+        """Download the ticked songs; uncertain matches wait, never block (plan §7 item 4).
+
+        A song with a certain match (or the owner's own choice) is queued now. A song not
+        checked yet is looked up first and joins the same batch the moment its match turns out
+        certain. A song whose match is uncertain waits with a ⚠ for Review… or "Download
+        uncertain anyway". Returns the jobs queued right now.
+        """
         listing = self._spotify
         route = self._route
-        tracks = self.selected_spotify_tracks()
+        tracks = [t for t in self.selected_spotify_tracks() if t.track_id not in self._spotify_sent]
         if listing is None or route is None or not route.is_spotify or not tracks:
+            return []
+        self._spotify_archive = self.spotify_card.archive_check.isChecked()
+        busy = {t.track_id for t in self._match_waiting}
+        busy |= {track.track_id for _, track, _ in self._match_runs.values()}
+        now, lookup, held = [], [], []
+        for track in tracks:
+            if track.track_id in self._spotify_pending:
+                continue  # already asked for; its lookup is on the way
+            match = self._spotify_matches.get(track.track_id)
+            if match is None:
+                lookup.append(track)
+            elif spotify.is_uncertain(match):
+                held.append(track)
+            else:
+                now.append(track)
+        group_id = ""
+        total = len(now) + len(lookup)
+        if total > 1:
+            group_id = uuid.uuid4().hex
+            self.store.add_group(group_id, listing.title, route.url, total)
+            group_card = GroupCard(listing.title, total)
+            self.queue_layout.insertWidget(0, group_card)
+            self._groups[group_id] = GroupState(group_card, total, listing.title)
+        for track in lookup:
+            self._spotify_pending[track.track_id] = group_id
+            if track.track_id not in busy:
+                self._match_waiting.append(track)
+                self.spotify_card.set_status(self._spotify_row(track), "Waiting to check…")
+        self._spotify_held.update(t.track_id for t in held)
+        jobs = self._send_spotify(now, group_id)
+        self._pump_matches()
+        if held:
+            noun = "song waits" if len(held) == 1 else "songs wait"
+            self._show_message(f"{len(held)} uncertain {noun} for review; the rest go ahead.")
+        self._update_uncertain()
+        self._update_spotify_selection()
+        return jobs
+
+    def download_uncertain_anyway(self) -> list[QueuedJob]:
+        """The one button that sends every waiting uncertain match as it is."""
+        tracks = self._waiting_uncertain()
+        if not tracks or self._spotify is None:
+            return []
+        group_id = ""
+        if len(tracks) > 1:
+            listing = self._spotify
+            group_id = uuid.uuid4().hex
+            title = f"{listing.title} (uncertain)"
+            route_url = self._route.url if self._route is not None else ""
+            self.store.add_group(group_id, title, route_url, len(tracks))
+            group_card = GroupCard(title, len(tracks))
+            self.queue_layout.insertWidget(0, group_card)
+            self._groups[group_id] = GroupState(group_card, len(tracks), title)
+        self._spotify_held.difference_update(t.track_id for t in tracks)
+        jobs = self._send_spotify(tracks, group_id)
+        self._update_uncertain()
+        self._show_message("")
+        return jobs
+
+    def _send_spotify(self, tracks: list[spotify.SpotifyTrack], group_id: str) -> list[QueuedJob]:
+        """Queue one tagged-MP3 job per song, each with its match and Spotify's picture."""
+        listing = self._spotify
+        if listing is None or not tracks:
             return []
         specs = spotify.batch_specs(
             tracks,
             self._spotify_matches,
             str(self._settings.effective_download_dir()),
-            archive=self.spotify_card.archive_check.isChecked(),
+            archive=self._spotify_archive,
             edited_titles=unique_names(
                 (t.track_id, self.spotify_card.table.edited_title(self._spotify_row(t)))
                 for t in tracks
             ),
+            album_order=listing.kind == "album",
         )
-        group_id = ""
-        if len(specs) > 1:
-            group_id = uuid.uuid4().hex
-            self.store.add_group(group_id, listing.title, route.url, len(specs))
-            group_card = GroupCard(listing.title, len(specs))
-            self.queue_layout.insertWidget(0, group_card)
-            self._groups[group_id] = GroupState(group_card, len(specs), listing.title)
         jobs = []
         for spec, track in zip(specs, tracks, strict=True):
+            self._spotify_sent.add(track.track_id)
             title = spec.options.get("edited_title") or (
                 f"{track.artist} - {track.title}" if track.artist else track.title
             )
-            # Spotify's art, not the YouTube match's picture, is the song's (plan §5.6a); it
-            # arrives with Spotify v2 (R6), so until then the card keeps its placeholder.
-            jobs.append(self._add_job(spec, title, group_id, music=True))
+            # Spotify's art, never the YouTube match's picture, follows the song into the
+            # queue and History (plan §5.6a).
+            job = self._add_job(spec, title, group_id, thumb_url=track.art_url, music=True)
+            art = self.spotify_card.art(self._spotify_row(track))
+            if art is not None:
+                job.card.set_thumbnail(art)
+            else:
+                self._set_job_thumb(job, track.art_url)
+            jobs.append(job)
         self.empty_state.hide()
         self.scheduler.submit_all(specs)
         self._update_summary()
@@ -1572,6 +1746,11 @@ class DownloadsPage(QWidget):
         for row, row_url in enumerate(self._playlist_thumb_urls):
             if row_url == url:
                 self.playlist_card.set_thumbnail(row, image)
+        if url == self._spotify_cover_url:
+            self.spotify_card.header.set_cover(image)
+        for row, row_url in enumerate(self._spotify_art_urls):
+            if row_url == url:
+                self.spotify_card.set_thumbnail(row, image)
         for job_id, job_url in self._job_thumbs.items():
             job = self.jobs.get(job_id)
             if job_url == url and job is not None:

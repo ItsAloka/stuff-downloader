@@ -1,8 +1,10 @@
-"""Spotify match review (item 9): our own score, uncertain badges and the Change… dialog."""
+"""Spotify match review (plan §7): our own score, uncertain badges and the Change… dialog."""
 
 from __future__ import annotations
 
 import pytest
+from PyQt6.QtCore import QObject, QPoint, pyqtSignal
+from PyQt6.QtGui import QColor, QImage
 from PyQt6.QtWidgets import QDialogButtonBox
 from test_spotify_page import (  # noqa: F401  (fixtures)
     T1,
@@ -18,6 +20,7 @@ from test_spotify_page import (  # noqa: F401  (fixtures)
 )
 
 from stuff_downloader.core import spotify
+from stuff_downloader.gui import pages
 from stuff_downloader.gui.widgets import MatchDialog, SpotifyCard
 
 VID3 = "abcdefghijk"
@@ -48,11 +51,18 @@ def test_wrong_recordings_are_uncertain(title, channel, duration):
 
 def test_the_threshold_edges_are_exactly_as_stated():
     at = spotify.Match(T1, VID, duration_diff=spotify.UNCERTAIN_DIFF, score=spotify.UNCERTAIN_SCORE)
-    assert not spotify.is_uncertain(at)  # "under 70" and "more than 10 s"
+    assert not spotify.is_uncertain(at)  # "under 70" and "more than 3 s"
     over = spotify.Match(T1, VID, duration_diff=spotify.UNCERTAIN_DIFF + 0.1, score=99.0)
     under = spotify.Match(T1, VID, duration_diff=0.0, score=spotify.UNCERTAIN_SCORE - 0.1)
     assert spotify.is_uncertain(over) and spotify.is_uncertain(under)
-    assert "70%" in spotify.UNCERTAIN_RULE and "10 s" in spotify.UNCERTAIN_RULE
+    assert "70%" in spotify.UNCERTAIN_RULE and "3 s" in spotify.UNCERTAIN_RULE
+    assert "video" in spotify.UNCERTAIN_RULE
+
+
+def test_a_video_is_uncertain_however_well_it_scores():
+    video = spotify.Match(T1, VID, duration_diff=0.0, score=100.0, method="video")
+    assert spotify.is_uncertain(video)
+    assert not spotify.is_uncertain(spotify.Match(T1, VID, score=100.0, method="album"))
 
 
 def test_the_owners_own_choice_is_never_flagged():
@@ -122,7 +132,7 @@ def test_uncertain_rows_get_a_badge_and_the_header_counts_them_before_download(
     assert card.cell_text(1, SpotifyCard.SCORE_COLUMN).startswith("⚠")
     assert "Uncertain" in card.table.item(1, SpotifyCard.SCORE_COLUMN).toolTip()
     assert not card.uncertain_label.isHidden()
-    assert card.uncertain_label.text().startswith("⚠  1 uncertain match — ")
+    assert card.uncertain_label.text().startswith("⚠  1 uncertain match waits for review — ")
     assert spotify.UNCERTAIN_RULE in card.uncertain_label.text()
     assert page.jobs == {}  # all of this happens before anything downloads
 
@@ -151,7 +161,9 @@ def test_picking_a_candidate_fixes_the_row_and_the_download_uses_it(
     card.table.set_checked(1, True)
     (job,) = page.start_spotify_download()
     assert job.spec.url.endswith(T2)
-    assert job.spec.options == spotify.download_options(VID3, archive=True)
+    assert job.spec.options == spotify.download_options(
+        VID3, archive=True, album="Global Warming", album_track=2
+    )
 
     # A second Change… still offers the same results to go back to.
     monkeypatch.setattr(page, "_ask_match", lambda t, c: seen.update(again=c))
@@ -166,9 +178,9 @@ def test_the_existing_warning_colour_is_kept(page, runs, qtbot):  # noqa: F811
 
 
 # ── the dialog ───────────────────────────────────────────────────────────────────────────
-def _dialog(qtbot, candidates):
+def _dialog(qtbot, candidates, **extra):
     track = spotify.SpotifyTrack(T3, 3, "Feel This Moment", ("Pitbull",), duration=229.0)
-    dialog = MatchDialog(track, candidates)
+    dialog = MatchDialog(track, candidates, **extra)
     qtbot.addWidget(dialog)
     return dialog
 
@@ -176,19 +188,22 @@ def _dialog(qtbot, candidates):
 CANDS = (
     spotify.Candidate(VID2, "Feel This Moment", "Pitbull", 230.0),
     spotify.Candidate(VID3, "<b>Feel This Moment (Live)</b>", "Fan", 300.0),
+    spotify.Candidate(VID, "Feel This Moment (Official Video)", "Pitbull", 229.0, kind="video"),
 )
 
 
-def test_the_dialog_lists_candidates_with_length_diff_and_score(qtbot):
+def test_the_dialog_lists_candidates_with_how_they_were_found_length_diff_and_score(qtbot):
     dialog = _dialog(qtbot, CANDS)
     table = dialog.table
-    assert [table.item(0, c).text() for c in range(5)] == [
-        "Feel This Moment", "Pitbull", "3:50", "+1s", table.item(0, 4).text()
-    ]
-    assert not table.item(0, 4).text().startswith("⚠")
-    assert table.item(1, 4).text().startswith("⚠")
+    assert [table.item(0, c).text() for c in range(6)] == [
+        "Feel This Moment", "Pitbull", "Song", "3:50", "+1s", table.item(0, 5).text()
+    ]  # fmt: skip
+    assert not table.item(0, 5).text().startswith("⚠")
+    assert table.item(1, 5).text().startswith("⚠")
+    # A video is flagged whatever its score: it is only ever a fallback.
+    assert table.item(2, 2).text() == "Video" and table.item(2, 5).text().startswith("⚠")
     assert "&lt;b&gt;" in table.item(1, 0).toolTip()  # site text stays text
-    assert dialog.choice() is None  # nothing picked yet
+    assert dialog.choice() == CANDS[0]  # the current pick is selected first
 
 
 def test_the_dialog_returns_the_selected_candidate_or_a_pasted_link(qtbot):
@@ -204,3 +219,75 @@ def test_the_dialog_without_candidates_still_takes_a_link(qtbot):
     assert dialog.table.isHidden()
     ok = dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.StandardButton.Ok)
     assert ok.text() == "Use this recording"
+
+
+# ── the pictures in the dialog (plan §5.6a) ───────────────────────────────────────────────
+class _Thumbs(QObject):
+    """A stand-in loader: records what the dialog asks for and answers when told to."""
+
+    loaded = pyqtSignal(str, QImage)
+
+    def __init__(self):
+        super().__init__()
+        self.requested: list[str] = []
+        self.images: dict[str, QImage] = {}
+
+    def cached(self, url):
+        return self.images.get(url)
+
+    def request(self, url):
+        self.requested.append(url)
+        return True
+
+
+def _solid(colour, width=64, height=36):
+    image = QImage(width, height, QImage.Format.Format_RGB32)
+    image.fill(QColor(colour))
+    return image
+
+
+def test_the_dialog_shows_spotifys_cover_beside_the_selected_results_youtube_picture(qtbot):
+    thumbs = _Thumbs()
+    dialog = _dialog(qtbot, CANDS, art=_solid("#00ff00", 56, 56), thumbs=thumbs)
+    middle = QPoint(dialog.SPOTIFY_ART.width() // 2, dialog.SPOTIFY_ART.height() // 2)
+    assert dialog.spotify_art.pixmap().toImage().pixelColor(middle) == QColor("#00ff00")
+    # The YouTube picture is the selected result's, built from its video id only.
+    first = f"https://i.ytimg.com/vi/{VID2}/mqdefault.jpg"
+    assert thumbs.requested == [first] and dialog.match_art_url == first
+    thumbs.loaded.emit(first, _solid("#ff0000"))
+    centre = QPoint(dialog.MATCH_ART.width() // 2, dialog.MATCH_ART.height() // 2)
+    assert dialog.match_art.pixmap().toImage().pixelColor(centre) == QColor("#ff0000")
+
+    thumbs.images[f"https://i.ytimg.com/vi/{VID3}/mqdefault.jpg"] = _solid("#0000ff")
+    dialog.table.selectRow(1)
+    assert dialog.match_art.pixmap().toImage().pixelColor(centre) == QColor("#0000ff")
+    # A late picture for a result no longer selected lands nowhere.
+    thumbs.loaded.emit(first, _solid("#ff0000"))
+    assert dialog.match_art.pixmap().toImage().pixelColor(centre) == QColor("#0000ff")
+
+
+def test_the_dialog_without_art_or_a_loader_shows_placeholders(qtbot):
+    dialog = _dialog(qtbot, CANDS)
+    assert not dialog.spotify_art.pixmap().isNull()
+    assert not dialog.match_art.pixmap().isNull()
+
+
+def test_change_opens_the_dialog_with_the_rows_spotify_art_and_the_pages_loader(
+    page, runs, qtbot, monkeypatch  # noqa: F811
+):
+    _with_matches(page, runs, qtbot, _wrong(T2))
+    art = _solid("#00ff00", 56, 56)
+    page.spotify_card.set_thumbnail(1, art)
+    seen = {}
+
+    class Recorder:
+        def __init__(self, track, candidates, parent, art=None, thumbs=None):
+            seen.update(track=track, art=art, thumbs=thumbs)
+
+        def exec(self):
+            return 0
+
+    monkeypatch.setattr(pages, "MatchDialog", Recorder)
+    assert page.change_spotify_match(1) is None
+    assert seen["track"].track_id == T2 and seen["thumbs"] is page.thumbs
+    assert seen["art"] is not None and seen["art"].pixelColor(28, 28) == QColor("#00ff00")

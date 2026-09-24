@@ -1,14 +1,17 @@
 """Thumbnails for rows and queue cards, loaded off the GUI thread.
 
-The GUI fetches only images whose URL it built itself from a validated YouTube video id
-(``i.ytimg.com``, https). Every other preview — a gallery tile, a direct image link, the analyzed
-video's cover — is fetched by the worker, behind its own address checks, and arrives as bytes.
+The GUI fetches only images whose URL it built itself from a validated id: a YouTube video's
+thumbnail (``i.ytimg.com``), a Spotify picture by its hash (``i.scdn.co/image/<hash>``), or a
+Spotify track's oEmbed lookup (``open.spotify.com/oembed``), whose answer is read only for its
+picture's hash. Every other preview — a gallery tile, a direct image link, the analyzed video's
+cover — is fetched by the worker, behind its own address checks, and arrives as bytes.
 All image bytes, from either side, are decoded here with a byte cap and a pixel cap checked from
 the header before any pixels are allocated. Any failure just leaves the placeholder.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import urllib.request
 from collections import OrderedDict
@@ -31,6 +34,17 @@ ROW_BOX = QSize(160, 160)  # rows and queue cards: keeps a full cache near 25 MB
 
 ALLOWED_HOSTS = frozenset({"i.ytimg.com"})
 _VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+# Spotify: exactly the two forms core.spotify builds, nothing else on those hosts.
+_SPOTIFY_IMAGE = re.compile(r"https://i\.scdn\.co/image/[0-9a-f]{40}")
+_SPOTIFY_OEMBED = re.compile(
+    r"https://open\.spotify\.com/oembed\?url=https://open\.spotify\.com/track/[A-Za-z0-9]{22}"
+)
+# The oEmbed answer holds a few hundred bytes of JSON.
+MAX_OEMBED_BYTES = 64 * 1024
+# Spotify's picture hosts in an oEmbed answer; the picture is re-fetched from i.scdn.co by hash.
+_OEMBED_THUMB = re.compile(
+    r"https://(?:i\.scdn\.co|image-cdn-[a-z]{2}\.spotifycdn\.com)/image/([0-9a-f]{40})"
+)
 
 Fetch = Callable[[str], bytes]
 
@@ -47,6 +61,10 @@ def youtube_thumb_url(video_id: str | None) -> str | None:
 
 
 def allowed(url: str) -> bool:
+    if not isinstance(url, str):
+        return False
+    if _SPOTIFY_IMAGE.fullmatch(url) or _SPOTIFY_OEMBED.fullmatch(url):
+        return True
     try:
         parts = urlsplit(url)
     except ValueError:
@@ -68,18 +86,41 @@ class _NoForeignRedirects(urllib.request.HTTPRedirectHandler):
 
 
 def fetch(url: str) -> bytes:
-    """GET ``url`` with a timeout and a size cap. Only allow-listed https image hosts."""
+    """GET ``url`` with a timeout and a size cap. Only allow-listed https image hosts.
+
+    A Spotify oEmbed URL is followed through to its picture: only the picture's hash is read
+    from the answer, and the image itself is fetched from i.scdn.co.
+    """
     if not allowed(url):
         raise ThumbnailError("not an allowed image URL")
+    if _SPOTIFY_OEMBED.fullmatch(url):
+        return fetch(spotify_oembed_picture(_get(url, MAX_OEMBED_BYTES)))
+    return _get(url, MAX_BYTES)
+
+
+def spotify_oembed_picture(answer: bytes) -> str:
+    """The i.scdn.co picture an oEmbed answer names; ThumbnailError for anything else."""
+    try:
+        data = json.loads(answer)
+    except ValueError:
+        raise ThumbnailError("oEmbed answer is not JSON") from None
+    thumb = data.get("thumbnail_url") if isinstance(data, dict) else None
+    found = _OEMBED_THUMB.fullmatch(thumb) if isinstance(thumb, str) else None
+    if found is None:
+        raise ThumbnailError("oEmbed answer names no Spotify picture")
+    return f"https://i.scdn.co/image/{found.group(1)}"
+
+
+def _get(url: str, cap: int) -> bytes:
     opener = urllib.request.build_opener(_NoForeignRedirects)
     request = urllib.request.Request(url, headers={"User-Agent": "StuffDownloader"})
     with opener.open(request, timeout=TIMEOUT) as resp:  # noqa: S310 (allow-listed https)
         length = resp.headers.get("Content-Length")
-        if length and length.isdigit() and int(length) > MAX_BYTES:
-            raise ThumbnailError("image too large")
-        data = resp.read(MAX_BYTES + 1)
-    if len(data) > MAX_BYTES:
-        raise ThumbnailError("image too large")
+        if length and length.isdigit() and int(length) > cap:
+            raise ThumbnailError("response too large")
+        data = resp.read(cap + 1)
+    if len(data) > cap:
+        raise ThumbnailError("response too large")
     return data
 
 

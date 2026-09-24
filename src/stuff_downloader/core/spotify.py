@@ -1,13 +1,13 @@
-"""Spotify listings, matches and the per-track jobs a batch expands into (plan §6.3). No Qt.
+"""Spotify listings, matches and the per-track jobs a batch expands into (plan §7). No Qt.
 
 Spotify audio is DRM-protected and never captured. Each track's audio is *matched* from YouTube
-Music by the spotDL engine, so a wrong recording can be picked. The flow therefore has three
-worker modes, each an ordinary job on the ``spotdl`` engine:
+Music, so a wrong recording can be picked. The flow therefore has three worker modes, each an
+ordinary job on the ``spotdl`` engine:
 
-- ``analyze`` on a track/album/playlist link lists the tracks, and does no matching: spotDL's
-  matcher takes tens of seconds per track, far too slow to run before the list can be shown.
-- ``match`` on one track link returns the YouTube result it would download, with the duration
-  difference and spotDL's own confidence score, for the match review table.
+- ``analyze`` on a track/album/playlist link lists the tracks from Spotify's public embed page,
+  with Spotify's own artwork, and does no matching.
+- ``match`` on one track link returns the YouTube Music result it would download and how it was
+  found: on the album, as a song, or only as a video (always uncertain, plan §7 item 3).
 - ``download`` on one track link downloads the reviewed match (or searches, if none was given),
   and tags the MP3 with Spotify's metadata and cover.
 
@@ -33,15 +33,23 @@ MAX_TEXT = 300
 MAX_ARTISTS = 20
 MAX_DURATION = 24 * 3600  # seconds; anything longer is not a song
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
+# Spotify's pictures, by hash. The worker normalizes every host to i.scdn.co; core re-checks.
+IMAGE_URL = re.compile(r"https://i\.scdn\.co/image/[0-9a-f]{40}")
 
 MAX_CANDIDATES = 8
 
-# A match is "uncertain" (item 9) when our score is under UNCERTAIN_SCORE or the recording's
-# length is off by more than UNCERTAIN_DIFF seconds. Both are shown to the owner, verbatim.
+# How the worker found a match (plan §7 item 3). Only "video" is a fallback.
+METHODS = ("album", "song", "video")
+CANDIDATE_KINDS = ("song", "video")
+
+# A match is "uncertain" when it was found only as a video, our score is under UNCERTAIN_SCORE,
+# or the recording's length is off by more than UNCERTAIN_DIFF seconds. The rule is shown to
+# the owner verbatim.
 UNCERTAIN_SCORE = 70.0
-UNCERTAIN_DIFF = 10.0
+UNCERTAIN_DIFF = 3.0
 UNCERTAIN_RULE = (
-    f"score under {UNCERTAIN_SCORE:.0f}% or length off by more than {UNCERTAIN_DIFF:.0f} s"
+    f"found only as a video, score under {UNCERTAIN_SCORE:.0f}% or length off by more than "
+    f"{UNCERTAIN_DIFF:.0f} s"
 )
 _FEAT = re.compile(r"[\(\[]\s*(feat|ft|with)\.?\s[^\)\]]*[\)\]]|\s(feat|ft)\.?\s.*$", re.I)
 _NON_WORD = re.compile(r"[^\w]+")
@@ -73,10 +81,16 @@ class SpotifyTrack:
     album: str = ""
     duration: float | None = None
     explicit: bool = False
+    art: str = ""  # Spotify's own picture (i.scdn.co), when the listing named one
 
     @property
     def url(self) -> str:
         return spotify_url("track", self.track_id)
+
+    @property
+    def art_url(self) -> str:
+        """Where the row's picture comes from: the listing's, or the track's oEmbed lookup."""
+        return self.art or oembed_url(self.track_id)
 
     @property
     def artist(self) -> str:
@@ -92,6 +106,7 @@ class SpotifyListing:
     owner: str = ""
     truncated: bool = False
     skipped: int = 0  # rows the worker reported that were not usable (local files, podcasts)
+    cover: str = ""  # the playlist's or album's own cover (i.scdn.co)
 
 
 @dataclass(frozen=True)
@@ -108,6 +123,8 @@ class Match:
     manual: bool = False  # the owner chose this one (pasted, or picked from the candidates)
     score: float | None = None  # our own score (match_score); None for a pasted link
     candidates: tuple[Candidate, ...] = ()
+    method: str = ""  # "album", "song" or "video" for an automatic match
+    album: str = ""  # the YouTube Music album it was found on, when known
 
     @property
     def url(self) -> str:
@@ -122,6 +139,19 @@ class Candidate:
     title: str = ""
     channel: str = ""
     duration: float | None = None
+    kind: str = "song"  # "song" or "video"
+
+
+def image_url(value: Any) -> str:
+    """A Spotify picture URL exactly as the worker normalizes it, or ""."""
+    return value if isinstance(value, str) and IMAGE_URL.fullmatch(value) else ""
+
+
+def oembed_url(track_id: str) -> str:
+    """The oEmbed lookup for one track's 300 px picture, built from a validated id only."""
+    if not SPOTIFY_ID.fullmatch(track_id or ""):
+        raise ValueError(f"invalid Spotify track id: {track_id!r}")
+    return f"https://open.spotify.com/oembed?url=https://open.spotify.com/track/{track_id}"
 
 
 def _norm(text: str) -> str:
@@ -153,6 +183,8 @@ def is_uncertain(match: Match) -> bool:
     """A match to check before downloading. A link the owner chose is never flagged."""
     if match.manual:
         return False
+    if match.method == "video":
+        return True
     if match.duration_diff is not None and abs(match.duration_diff) > UNCERTAIN_DIFF:
         return True
     return match.score is not None and match.score < UNCERTAIN_SCORE
@@ -178,6 +210,7 @@ def parse_candidates(data: Any, track: SpotifyTrack) -> tuple[Candidate, ...]:
                 title=_text(row.get("title")),
                 channel=_text(row.get("channel")),
                 duration=_seconds(row.get("duration")),
+                kind=row.get("kind") if row.get("kind") in CANDIDATE_KINDS else "video",
             )
         )
     return tuple(out)
@@ -194,6 +227,7 @@ def candidate_match(candidate: Candidate, track: SpotifyTrack) -> Match:
         duration_diff=duration_diff(candidate.duration, track.duration),
         score=match_score(track, candidate.title, candidate.channel, candidate.duration),
         manual=True,
+        method=candidate.kind,
     )
 
 
@@ -218,6 +252,7 @@ def parse_track(raw: Any, index: int) -> SpotifyTrack | None:
         album=_text(raw.get("album")),
         duration=_seconds(raw.get("duration")),
         explicit=raw.get("explicit") is True,
+        art=image_url(raw.get("art")),
     )
 
 
@@ -254,6 +289,7 @@ def parse_listing(data: Any) -> SpotifyListing:
         owner=_text(data.get("owner")),
         truncated=bool(data.get("truncated")) or len(raw_tracks) > MAX_TRACKS,
         skipped=max(0, min(worker_skipped, 100_000)) + dropped,
+        cover=image_url(data.get("cover")),
     )
 
 
@@ -284,6 +320,9 @@ def parse_match(data: Any, track: SpotifyTrack) -> Match | None:
         # Our own score, computed here too: the worker's number is never the verdict.
         score=match_score(track, title, channel, duration),
         candidates=parse_candidates(data, track),
+        # Unknown reads as the weakest: a match the worker cannot vouch for is uncertain.
+        method=data.get("method") if data.get("method") in METHODS else "video",
+        album=_text(data.get("album")),
     )
 
 
@@ -314,19 +353,27 @@ def analyze_options() -> dict[str, Any]:
     return {"mode": "analyze"}
 
 
-def match_options() -> dict[str, Any]:
-    return {"mode": "match"}
+def match_options(album: str | None = None) -> dict[str, Any]:
+    """``album`` (an album link's own name) lets the worker look on that album first."""
+    options: dict[str, Any] = {"mode": "match"}
+    if _text(album):
+        options["album"] = _text(album)
+    return options
 
 
 def download_options(
-    video_id: str | None = None, archive: bool = True, edited_title: str | None = None
+    video_id: str | None = None,
+    archive: bool = True,
+    edited_title: str | None = None,
+    album: str | None = None,
+    album_track: int | None = None,
 ) -> dict[str, Any]:
     """The job ``options`` for one track's download. Mirrors the worker's validation exactly.
 
-    ``edited_title`` names the file only (plan §5.5); the tags stay Spotify's.
-
-    Nothing about the listing travels: unlike a YouTube playlist, every Spotify track carries its
-    own album, track number and cover, and those are what the file is tagged with.
+    ``edited_title`` names the file only (plan §5.5); the tags stay Spotify's. ``album`` is the
+    track's real album (the album link itself, or the matched YouTube Music song's), and
+    ``album_track`` its position on an album link: the only time a track number is written
+    (plan §5.7).
     """
     options: dict[str, Any] = {"mode": "download", "preset": PRESET_ID, "archive": bool(archive)}
     if video_id is not None:
@@ -336,6 +383,16 @@ def download_options(
     title = (edited_title or "").strip()
     if title:
         options["edited_title"] = title[:300]
+    if _text(album):
+        options["album"] = _text(album)
+    if album_track is not None:
+        if (
+            isinstance(album_track, bool)
+            or not isinstance(album_track, int)
+            or not 1 <= album_track <= MAX_TRACKS
+        ):
+            raise ValueError(f"invalid track number: {album_track!r}")
+        options["album_track"] = album_track
     return options
 
 
@@ -346,7 +403,7 @@ def match_spec(track: SpotifyTrack) -> JobSpec:
         engine=ENGINE,
         url=track.url,
         output_dir=".",
-        options=match_options(),
+        options=match_options(track.album),
     )
 
 
@@ -356,10 +413,12 @@ def batch_specs(
     output_dir: str,
     archive: bool = True,
     edited_titles: dict[str, str] | None = None,
+    album_order: bool = False,
 ) -> list[JobSpec]:
     """One ordinary download job per selected track, carrying its reviewed match if any.
 
     A track with no reviewed match is still queued: the worker then searches for it itself.
+    ``album_order`` (an album link) makes each track's listing position its track number.
     """
     specs = []
     for track in tracks:
@@ -368,6 +427,8 @@ def batch_specs(
             video_id=match.video_id if match is not None else None,
             archive=archive,
             edited_title=(edited_titles or {}).get(track.track_id),
+            album=track.album or (match.album if match is not None else ""),
+            album_track=track.index if album_order else None,
         )
         specs.append(
             JobSpec(

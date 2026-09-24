@@ -1,4 +1,4 @@
-"""core.spotify: what a Spotify listing, match and batch may look like (plan §6.3)."""
+"""core.spotify: what a Spotify listing, match and batch may look like (plan §7)."""
 
 from __future__ import annotations
 
@@ -194,18 +194,20 @@ def test_anything_but_one_youtube_video_is_refused_as_an_override(text):
 
 # ── specs ─────────────────────────────────────────────────────────────────────────────────
 def test_batch_specs_are_one_ordinary_job_per_ticked_track():
-    listing = spotify.parse_listing(listing_data())
+    listing = spotify.parse_listing(listing_data(tracks=[row(album=""), row(T2, album="")]))
     first, second = listing.tracks
     specs = spotify.batch_specs(
-        [first, second], {T1: spotify.Match(T1, VID)}, "C:/Music", archive=True
+        [first, second], {T1: spotify.Match(T1, VID, album="Global Warming")}, "C:/Music"
     )
     assert [s.engine for s in specs] == ["spotdl", "spotdl"]
     assert [s.url for s in specs] == [first.url, second.url]
+    # A playlist row's album is the matched YouTube Music song's; no track number.
     assert specs[0].options == {
         "mode": "download",
         "preset": "spotify_mp3",
         "archive": True,
         "video_id": VID,
+        "album": "Global Warming",
     }
     # No reviewed match: the worker searches for itself.
     assert specs[1].options == {"mode": "download", "preset": "spotify_mp3", "archive": True}
@@ -214,12 +216,84 @@ def test_batch_specs_are_one_ordinary_job_per_ticked_track():
         assert JobSpec.from_json(spec.to_json()) == spec
 
 
+def test_an_album_link_carries_its_own_album_and_track_numbers():
+    listing = spotify.parse_listing(listing_data())
+    specs = spotify.batch_specs(
+        list(listing.tracks), {T2: spotify.Match(T2, VID, album="Other")}, "C:/M", album_order=True
+    )
+    assert [s.options["album"] for s in specs] == ["Global Warming", "Global Warming"]
+    assert [s.options["album_track"] for s in specs] == [1, 2]
+
+
+@pytest.mark.parametrize("number", [0, spotify.MAX_TRACKS + 1, True, "1"])
+def test_a_bad_track_number_never_reaches_a_spec(number):
+    with pytest.raises(ValueError):
+        spotify.download_options(album_track=number)
+
+
 def test_a_bad_video_id_never_reaches_a_spec():
     with pytest.raises(ValueError):
         spotify.download_options(video_id="x; rm -rf")
 
 
-def test_a_match_spec_is_a_short_job_on_one_track():
+def test_a_match_spec_is_a_short_job_on_one_track_naming_its_album():
     spec = spotify.match_spec(track())
     assert spec.engine == "spotdl" and spec.url == f"https://open.spotify.com/track/{T1}"
-    assert spec.options == {"mode": "match"}
+    assert spec.options == {"mode": "match", "album": "Global Warming"}
+    playlist_row = spotify.parse_listing(listing_data(tracks=[row(album="")])).tracks[0]
+    assert spotify.match_spec(playlist_row).options == {"mode": "match"}
+
+
+# ── artwork (plan §7 item 2) ──────────────────────────────────────────────────────────────
+ART = "https://i.scdn.co/image/ab67616d00001e02" + "c" * 24
+
+
+def test_listing_art_and_cover_are_kept_only_in_their_normalized_form():
+    listing = spotify.parse_listing(listing_data(cover=ART, tracks=[row(art=ART), row(T2)]))
+    first, second = listing.tracks
+    assert listing.cover == ART and first.art == ART and first.art_url == ART
+    # No picture in the listing: the row looks its own up through oEmbed, by its id.
+    assert second.art == "" and second.art_url == spotify.oembed_url(T2)
+    assert second.art_url == (
+        f"https://open.spotify.com/oembed?url=https://open.spotify.com/track/{T2}"
+    )
+
+
+@pytest.mark.parametrize(
+    "art",
+    [
+        "https://image-cdn-ak.spotifycdn.com/image/ab67616d00001e02" + "c" * 24,
+        "http://i.scdn.co/image/ab67616d00001e02" + "c" * 24,
+        ART + "?x=1",
+        "https://evil.example/cover.jpg",
+        "https://i.scdn.co/image/../../x",
+        5,
+    ],
+)
+def test_any_other_picture_url_is_dropped(art):
+    listing = spotify.parse_listing(listing_data(cover=art, tracks=[row(art=art)]))
+    assert listing.cover == "" and listing.tracks[0].art == ""
+
+
+def test_an_oembed_lookup_is_only_built_from_a_real_track_id():
+    with pytest.raises(ValueError):
+        spotify.oembed_url("../x")
+
+
+# ── how a match was found (plan §7 items 3-4) ─────────────────────────────────────────────
+@pytest.mark.parametrize(
+    ("method", "uncertain"), [("album", False), ("song", False), ("video", True)]
+)
+def test_only_a_video_match_is_uncertain_by_how_it_was_found(method, uncertain):
+    m = spotify.parse_match(match_data(duration=86.0, method=method), track())
+    assert m.method == method and spotify.is_uncertain(m) is uncertain
+
+
+@pytest.mark.parametrize("method", [None, "spotdl", 5])
+def test_an_unknown_method_reads_as_a_video(method):
+    assert spotify.parse_match(match_data(method=method), track()).method == "video"
+
+
+def test_a_match_keeps_the_album_it_was_found_on_as_plain_text():
+    m = spotify.parse_match(match_data(album="Global\n  Warming", method="song"), track())
+    assert m.album == "Global Warming"

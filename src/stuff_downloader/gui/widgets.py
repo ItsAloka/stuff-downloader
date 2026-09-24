@@ -59,7 +59,7 @@ from ..core.spotify import (
     match_score,
 )
 from .theme import ACCENT, BORDER, SURFACE, SURFACE_HOVER, TEXT, TEXT_DIM, set_state
-from .thumbs import decode_image
+from .thumbs import decode_image, youtube_thumb_url
 
 # Drags carry the job id only: a drop from another application can never be mistaken for a
 # queue reorder.
@@ -1340,29 +1340,68 @@ class PlaylistCard(Card):
 
 
 class MatchDialog(QDialog):
-    """Change one Spotify song's recording: pick a looked-up result, or paste a YouTube link."""
+    """Change one Spotify song's recording: pick a looked-up result, or paste a YouTube link.
 
-    COLUMNS = ("Title", "Channel", "Length", "Diff", "Score")
+    Spotify's cover and the selected result's YouTube picture sit side by side, so the owner can
+    compare them (plan §5.6a). The YouTube picture lives only here, never on the row.
+    """
 
-    def __init__(self, track: SpotifyTrack, candidates=(), parent=None) -> None:
+    COLUMNS = ("Title", "Channel", "Found as", "Length", "Diff", "Score")
+    SPOTIFY_ART = QSize(96, 96)
+    MATCH_ART = QSize(128, 72)
+
+    def __init__(
+        self, track: SpotifyTrack, candidates=(), parent=None, art=None, thumbs=None
+    ) -> None:
         super().__init__(parent)
         self.track = track
         self.candidates: tuple[Candidate, ...] = tuple(candidates)
+        self.thumbs = thumbs
         self.setWindowTitle("Choose the recording")
-        self.resize(720, 420)
+        self.resize(760, 480)
         layout = QVBoxLayout(self)
+
+        top = QHBoxLayout()
+        top.setSpacing(12)
+        self.spotify_art = QLabel()
+        self.spotify_art.setFixedSize(self.SPOTIFY_ART)
+        self.spotify_art.setToolTip("Spotify's cover")
+        self.spotify_art.setPixmap(
+            row_icon(art, self.SPOTIFY_ART).pixmap(self.SPOTIFY_ART)
+            if isinstance(art, QImage) and not art.isNull()
+            else art_placeholder(self.SPOTIFY_ART, True)
+        )
+        top.addWidget(self.spotify_art, 0, Qt.AlignmentFlag.AlignTop)
+        text = QVBoxLayout()
         heading = QLabel(f"{track.artist} — {track.title}" if track.artist else track.title)
         heading.setTextFormat(Qt.TextFormat.PlainText)
         heading.setStyleSheet("font-weight:600;")
         heading.setWordWrap(True)
-        layout.addWidget(heading)
+        text.addWidget(heading)
         info = QLabel(
             f"Spotify length {format_duration(track.duration)}. "
             f"Results with a ⚠ are uncertain: {UNCERTAIN_RULE}."
         )
         info.setObjectName("muted")
         info.setWordWrap(True)
-        layout.addWidget(info)
+        text.addWidget(info)
+        text.addStretch(1)
+        top.addLayout(text, 1)
+        match_box = QVBoxLayout()
+        match_box.setSpacing(2)
+        self.match_art = QLabel()
+        self.match_art.setFixedSize(self.MATCH_ART)
+        self.match_art.setToolTip("The selected result's YouTube picture")
+        caption = QLabel("YouTube match")
+        caption.setObjectName("muted")
+        caption.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        match_box.addWidget(self.match_art)
+        match_box.addWidget(caption)
+        match_box.addStretch(1)
+        top.addLayout(match_box)
+        layout.addLayout(top)
+        self.match_art_url: str | None = None
+        self._show_match_art(None)
 
         self.table = QTableWidget(len(self.candidates), len(self.COLUMNS))
         self.table.setObjectName("matchTable")
@@ -1381,11 +1420,13 @@ class MatchDialog(QDialog):
                 video_id=cand.video_id,
                 duration_diff=duration_diff(cand.duration, track.duration),
                 score=match_score(track, cand.title, cand.channel, cand.duration),
+                method=cand.kind,
             )
             score = f"{match.score:.0f}%"
             cells = (
                 cand.title or "Untitled",
                 cand.channel,
+                "Video" if cand.kind == "video" else "Song",
                 format_duration(cand.duration),
                 format_diff(match.duration_diff),
                 f"⚠ {score}" if is_uncertain(match) else score,
@@ -1396,8 +1437,12 @@ class MatchDialog(QDialog):
                     item.setToolTip(plain_tooltip(text))  # site-written text
                 self.table.setItem(row, column, item)
         self.table.doubleClicked.connect(lambda _: self.accept())
+        self.table.itemSelectionChanged.connect(self._selection_changed)
+        if thumbs is not None:
+            thumbs.loaded.connect(self._on_thumbnail)
         if self.candidates:
             layout.addWidget(self.table, 1)
+            self.table.selectRow(0)  # the current pick is offered first
         else:
             self.table.hide()
             none = QLabel("No other results were found for this song.")
@@ -1423,6 +1468,27 @@ class MatchDialog(QDialog):
             return text
         rows = self.table.selectionModel().selectedRows()
         return self.candidates[rows[0].row()] if rows else None
+
+    # ── the YouTube picture ──────────────────────────────────────────────────────────────
+    def _selection_changed(self) -> None:
+        rows = self.table.selectionModel().selectedRows()
+        cand = self.candidates[rows[0].row()] if rows else None
+        url = youtube_thumb_url(cand.video_id) if cand is not None else None
+        self.match_art_url = url
+        image = self.thumbs.cached(url) if self.thumbs is not None and url else None
+        self._show_match_art(image)
+        if image is None and self.thumbs is not None and url:
+            self.thumbs.request(url)
+
+    def _on_thumbnail(self, url: str, image: QImage) -> None:
+        if url == self.match_art_url:
+            self._show_match_art(image)
+
+    def _show_match_art(self, image: QImage | None) -> None:
+        if image is None or image.isNull():
+            self.match_art.setPixmap(art_placeholder(self.MATCH_ART, False))
+        else:
+            self.match_art.setPixmap(row_icon(image, self.MATCH_ART).pixmap(self.MATCH_ART))
 
 
 class SiteLoginDialog(QDialog):
@@ -1733,13 +1799,19 @@ class SpotifyCard(Card):
         self.disclosure_label.setTextFormat(Qt.TextFormat.PlainText)
         self.body.addWidget(self.header)
         self.body.addWidget(self.disclosure_label)
-        # "3 uncertain matches — …": counted before anything downloads (item 9).
+        # "3 uncertain matches — …": they wait, never block the rest (plan §7 item 4).
+        uncertain = QHBoxLayout()
         self.uncertain_label = QLabel("")
         self.uncertain_label.setObjectName("warning")
         self.uncertain_label.setWordWrap(True)
         self.uncertain_label.setTextFormat(Qt.TextFormat.PlainText)
         self.uncertain_label.hide()
-        self.body.addWidget(self.uncertain_label)
+        self.uncertain_button = QPushButton("⬇  Download uncertain anyway")
+        self.uncertain_button.setToolTip("Download every uncertain match as it is, without review")
+        self.uncertain_button.hide()
+        uncertain.addWidget(self.uncertain_label, 1)
+        uncertain.addWidget(self.uncertain_button, 0, Qt.AlignmentFlag.AlignTop)
+        self.body.addLayout(uncertain)
 
         self.table = TrackTable(self.EXTRA)
         header = self.table.horizontalHeader()
@@ -1747,7 +1819,7 @@ class SpotifyCard(Card):
         header.setSectionResizeMode(self.MATCH_COLUMN, QHeaderView.ResizeMode.Stretch)
         # ResizeToContents measures items, not cell widgets, so the button column is sized here.
         header.setSectionResizeMode(self.CHANGE_COLUMN, QHeaderView.ResizeMode.Fixed)
-        header.resizeSection(self.CHANGE_COLUMN, 96)
+        header.resizeSection(self.CHANGE_COLUMN, 112)  # fits "⚠ Review…"
         self.body.addWidget(self.table)
 
         controls = QHBoxLayout()
@@ -1765,7 +1837,7 @@ class SpotifyCard(Card):
 
         self.archive_check = QCheckBox("Skip songs already in this folder")
         self.archive_check.setChecked(True)
-        # Spotify songs are tagged MP3s (§7); other formats come with Spotify v2 (R6).
+        # Spotify songs are tagged MP3s (§7 item 6).
         self.format_combo = QComboBox()
         self.format_combo.addItem("MP3", "mp3")
         self.format_combo.setEnabled(False)
@@ -1795,6 +1867,9 @@ class SpotifyCard(Card):
         """A row with no match to show: not checked yet, checking, or why none was found."""
         self._set_match_cells(row, text, "", "", warn)
         self.table.set_cell(row, self.MATCH_COLUMN, text, warn, tip or text)
+        button = self.change_button(row)
+        if button is not None:
+            button.setText("Change…")
 
     def set_match(self, row: int, match: Match) -> None:
         if match.manual and not match.title:
@@ -1814,27 +1889,40 @@ class SpotifyCard(Card):
         self.table.set_cell(
             row, self.MATCH_COLUMN, label, warn, f"{label}\nYouTube video {match.video_id}"
         )
-        tip = f"Uncertain: {UNCERTAIN_RULE}. Use Change… to pick another." if warn else ""
-        if match.confidence is not None:
-            tip = f"{tip}\nspotDL's own score: {match.confidence:.0f}%".strip()
+        tip = f"Uncertain: {UNCERTAIN_RULE}. Use Review… to pick another." if warn else ""
+        found = {"album": "on the album", "song": "as a song", "video": "only as a video"}
+        if match.method in found:
+            tip = f"{tip}\nFound {found[match.method]} on YouTube Music.".strip()
         self.table.set_cell(row, self.SCORE_COLUMN, score, warn, tip)
         if not tip:
             item = self.table.item(row, self.SCORE_COLUMN)
             if item is not None:
                 item.setToolTip("")
+        button = self.change_button(row)
+        if button is not None:
+            button.setText("⚠ Review…" if warn else "Change…")
 
     def set_uncertain_count(self, count: int) -> None:
+        """How many uncertain matches are waiting; they are downloaded only when asked."""
         if count:
-            noun = "match" if count == 1 else "matches"
+            noun = "match waits" if count == 1 else "matches wait"
             self.uncertain_label.setText(
-                f"⚠  {count} uncertain {noun} — {UNCERTAIN_RULE}. "
-                "Check them with Change… before downloading."
+                f"⚠  {count} uncertain {noun} for review — {UNCERTAIN_RULE}. "
+                "The others download without them."
             )
+            self.uncertain_button.setText(f"⬇  Download {count} uncertain anyway")
         self.uncertain_label.setVisible(bool(count))
+        self.uncertain_button.setVisible(bool(count))
 
     def set_thumbnail(self, row: int, image: QImage) -> None:
         """Spotify's own art for the row. A YouTube match's picture never comes here."""
         self.table.set_art(row, image)
+
+    def art(self, row: int) -> QImage | None:
+        return self.table.art(row)
+
+    def visible_rows(self) -> range:
+        return self.table.visible_rows()
 
     def _set_match_cells(self, row: int, label: str, diff: str, score: str, warn: bool) -> None:
         for column, text in (

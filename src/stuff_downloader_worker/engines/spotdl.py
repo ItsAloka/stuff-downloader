@@ -1,39 +1,43 @@
-"""spotDL engine (plan §6.3, §M5): Spotify metadata, a YouTube Music match, a tagged MP3.
+"""Spotify engine (plan §7): Spotify's public embed data, a YouTube Music match, a tagged MP3.
 
-Runs only in the isolated ``envs\\spotdl`` runtime, whose own yt-dlp pin never meets ours. spotDL
-is used as a library for exactly three things -- reading Spotify's metadata, listing a
-track/album/playlist, and picking a YouTube Music match -- and never for its sync or delete
-behaviour. The audio itself is downloaded by this project's own yt-dlp engine code (the MP3
-preset), and the file is then re-tagged with Spotify's metadata and cover through mutagen.
+Runs in the isolated ``envs\\spotdl`` runtime, which ships ytmusicapi and requests. Nothing here
+needs a Spotify account or developer credentials:
 
-Facts this module is built around, checked live against spotDL 4.5.2 in September 2026:
+- **Listing** reads the public embed page (``/embed/{track|album|playlist}/<id>``) in one
+  request. Its ``trackList`` stops at EMBED_PAGE_CAP rows, so only a longer list falls back to
+  spotDL's ``get_metadata`` for the rest. That is the one place spotDL is still imported.
+- **Artwork** is Spotify's own. Every picture URL is normalized to ``https://i.scdn.co/image/<hash>``
+  (the same hash is served by Spotify's other image hosts), so the GUI only ever fetches from one
+  host. An album's rows share the album cover; a playlist's rows carry none, and the GUI looks
+  each one up lazily through oEmbed when the row is on screen. Tagging uses the 640 px picture
+  from the track's own embed (``visualIdentity.image``).
+- **Matching** calls ytmusicapi directly, in three steps: the album (when it is known), then
+  YouTube Music *songs* with strict rules, then *videos*. A video is always marked uncertain.
+- The audio is downloaded by this project's own yt-dlp engine code (the MP3 preset), and the file
+  is then re-tagged with Spotify's title, artists, album, year and cover through mutagen.
 
-- spotDL's shared client id/secret for the official Web API is over quota: every endpoint answers
-  429 with ``Retry-After: 86400``, and spotipy sleeps that out instead of failing. So the client
-  is always the default *free* one (``SpotipyFree``, which reads Spotify's web player), and none
-  of the options that silently switch spotDL to the official API are ever passed.
-- The free client takes ~10 s per call. ``Album/Playlist.from_url(fetch_songs=True)`` re-reads
-  every track one at a time and takes minutes, so listings use ``get_metadata`` (one pass).
-- The free client never returns an ISRC, and playlist rows carry no cover. The cover is read per
-  track at download time.
-- ``YouTubeMusic.search`` takes ~30 s per track, so matching is its own per-track job.
-- spotDL drops every YouTube Music *song* result: it reads their length as 0, so only *videos*
-  (music videos with intros, lyric uploads) are ever scored, and the audio is often the wrong
-  length. So the match searches YouTube Music songs first itself (``pick_song``), through the
-  ytmusicapi spotDL already ships, and only falls back to spotDL's search when no song fits.
+Facts this module is built around, checked live in September 2026:
+
+- The embed page's ``__NEXT_DATA__`` holds the entity: title, owner (``authors`` for a playlist,
+  ``subtitle`` for an album), cover, and ``trackList`` rows of uri, title, subtitle (the
+  artists), duration in ms and explicit. It names no per-track album and no per-track picture.
+- oEmbed (``/oembed?url=…/track/<id>``) answers with a 300 px ``thumbnail_url`` per track.
+- spotDL's shared Web API credentials are over quota (429, ``Retry-After: 86400``), so when the
+  fallback runs it uses spotDL's free client only.
 
 Nothing here prints: stdout is the protocol channel.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import unicodedata
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import urlsplit
 
 from stuff_downloader_worker import tagging
 from stuff_downloader_worker.engines.base import Emit, EngineError
@@ -50,28 +54,44 @@ ARCHIVE_FILENAME = ".stuff-downloader-spotify-archive.txt"
 MAX_EDITED_TITLE = 300
 MAX_NAME = 150  # characters of "Artist - Title" before the extension
 
+EMBED_PAGE_CAP = 100  # rows the embed page lists; a list this long may have more
+MAX_EMBED_BYTES = 5_000_000
+EMBED_TIMEOUT = 20
+EMBED_HEADERS = {"User-Agent": "Mozilla/5.0", "Accept-Language": "en"}
+_NEXT_DATA = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
+
 SPOTIFY_ID = re.compile(r"[A-Za-z0-9]{22}")
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 KINDS = ("track", "album", "playlist")
-YOUTUBE_HOSTS = frozenset({"www.youtube.com", "youtube.com", "music.youtube.com", "m.youtube.com"})
-# Spotify serves covers from these; a cover URL anywhere else is not fetched.
-COVER_HOST_SUFFIXES = (".scdn.co", ".spotifycdn.com")
+# Spotify serves the same picture, by hash, from all of these; only i.scdn.co ever leaves here.
+IMAGE_HOST = re.compile(r"(i\.scdn\.co|image-cdn-[a-z]{2}\.spotifycdn\.com)")
+IMAGE_PATH = re.compile(r"/image/([0-9a-f]{40})")
 _URL = re.compile(r"https?://\S+", re.IGNORECASE)
 _WINDOWS_BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
 _RESERVED = re.compile(r"(?i)^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$")
 
-# Song matching (see pick_song). A YouTube Music song within this many seconds of Spotify's
-# length is the same recording; official audio is usually within 1-2 s.
-SONG_MAX_DIFF = 5
+# Matching (plan §7 item 3). The album's own track is the official audio: ±2 s. A YouTube
+# Music song must be within ±3 s. A video is only a fallback, and always uncertain.
+ALBUM_MAX_DIFF = 2
+SONG_MAX_DIFF = 3
+VIDEO_MAX_DIFF = 30
 SONG_MIN_SCORE = 70.0
-SONG_SEARCH_LIMIT = 10
+SEARCH_LIMIT = 10
+ALBUM_TRIES = 2
+MIN_TITLE_SIMILARITY = 0.8
+METHODS = ("album", "song", "video")
 # A version with one of these in its title is a different recording, unless Spotify's title
 # says the same thing.
 _VARIANT_WORDS = (
     "sped up", "speed up", "slowed", "reverb", "nightcore", "remix", "live", "acoustic",
-    "instrumental", "karaoke", "cover", "8d", "remaster", "extended", "radio edit",
+    "instrumental", "karaoke", "cover", "8d", "remaster", "extended", "radio edit", "lyric",
+    "lyrics",
 )  # fmt: skip
 _FEAT = re.compile(r"[\(\[]\s*(feat|ft|with)\.?\s[^\)\]]*[\)\]]", re.IGNORECASE)
+# "(Official Audio)", "[Official Music Video]"… say nothing about the recording.
+_OFFICIAL = re.compile(
+    r"[\(\[]\s*official\s*(audio|music video|video|visualizer)?\s*[\)\]]", re.IGNORECASE
+)
 _NON_WORD = re.compile(r"[^\w]+")
 
 
@@ -95,9 +115,27 @@ def parse_url(url: str) -> tuple[str, str]:
     return segments[0], segments[1]
 
 
+def _album_options(opts: dict[str, Any]) -> None:
+    """The album a track belongs to, when core knows it; the same checks in match and download."""
+    album = opts.get("album")
+    if album is not None and (not isinstance(album, str) or len(album) > MAX_TEXT):
+        raise EngineError("bad_options", "'album' must be a short string")
+    number = opts.get("album_track")
+    if number is not None and (
+        isinstance(number, bool) or not isinstance(number, int) or not 1 <= number <= MAX_TRACKS
+    ):
+        raise EngineError("bad_options", "'album_track' must be a track number")
+
+
+def parse_match_options(opts: dict[str, Any]) -> None:
+    if set(opts) - {"mode", "album"}:
+        raise EngineError("bad_options", "match takes only an album")
+    _album_options(opts)
+
+
 def parse_download_options(opts: dict[str, Any]) -> tuple[str | None, bool]:
     """(video_id or None, archive). Mirrors core.spotify.download_options exactly."""
-    allowed = {"mode", "preset", "video_id", "archive", "edited_title"}
+    allowed = {"mode", "preset", "video_id", "archive", "edited_title", "album", "album_track"}
     if set(opts) - allowed or opts.get("preset") != PRESET_ID:
         raise EngineError("bad_options", f"a Spotify download takes preset={PRESET_ID}")
     archive = opts.get("archive", True)
@@ -109,6 +147,7 @@ def parse_download_options(opts: dict[str, Any]) -> tuple[str | None, bool]:
     edited = opts.get("edited_title")
     if edited is not None and (not isinstance(edited, str) or len(edited) > MAX_EDITED_TITLE):
         raise EngineError("bad_options", "'edited_title' must be a short string")
+    _album_options(opts)
     return video_id, archive
 
 
@@ -118,22 +157,6 @@ def edited_stem(opts: dict[str, Any]) -> str | None:
     It names the file only: the tags stay Spotify's own title, artists and album.
     """
     return safe_output_name(opts.get("edited_title"))
-
-
-def video_id_of(url: Any) -> str | None:
-    """The id of a YouTube watch URL spotDL returned, or None for anything else."""
-    if not isinstance(url, str):
-        return None
-    try:
-        parts = urlsplit(url)
-    except ValueError:
-        return None
-    if parts.scheme != "https" or (parts.hostname or "").lower() not in YOUTUBE_HOSTS:
-        return None
-    if parts.path != "/watch":
-        return None
-    value = (parse_qs(parts.query).get("v") or [""])[0]
-    return value if VIDEO_ID.fullmatch(value) else None
 
 
 def safe_text(value: Any) -> str:
@@ -150,7 +173,7 @@ def safe_text(value: Any) -> str:
 
 
 def describe_error(exc: BaseException) -> tuple[str, str]:
-    """(code, safe message) for a spotDL / Spotify / YouTube Music failure."""
+    """(code, safe message) for a Spotify / YouTube Music failure."""
     text = safe_text(f"{exc.__class__.__name__}: {exc}")[:500]
     lowered = text.lower()
     if any(needle in lowered for needle in ("429", "too many requests", "rate limit")):
@@ -160,7 +183,86 @@ def describe_error(exc: BaseException) -> tuple[str, str]:
     return "download_error", text or "Spotify could not be read"
 
 
-# ── metadata ──────────────────────────────────────────────────────────────────────────────
+def spotify_image(url: Any) -> str | None:
+    """``https://i.scdn.co/image/<hash>`` for a Spotify picture URL, or None for anything else."""
+    if not isinstance(url, str):
+        return None
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    if (
+        parts.scheme != "https"
+        or not IMAGE_HOST.fullmatch(parts.hostname or "")
+        or parts.port not in (None, 443)
+        or parts.username
+        or parts.query
+    ):
+        return None
+    found = IMAGE_PATH.fullmatch(parts.path)
+    return f"https://i.scdn.co/image/{found.group(1)}" if found else None
+
+
+# ── the embed page ────────────────────────────────────────────────────────────────────────
+def fetch_embed(kind: str, spotify_id: str) -> dict[str, Any]:
+    """The embed page's entity for one validated link. One request, no credentials."""
+    import requests
+
+    url = f"https://open.spotify.com/embed/{kind}/{spotify_id}"
+    with requests.get(url, headers=EMBED_HEADERS, stream=True, timeout=EMBED_TIMEOUT) as resp:
+        if resp.status_code == 404:
+            raise EngineError("download_error", f"http error 404: that {kind} was not found")
+        if resp.status_code != 200:
+            raise EngineError("download_error", f"http error {resp.status_code}: Spotify")
+        body = resp.raw.read(MAX_EMBED_BYTES + 1, decode_content=True)
+    if len(body) > MAX_EMBED_BYTES:
+        raise EngineError("download_error", "Spotify's page was too large")
+    return embed_entity(body.decode("utf-8", "replace"))
+
+
+def embed_entity(html: str) -> dict[str, Any]:
+    """The ``entity`` from an embed page's ``__NEXT_DATA__``; a clear error when it is not there."""
+    found = _NEXT_DATA.search(html)
+    try:
+        data = json.loads(found.group(1)) if found else None
+        entity = data["props"]["pageProps"]["state"]["data"]["entity"]
+    except (ValueError, KeyError, TypeError):
+        entity = None
+    if not isinstance(entity, dict):
+        raise EngineError("download_error", "http error 404: Spotify showed no song list there")
+    return entity
+
+
+def _images(entity: dict[str, Any]) -> list[tuple[int, str]]:
+    """(width, i.scdn.co url) for every picture the entity names."""
+    found: list[tuple[int, str]] = []
+    visual = entity.get("visualIdentity")
+    for raw in (visual.get("image") if isinstance(visual, dict) else None) or []:
+        if isinstance(raw, dict) and (url := spotify_image(raw.get("url"))):
+            width = raw.get("maxWidth")
+            found.append((width if isinstance(width, int) else 0, url))
+    cover = entity.get("coverArt")
+    for raw in (cover.get("sources") if isinstance(cover, dict) else None) or []:
+        if isinstance(raw, dict) and (url := spotify_image(raw.get("url"))):
+            width = raw.get("width")
+            found.append((width if isinstance(width, int) else 300, url))
+    return found
+
+
+def picture(entity: dict[str, Any], width: int) -> str | None:
+    """The entity's picture closest to ``width`` pixels, or None."""
+    images = _images(entity)
+    if not images:
+        return None
+    return min(images, key=lambda image: abs(image[0] - width))[1]
+
+
+def _seconds(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, int | float) or value <= 0:
+        return None
+    return round(value / 1000, 1)
+
+
 def _artists(raw: Any) -> list[str]:
     names = []
     if isinstance(raw, list):
@@ -172,184 +274,342 @@ def _artists(raw: Any) -> list[str]:
     return names
 
 
-def _cover_url(album: dict[str, Any]) -> str | None:
-    images = [i for i in album.get("images") or [] if isinstance(i, dict) and i.get("url")]
-    if not images:
+def _track_id(uri: Any) -> str | None:
+    if not isinstance(uri, str) or not uri.startswith("spotify:track:"):
         return None
-    best = max(images, key=lambda i: (i.get("width") or 0) * (i.get("height") or 0))
-    return str(best["url"])
+    value = uri.removeprefix("spotify:track:")
+    return value if SPOTIFY_ID.fullmatch(value) else None
 
 
-def track_row(track: dict[str, Any]) -> dict[str, Any] | None:
-    """The listing row for one raw Spotify track, or None if it is not a playable track."""
-    track_id = track.get("id")
-    if not isinstance(track_id, str) or not SPOTIFY_ID.fullmatch(track_id):
+def embed_row(item: Any, album: str = "", art: str | None = None) -> dict[str, Any] | None:
+    """The listing row for one embed ``trackList`` item, or None for an episode or a bad row."""
+    if not isinstance(item, dict) or item.get("entityType", "track") != "track":
         return None
-    duration_ms = track.get("duration_ms")
-    album = track.get("album") if isinstance(track.get("album"), dict) else {}
-    return {
+    track_id = _track_id(item.get("uri"))
+    if track_id is None:
+        return None
+    # The embed names the artists as one "A, B" line.
+    subtitle = safe_text(item.get("subtitle"))
+    row = {
         "id": track_id,
-        "title": safe_text(track.get("name")) or "Untitled",
-        "artists": _artists(track.get("artists")),
-        "album": safe_text(album.get("name")),
-        "duration": round(duration_ms / 1000, 1)
-        if isinstance(duration_ms, int | float) and not isinstance(duration_ms, bool)
-        else None,
-        "explicit": track.get("explicit") is True,
+        "title": safe_text(item.get("title")) or "Untitled",
+        "artists": [a for a in (s.strip() for s in subtitle.split(", ")) if a][:MAX_ARTISTS],
+        "album": album,
+        "duration": _seconds(item.get("duration")),
+        "explicit": item.get("isExplicit") is True,
     }
+    if art:
+        row["art"] = art
+    return row
 
 
-def song_row(song: Any) -> dict[str, Any] | None:
-    """The listing row for a spotDL Song built by an album/playlist ``get_metadata``."""
+def track_entity_row(entity: dict[str, Any], spotify_id: str) -> dict[str, Any]:
+    """The one row a track link lists, from the track's own embed."""
+    if entity.get("type") != "track" or entity.get("id") != spotify_id:
+        raise EngineError("download_error", "http error 404: that track was not found")
+    row = {
+        "id": spotify_id,
+        "title": safe_text(entity.get("name") or entity.get("title")) or "Untitled",
+        "artists": _artists(entity.get("artists")),
+        "album": "",
+        "duration": _seconds(entity.get("duration")),
+        "explicit": entity.get("isExplicit") is True,
+    }
+    art = picture(entity, 300)
+    if art:
+        row["art"] = art
+    return row
+
+
+def song_row(song: Any, album: str = "", art: str | None = None) -> dict[str, Any] | None:
+    """The listing row for a spotDL Song from ``get_metadata`` (the >100-row fallback)."""
     track_id = getattr(song, "song_id", None)
     if not isinstance(track_id, str) or not SPOTIFY_ID.fullmatch(track_id):
         return None
     duration = getattr(song, "duration", None)
-    return {
+    row = {
         "id": track_id,
         "title": safe_text(getattr(song, "name", "")) or "Untitled",
         "artists": _artists(list(getattr(song, "artists", None) or [])),
-        "album": safe_text(getattr(song, "album_name", "")),
+        "album": album,
         "duration": float(duration)
-        if isinstance(duration, int | float) and not isinstance(duration, bool)
+        if isinstance(duration, int | float) and not isinstance(duration, bool) and duration > 0
         else None,
         "explicit": getattr(song, "explicit", False) is True,
     }
+    if art:
+        row["art"] = art
+    return row
 
 
-def song_fields(track: dict[str, Any]) -> dict[str, Any]:
-    """spotDL Song fields from one raw track, the same mapping spotDL's playlist code uses."""
-    album = track.get("album") if isinstance(track.get("album"), dict) else {}
-    artists = _artists(track.get("artists")) or ["Unknown artist"]
-    album_artists = _artists(album.get("artists"))
-    release = album.get("release_date") if isinstance(album.get("release_date"), str) else None
-    isrc = (track.get("external_ids") or {}).get("isrc") or None
+def track_fields(entity: dict[str, Any], track_id: str, opts: dict[str, Any]) -> dict[str, Any]:
+    """What one track is matched and tagged with: its embed, plus the album core knows."""
+    row = track_entity_row(entity, track_id)
+    artists = row["artists"] or ["Unknown artist"]
+    release = entity.get("releaseDate")
+    iso = release.get("isoString") if isinstance(release, dict) else None
+    date = iso[:10] if isinstance(iso, str) else None
+    date = date if date and re.fullmatch(r"\d{4}-\d{2}-\d{2}", date) else None
     return {
-        "name": safe_text(track.get("name")) or "Untitled",
+        "name": row["title"],
         "artists": artists,
         "artist": artists[0],
-        "album_id": album.get("id"),
-        "album_name": safe_text(album.get("name")),
-        "album_artist": album_artists[0] if album_artists else artists[0],
-        "album_type": album.get("album_type"),
-        "disc_number": track.get("disc_number") or 1,
-        "duration": int((track.get("duration_ms") or 0) / 1000),
-        "year": release[:4] if release else None,
-        "date": release,
-        "track_number": track.get("track_number") or 1,
-        "tracks_count": album.get("total_tracks"),
-        "song_id": track["id"],
-        "explicit": track.get("explicit") is True,
-        "url": f"https://open.spotify.com/track/{track['id']}",
-        "isrc": isrc if isinstance(isrc, str) else None,
-        "cover_url": _cover_url(album),
+        "album_name": safe_text(opts.get("album")),
+        "album_artist": artists[0],
+        "track_number": opts.get("album_track"),
+        "duration": row["duration"] or 0,
+        "explicit": row["explicit"],
+        "year": date[:4] if date else None,
+        "date": date,
+        "url": f"https://open.spotify.com/track/{track_id}",
+        "cover_url": picture(entity, 640),
     }
 
 
-# ── matching ──────────────────────────────────────────────────────────────────────────
+# ── matching ──────────────────────────────────────────────────────────────────────────────
 def _norm(text: Any) -> str:
-    """Lower-case words only, without a "(feat. X)" part, for comparing titles and names."""
+    """Lower-case words only, without "(feat. X)" or "(Official Audio)", for comparing."""
     if not isinstance(text, str):
         return ""
-    return " ".join(_NON_WORD.sub(" ", _FEAT.sub(" ", text).casefold()).split())
+    text = _OFFICIAL.sub(" ", _FEAT.sub(" ", text))
+    return " ".join(_NON_WORD.sub(" ", text.casefold()).split())
 
 
 def _variants(title: str) -> set[str]:
     lowered = f" {_norm(title)} "
-    return {w for w in _VARIANT_WORDS if f" {w} " in lowered}
+    found = {w for w in _VARIANT_WORDS if f" {w} " in lowered}
+    return {"lyric" if w == "lyrics" else w for w in found}
+
+
+def _similar(a: Any, b: Any) -> float:
+    left, right = _norm(a), _norm(b)
+    return SequenceMatcher(None, left, right).ratio() if left and right else 0.0
+
+
+def _length(raw: dict[str, Any]) -> float | None:
+    length = raw.get("duration_seconds")
+    if isinstance(length, bool) or not isinstance(length, int | float) or length <= 0:
+        return None
+    return float(length)
+
+
+def _names(raw: dict[str, Any]) -> list[str]:
+    return [a.get("name") for a in raw.get("artists") or [] if isinstance(a, dict)]
+
+
+def _same_artist(fields: dict[str, Any], names: list[Any]) -> bool:
+    want = {_norm(a) for a in fields.get("artists") or []} - {""}
+    return bool(want & {_norm(a) for a in names})
+
+
+def _found(raw: dict[str, Any], method: str, score: float, album: Any) -> dict[str, Any]:
+    names = _names(raw)
+    return {
+        "video_id": raw["videoId"],
+        "title": safe_text(raw.get("title")),
+        "channel": ", ".join(safe_text(a) for a in names if a),
+        "duration": _length(raw),
+        "score": round(min(score, 100.0), 1),
+        "method": method,
+        "album": safe_text(album) if isinstance(album, str) else "",
+    }
+
+
+def _recording(raw: Any, fields: dict[str, Any], max_diff: float) -> tuple[float, float] | None:
+    """(title similarity, length difference) when ``raw`` is Spotify's recording, else None.
+
+    The same title (ignoring "feat." parts), the same version markers on both sides, and a
+    length within ``max_diff`` seconds.
+    """
+    if not isinstance(raw, dict):
+        return None
+    video_id = raw.get("videoId")
+    length = _length(raw)
+    if not isinstance(video_id, str) or not VIDEO_ID.fullmatch(video_id) or length is None:
+        return None
+    title = str(raw.get("title") or "")
+    if _variants(title) != _variants(str(fields.get("name") or "")):
+        return None
+    similarity = _similar(fields.get("name"), title)
+    diff = abs(length - float(fields.get("duration") or 0))
+    if similarity < MIN_TITLE_SIMILARITY or (fields.get("duration") and diff > max_diff):
+        return None
+    return similarity, diff
+
+
+def pick_album_track(album: Any, fields: dict[str, Any]) -> dict[str, Any] | None:
+    """Spotify's track inside one ytmusicapi ``get_album`` result: title and length within ±2 s."""
+    if not isinstance(album, dict):
+        return None
+    best: tuple[float, dict[str, Any]] | None = None
+    for raw in (album.get("tracks") if isinstance(album.get("tracks"), list) else [])[:200]:
+        fit = _recording(raw, fields, ALBUM_MAX_DIFF)
+        if fit is None:
+            continue
+        similarity, diff = fit
+        score = 70 * similarity + 30 * (1 - diff / (ALBUM_MAX_DIFF + 1))
+        if best is None or score > best[0]:
+            best = (score, _found(raw, "album", score, album.get("title")))
+    return best[1] if best else None
 
 
 def pick_song(results: Any, fields: dict[str, Any]) -> dict[str, Any] | None:
     """The YouTube Music *song* that is Spotify's recording, or None if none clearly is.
 
     ``results`` is ytmusicapi's ``search(filter="songs")`` output. A result must name one of
-    Spotify's artists, carry the same title (ignoring "feat." parts) with no extra "sped up",
-    "live", "remix"… marker, and run within SONG_MAX_DIFF seconds of Spotify's length. Among
-    those, the closest length wins, then the same explicit/clean version as Spotify's, then the
-    same album. Returns {video_id, title, channel, duration, score}.
+    Spotify's artists, carry the same title with the same version markers, and run within
+    SONG_MAX_DIFF seconds of Spotify's length. Among those, the closest length wins, then the
+    same explicit/clean version as Spotify's, then the same album.
     """
     if not isinstance(results, list):
         return None
-    want_title = _norm(fields.get("name"))
-    want_artists = {_norm(a) for a in fields.get("artists") or []} - {""}
     want_album = _norm(fields.get("album_name"))
-    want_variants = _variants(str(fields.get("name") or ""))
-    want_length = fields.get("duration") or 0
     best: tuple[float, dict[str, Any]] | None = None
     for raw in results[:50]:
         if not isinstance(raw, dict) or raw.get("resultType") not in (None, "song"):
             continue
-        video_id = raw.get("videoId")
-        length = raw.get("duration_seconds")
-        if not isinstance(video_id, str) or not VIDEO_ID.fullmatch(video_id):
+        if not _same_artist(fields, _names(raw)):
             continue
-        if isinstance(length, bool) or not isinstance(length, int | float) or length <= 0:
+        fit = _recording(raw, fields, SONG_MAX_DIFF)
+        if fit is None:
             continue
-        artists = [a.get("name") for a in raw.get("artists") or [] if isinstance(a, dict)]
-        if not want_artists & {_norm(a) for a in artists}:
-            continue
-        title = raw.get("title")
-        if _variants(str(title or "")) != want_variants:
-            continue
-        similarity = SequenceMatcher(None, want_title, _norm(title)).ratio()
-        diff = abs(float(length) - float(want_length))
-        if similarity < 0.8 or (want_length and diff > SONG_MAX_DIFF):
-            continue
+        similarity, diff = fit
         album = (raw.get("album") or {}).get("name") if isinstance(raw.get("album"), dict) else None
         score = 60 * similarity + 30 * (1 - diff / (SONG_MAX_DIFF + 1))
         score += 5 if bool(raw.get("isExplicit")) == bool(fields.get("explicit")) else 0
         score += 5 if want_album and _norm(album) == want_album else 0
         if score >= SONG_MIN_SCORE and (best is None or score > best[0]):
-            best = (
-                score,
-                {
-                    "video_id": video_id,
-                    "title": safe_text(title),
-                    "channel": ", ".join(safe_text(a) for a in artists if a),
-                    "duration": float(length),
-                    "score": round(min(score, 100.0), 1),
-                },
-            )
+            best = (score, _found(raw, "song", score, album))
+    return best[1] if best else None
+
+
+def pick_video(results: Any, fields: dict[str, Any]) -> dict[str, Any] | None:
+    """The likeliest *video* for the song. Only a fallback: core always marks it uncertain."""
+    if not isinstance(results, list):
+        return None
+    want = _norm(fields.get("name"))
+    best: tuple[float, dict[str, Any]] | None = None
+    for raw in results[:50]:
+        if not isinstance(raw, dict) or raw.get("resultType") not in (None, "video"):
+            continue
+        video_id = raw.get("videoId")
+        if not isinstance(video_id, str) or not VIDEO_ID.fullmatch(video_id):
+            continue
+        # A lyric video carries the same audio; a live cut or a remix does not.
+        variants = _variants(str(raw.get("title") or "")) - {"lyric"}
+        if variants != _variants(str(fields.get("name") or "")) - {"lyric"}:
+            continue
+        title = _norm(raw.get("title"))
+        named = want and f" {want} " in f" {title} "
+        similarity = max(_similar(fields.get("name"), raw.get("title")), 0.9 if named else 0.0)
+        if similarity < 0.6:
+            continue
+        artist = _same_artist(fields, _names(raw)) or any(
+            f" {_norm(a)} " in f" {title} " for a in fields.get("artists") or [] if _norm(a)
+        )
+        length = _length(raw)
+        diff = abs(length - float(fields.get("duration") or 0)) if length else VIDEO_MAX_DIFF
+        if fields.get("duration") and diff > VIDEO_MAX_DIFF:
+            continue
+        length_part = 1 - min(diff, VIDEO_MAX_DIFF) / VIDEO_MAX_DIFF
+        score = 50 * similarity + 25 * artist + 25 * length_part
+        if best is None or score > best[0]:
+            best = (score, _found(raw, "video", score, None))
     return best[1] if best else None
 
 
 MAX_CANDIDATES = 8
 
 
-def candidate_rows(results: Any) -> list[dict[str, Any]]:
-    """Up to MAX_CANDIDATES song results for the owner to choose from: ids and plain text only."""
+def candidate_rows(results: Any, kind: str = "song") -> list[dict[str, Any]]:
+    """Up to MAX_CANDIDATES results for the owner to choose from: ids and plain text only."""
     rows: list[dict[str, Any]] = []
     for raw in results[:50] if isinstance(results, list) else []:
         if len(rows) >= MAX_CANDIDATES:
             break
-        if not isinstance(raw, dict) or raw.get("resultType") not in (None, "song"):
+        if not isinstance(raw, dict) or raw.get("resultType") not in (None, kind):
             continue
         video_id = raw.get("videoId")
         if not isinstance(video_id, str) or not VIDEO_ID.fullmatch(video_id):
             continue
         if any(row["video_id"] == video_id for row in rows):
             continue
-        length = raw.get("duration_seconds")
-        artists = [a.get("name") for a in raw.get("artists") or [] if isinstance(a, dict)]
         rows.append(
             {
                 "video_id": video_id,
                 "title": safe_text(raw.get("title")),
-                "channel": ", ".join(safe_text(a) for a in artists if a),
-                "duration": float(length)
-                if isinstance(length, int | float) and not isinstance(length, bool) and length > 0
-                else None,
+                "channel": ", ".join(safe_text(a) for a in _names(raw) if a),
+                "duration": _length(raw),
+                "kind": kind,
             }
         )
     return rows
 
 
-def search_songs(fields: dict[str, Any]) -> list[Any]:
-    """YouTube Music song results for this track (ytmusicapi, as shipped with spotDL)."""
+def ytmusic() -> Any:
     from ytmusicapi import YTMusic
 
+    return YTMusic()
+
+
+def find_match(
+    fields: dict[str, Any], emit: Emit, candidates: list[dict[str, Any]] | None = None
+) -> dict[str, Any] | None:
+    """Album first, then songs, then videos (plan §7 item 3). None when nothing was found.
+
+    Returns {video_id, title, channel, duration, score, method, album}. Song and video results
+    are appended to ``candidates`` when one is given.
+    """
+    ytm = ytmusic()
+    picked = _album_first(ytm, fields, emit)
     query = f"{', '.join(fields.get('artists') or [])} {fields.get('name') or ''}".strip()
-    return YTMusic().search(query, filter="songs", limit=SONG_SEARCH_LIMIT)
+    if picked is not None and candidates is None:
+        return picked
+    try:
+        songs = ytm.search(query, filter="songs", limit=SEARCH_LIMIT)
+        if candidates is not None:
+            # Still looked up after an album hit, so Change… has alternatives to offer.
+            candidates.extend(candidate_rows(songs, "song"))
+        picked = picked or pick_song(songs, fields)
+    except Exception:
+        emit("log", {"level": "warning", "message": "YouTube Music song search failed"})
+    if picked is not None:
+        return picked
+    try:
+        videos = ytm.search(query, filter="videos", limit=SEARCH_LIMIT)
+        if candidates is not None:
+            candidates.extend(candidate_rows(videos, "video"))
+        return pick_video(videos, fields)
+    except Exception:
+        emit("log", {"level": "warning", "message": "YouTube Music video search failed"})
+        return None
+
+
+def _album_first(ytm: Any, fields: dict[str, Any], emit: Emit) -> dict[str, Any] | None:
+    """Spotify's track on the YouTube Music album of the same name and artist, or None."""
+    artist = (fields.get("artists") or [""])[0]
+    album_name = fields.get("album_name")
+    if album_name:
+        try:
+            albums = ytm.search(f"{album_name} {artist}".strip(), filter="albums", limit=5)
+            tried = 0
+            for raw in albums if isinstance(albums, list) else []:
+                if tried >= ALBUM_TRIES:
+                    break
+                browse = raw.get("browseId") if isinstance(raw, dict) else None
+                if not isinstance(browse, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", browse):
+                    continue
+                if not _same_artist(fields, _names(raw)):
+                    continue
+                if _similar(album_name, raw.get("title")) < MIN_TITLE_SIMILARITY:
+                    continue
+                tried += 1
+                picked = pick_album_track(ytm.get_album(browse), fields)
+                if picked is not None:
+                    return picked
+        except Exception:  # the song search still gets its turn
+            emit("log", {"level": "warning", "message": "YouTube Music album search failed"})
+    return None
 
 
 # ── files ─────────────────────────────────────────────────────────────────────────────────
@@ -401,12 +661,8 @@ class Archive:
 
 
 def fetch_cover(url: str | None) -> bytes | None:
-    """Spotify's cover as JPEG bytes, or None. Only Spotify's own https image hosts."""
-    if not url:
-        return None
-    parts = urlsplit(url)
-    host = (parts.hostname or "").lower()
-    if parts.scheme != "https" or not host.endswith(COVER_HOST_SUFFIXES):
+    """Spotify's cover as JPEG bytes, or None. Only a normalized i.scdn.co picture."""
+    if not url or spotify_image(url) != url:
         return None
     import requests
 
@@ -423,42 +679,35 @@ def fetch_cover(url: str | None) -> bytes | None:
 
 
 def tag_mp3(path: Path, fields: dict[str, Any], cover: bytes | None) -> dict[str, Any]:
-    """Replace the file's tags with Spotify's metadata and cover. Returns what was written."""
-    from mutagen.id3 import (
-        APIC,
-        ID3,
-        TALB,
-        TDRC,
-        TIT2,
-        TPE1,
-        TPE2,
-        TPOS,
-        TRCK,
-        TSRC,
-        WOAS,
-        ID3NoHeaderError,
-    )
+    """Replace the file's tags with Spotify's metadata and cover. Returns what was written.
+
+    Album and track number are written only when known: an unknown album stays empty, and a
+    track number exists only for an album link (plan §5.7). Whatever yt-dlp wrote for those is
+    removed rather than left behind.
+    """
+    from mutagen.id3 import APIC, ID3, TALB, TDRC, TIT2, TPE1, TPE2, TRCK, WOAS, ID3NoHeaderError
 
     try:
         tags = ID3(str(path))
     except ID3NoHeaderError:
         tags = ID3()
     track_no = fields.get("track_number")
-    total = fields.get("tracks_count")
+    album = fields.get("album_name") or ""
     frames = {
         "TIT2": TIT2(encoding=3, text=fields["name"]),
         # One string: ID3v2.3 has no multi-value frames, and "A, B" reads well everywhere.
         "TPE1": TPE1(encoding=3, text=", ".join(fields["artists"])),
         "TPE2": TPE2(encoding=3, text=fields.get("album_artist") or fields["artist"]),
-        "TALB": TALB(encoding=3, text=fields.get("album_name") or ""),
-        "TRCK": TRCK(encoding=3, text=f"{track_no}/{total}" if total else str(track_no)),
-        "TPOS": TPOS(encoding=3, text=str(fields.get("disc_number") or 1)),
         "WOAS": WOAS(url=fields["url"]),
     }
+    if album:
+        frames["TALB"] = TALB(encoding=3, text=album)
+    if track_no:
+        frames["TRCK"] = TRCK(encoding=3, text=str(track_no))
     if fields.get("date") or fields.get("year"):
         frames["TDRC"] = TDRC(encoding=3, text=str(fields.get("date") or fields.get("year")))
-    if fields.get("isrc"):
-        frames["TSRC"] = TSRC(encoding=3, text=fields["isrc"])
+    for frame_id in ("TALB", "TRCK", "TPOS", "TSRC", "TDRC", "TYER", "TDAT", "COMM", "TCON"):
+        tags.delall(frame_id)
     for frame_id, frame in frames.items():
         tags.setall(frame_id, [frame])
     if cover is not None:
@@ -472,7 +721,7 @@ def tag_mp3(path: Path, fields: dict[str, Any], cover: bytes | None) -> dict[str
     return {
         "title": fields["name"],
         "artist": ", ".join(fields["artists"]),
-        "album": fields.get("album_name") or "",
+        "album": album,
         "track_number": track_no,
         "cover": {"width": size[0], "height": size[1]} if size else None,
     }
@@ -486,9 +735,11 @@ class SpotDlEngine:
         kind, spotify_id = parse_url(job.url)
         opts = dict(job.options)
         mode = opts.get("mode", "analyze")
-        if mode in ("analyze", "match"):
+        if mode == "analyze":
             if set(opts) - {"mode"}:
-                raise EngineError("bad_options", f"{mode} takes no options")
+                raise EngineError("bad_options", "analyze takes no options")
+        elif mode == "match":
+            parse_match_options(opts)
         elif mode == "download":
             video_id, archive = parse_download_options(opts)
         else:
@@ -496,72 +747,58 @@ class SpotDlEngine:
         if mode != "analyze" and kind != "track":
             raise EngineError("bad_options", f"{mode} works on one track")
 
-        client = self._client()
         try:
             if mode == "analyze":
-                return self._analyze(client, kind, spotify_id, emit)
+                return self._analyze(kind, spotify_id, emit)
             if mode == "match":
-                return self._match(client, spotify_id, emit)
-            return self._download(client, job, spotify_id, video_id, archive, emit)
+                return self._match(spotify_id, opts, emit)
+            return self._download(job, spotify_id, video_id, archive, emit)
         except EngineError:
             raise
         except Exception as exc:
             raise EngineError(*describe_error(exc)) from None
 
-    @staticmethod
-    def _client() -> Any:
-        try:
-            from spotdl.utils.config import DEFAULT_CONFIG
-            from spotdl.utils.spotify import SpotifyClient
-        except ImportError as exc:
-            raise EngineError("engine_missing", f"spotDL is not installed here: {exc}") from exc
-        if SpotifyClient._instance is None:
-            # The free client, always: see the module docstring. None of user_auth, auth_token or
-            # use_cache_file is passed, because each silently switches spotDL to the official
-            # API, whose shared credentials are over quota. no_cache keeps nothing on disk.
-            SpotifyClient.init(
-                client_id=DEFAULT_CONFIG["client_id"],
-                client_secret=DEFAULT_CONFIG["client_secret"],
-                no_cache=True,
-                use_official_api=False,
-            )
-        return SpotifyClient()
-
     # ── analyze ───────────────────────────────────────────────────────────────────────────
-    @staticmethod
-    def _analyze(client: Any, kind: str, spotify_id: str, emit: Emit) -> dict[str, Any]:
+    def _analyze(self, kind: str, spotify_id: str, emit: Emit) -> dict[str, Any]:
         emit("stage", {"stage": "analyzing"})
         url = f"https://open.spotify.com/{kind}/{spotify_id}"
+        entity = fetch_embed(kind, spotify_id)
+        cover = picture(entity, 300)
+        skipped = 0
         if kind == "track":
-            raw = client.track(spotify_id)
-            row = track_row(raw) if isinstance(raw, dict) else None
-            if row is None:
-                raise EngineError("download_error", "http error 404: that track was not found")
-            rows, title, owner, skipped = [row], row["title"], ", ".join(row["artists"]), 0
+            row = track_entity_row(entity, spotify_id)
+            rows, title, owner = [row], row["title"], ", ".join(row["artists"])
         else:
-            from spotdl.types.album import Album
-            from spotdl.types.playlist import Playlist
-
-            metadata, songs = (Album if kind == "album" else Playlist).get_metadata(url)
+            title = safe_text(entity.get("name") or entity.get("title")) or kind.capitalize()
+            # An album's rows are the album's own songs: its name and cover are theirs too. A
+            # playlist's rows name neither; the GUI looks up each row's picture itself.
+            album = title if kind == "album" else ""
+            art = cover if kind == "album" else None
+            if kind == "album":
+                owner = safe_text(entity.get("subtitle"))
+            else:
+                owner = ", ".join(_artists(entity.get("authors"))) or safe_text(
+                    entity.get("subtitle")
+                )
+            items = entity.get("trackList") if isinstance(entity.get("trackList"), list) else []
             rows = []
-            skipped = 0
-            for song in songs:
-                row = song_row(song)
+            for item in items:
+                row = embed_row(item, album, art)
                 if row is None:
                     skipped += 1
                 else:
                     rows.append(row)
-            title = safe_text(metadata.get("name")) or kind.capitalize()
-            # An album names its first artist as a dict; a playlist names its owner as text.
-            owner = ", ".join(_artists([metadata.get("artist")])) or safe_text(
-                metadata.get("author_name")
-            )
+            if len(items) >= EMBED_PAGE_CAP:
+                rows, skipped = self._rest(kind, url, rows, skipped, album, art, emit)
         truncated = len(rows) > MAX_TRACKS
+        listed = rows[:MAX_TRACKS]
         emit("stage", {"stage": "completed"})
         # Even one song is listed as a playlist of one: it is matched and downloaded the same way.
         # The rows are the MediaResult entries; "tracks" is the same list, which core.spotify
-        # still parses until the result card (R2) reads entries.
-        listed = rows[:MAX_TRACKS]
+        # parses.
+        fields: dict[str, Any] = {}
+        if cover:
+            fields["cover"] = cover
         return media_result(
             "playlist",
             ["tracks"],
@@ -575,82 +812,65 @@ class SpotDlEngine:
             tracks=listed,
             skipped=skipped,
             truncated=truncated,
+            **fields,
         )
 
-    # ── match ─────────────────────────────────────────────────────────────────────────────
     @staticmethod
-    def _song(client: Any, track_id: str) -> tuple[Any, dict[str, Any]]:
-        from spotdl.types.song import Song
-
-        raw = client.track(track_id)
-        if not isinstance(raw, dict) or raw.get("id") != track_id:
-            raise EngineError("download_error", "http error 404: that track was not found")
-        fields = song_fields(raw)
-        return Song.from_missing_data(**fields), fields
-
-    @staticmethod
-    def _search(
-        song: Any, fields: dict[str, Any], emit: Emit, candidates: list | None = None
-    ) -> dict[str, Any] | None:
-        """The match: a YouTube Music song first, spotDL's own pick only when no song fits.
-
-        Returns {video_id, title, channel, duration, score}, or None when nothing was found.
-        The song search's results are also appended to ``candidates`` when one is given.
-        """
+    def _rest(
+        kind: str,
+        url: str,
+        rows: list[dict[str, Any]],
+        skipped: int,
+        album: str,
+        art: str | None,
+        emit: Emit,
+    ) -> tuple[list[dict[str, Any]], int]:
+        """The rows past the embed page's cap, from spotDL (plan §7 item 1). Best effort."""
         try:
-            results = search_songs(fields)
-            if candidates is not None:
-                candidates.extend(candidate_rows(results))
-            picked = pick_song(results, fields)
-        except Exception:  # the fallback below still gets its turn
-            emit("log", {"level": "warning", "message": "YouTube Music song search failed"})
-            picked = None
-        if picked is not None:
-            return picked
-        video_id, result, score = SpotDlEngine._spotdl_search(song)
-        if video_id is None:
-            return None
-        duration = getattr(result, "duration", None) if result is not None else None
-        return {
-            "video_id": video_id,
-            "title": safe_text(getattr(result, "name", "")) if result is not None else "",
-            "channel": safe_text(getattr(result, "author", "")) if result is not None else "",
-            "duration": float(duration)
-            if isinstance(duration, int | float) and not isinstance(duration, bool) and duration
-            else None,
-            "score": round(score, 1) if score is not None else None,
-        }
+            from spotdl.types.album import Album
+            from spotdl.types.playlist import Playlist
+
+            SpotDlEngine._client()
+            _, songs = (Album if kind == "album" else Playlist).get_metadata(url)
+        except Exception:
+            message = f"only the first {len(rows)} songs could be listed"
+            emit("log", {"level": "warning", "message": message})
+            return rows, skipped
+        seen = {row["id"] for row in rows}
+        extra_skipped = 0
+        for song in songs:
+            row = song_row(song, album, art)
+            if row is None:
+                extra_skipped += 1
+            elif row["id"] not in seen:
+                seen.add(row["id"])
+                rows.append(row)
+        return rows, max(skipped, extra_skipped)
 
     @staticmethod
-    def _spotdl_search(song: Any) -> tuple[str | None, Any, float | None]:
-        """(video id, spotDL result, score) of spotDL's pick, or (None, None, None)."""
-        from spotdl.providers.audio import YouTubeMusic
+    def _client() -> Any:
+        """spotDL's free client, built once: only the >100-row fallback uses it."""
+        from spotdl.utils.config import DEFAULT_CONFIG
+        from spotdl.utils.spotify import SpotifyClient
 
-        class Scored(YouTubeMusic):
-            """spotDL's own YouTube Music matcher, remembering the score of its pick."""
+        if SpotifyClient._instance is None:
+            # The free client, always. None of user_auth, auth_token or use_cache_file is
+            # passed, because each silently switches spotDL to the official API, whose shared
+            # credentials are over quota. no_cache keeps nothing on disk.
+            SpotifyClient.init(
+                client_id=DEFAULT_CONFIG["client_id"],
+                client_secret=DEFAULT_CONFIG["client_secret"],
+                no_cache=True,
+                use_official_api=False,
+            )
+        return SpotifyClient()
 
-            picked: tuple[Any, float] | None = None
-
-            def get_best_result(self, results):  # type: ignore[no-untyped-def]
-                best = super().get_best_result(results)
-                self.picked = best
-                return best
-
-        provider = Scored()
-        url = provider.search(song)
-        video_id = video_id_of(url)
-        if video_id is None:
-            return None, None, None
-        picked = provider.picked
-        if picked is not None and video_id_of(getattr(picked[0], "url", None)) == video_id:
-            return video_id, picked[0], float(picked[1])
-        return video_id, None, None  # an ISRC hit, which spotDL returns without a score
-
-    def _match(self, client: Any, track_id: str, emit: Emit) -> dict[str, Any]:
+    # ── match ─────────────────────────────────────────────────────────────────────────────
+    def _match(self, track_id: str, opts: dict[str, Any], emit: Emit) -> dict[str, Any]:
         emit("stage", {"stage": "analyzing"})
-        song, fields = self._song(client, track_id)
+        fields = track_fields(fetch_embed("track", track_id), track_id, opts)
         candidates: list[dict[str, Any]] = []
-        found = self._search(song, fields, emit, candidates)
+        found = find_match(fields, emit, candidates)
         if found is None:
             raise EngineError("no_match", "No matching song was found on YouTube Music.")
         emit("stage", {"stage": "completed"})
@@ -662,6 +882,8 @@ class SpotDlEngine:
             "channel": found["channel"],
             "duration": found["duration"],
             "confidence": found["score"],
+            "method": found["method"],
+            "album": found["album"],
             "spotify_duration": fields["duration"],
             # The other results, so a wrong pick can be swapped without a pasted link.
             "candidates": [c for c in candidates if c["video_id"] != found["video_id"]],
@@ -670,7 +892,6 @@ class SpotDlEngine:
     # ── download ──────────────────────────────────────────────────────────────────────────
     def _download(
         self,
-        client: Any,
         job: JobSpec,
         track_id: str,
         video_id: str | None,
@@ -693,13 +914,15 @@ class SpotDlEngine:
             }
 
         emit("stage", {"stage": "analyzing"})
-        song, fields = self._song(client, track_id)
+        fields = track_fields(fetch_embed("track", track_id), track_id, job.options)
         manual = video_id is not None
         if video_id is None:
-            found = self._search(song, fields, emit)
+            found = find_match(fields, emit)
             if found is None:
                 raise EngineError("no_match", "No matching song was found on YouTube Music.")
             video_id = found["video_id"]
+            if not fields["album_name"] and found["album"]:
+                fields["album_name"] = found["album"]
 
         # The audio: this project's own MP3 recipe, run by the yt-dlp engine in this env.
         from stuff_downloader_worker.engines.ytdlp import YtDlpEngine

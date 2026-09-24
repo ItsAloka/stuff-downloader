@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import threading
 
 import pytest
@@ -85,6 +86,79 @@ def test_nothing_outside_the_allow_list_is_fetched(qtbot, url, monkeypatch):
     monkeypatch.undo()  # the real fetcher, which must refuse before connecting
     with pytest.raises(thumbs.ThumbnailError):
         thumbs.fetch(url)
+
+
+# ── Spotify's pictures (plan §7 item 2) ──────────────────────────────────────────────────
+HASH = "ab67616d00001e02" + "c" * 24
+SCDN = f"https://i.scdn.co/image/{HASH}"
+T1 = "6OmhkSOpvYBokMKQxpIGx2"
+OEMBED = f"https://open.spotify.com/oembed?url=https://open.spotify.com/track/{T1}"
+
+
+def test_spotify_pictures_and_oembed_lookups_are_allowed_in_their_exact_form():
+    assert thumbs.allowed(SCDN) and thumbs.allowed(OEMBED)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        f"https://image-cdn-ak.spotifycdn.com/image/{HASH}",  # only the normalized host
+        f"https://i.scdn.co/image/{HASH}?x=1",
+        f"https://i.scdn.co/other/{HASH}",
+        f"http://i.scdn.co/image/{HASH}",
+        "https://i.scdn.co/image/../../x",
+        f"https://open.spotify.com/oembed?url=https://open.spotify.com/playlist/{T1}",
+        f"{OEMBED}&format=xml",
+        f"https://open.spotify.com/oembed?url=https://evil.example/track/{T1}",
+        f"https://open.spotify.com/embed/track/{T1}",
+    ],
+)
+def test_nothing_else_on_spotifys_hosts_is_fetched(url, monkeypatch):
+    monkeypatch.undo()  # the real fetcher, which must refuse before connecting
+    assert not thumbs.allowed(url)
+    with pytest.raises(thumbs.ThumbnailError):
+        thumbs.fetch(url)
+
+
+def test_an_oembed_lookup_is_followed_to_its_picture_on_i_scdn_co(monkeypatch):
+    monkeypatch.undo()  # the real fetcher; only its network call is replaced
+    calls = []
+
+    def get(url, cap):
+        calls.append((url, cap))
+        if url == OEMBED:
+            answer = {"thumbnail_url": f"https://image-cdn-ak.spotifycdn.com/image/{HASH}"}
+            return json.dumps(answer).encode()
+        return png()
+
+    monkeypatch.setattr(thumbs, "_get", get)
+    assert thumbs.fetch(OEMBED) == png()
+    assert calls == [(OEMBED, thumbs.MAX_OEMBED_BYTES), (SCDN, thumbs.MAX_BYTES)]
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        b"not json",
+        b"[]",
+        json.dumps({"thumbnail_url": "https://evil.example/image/" + HASH}).encode(),
+        json.dumps({"thumbnail_url": SCDN + "?x=1"}).encode(),
+        json.dumps({"thumbnail_url": "file:///C:/x.png"}).encode(),
+        json.dumps({"html": "<iframe>"}).encode(),
+    ],
+)
+def test_a_hostile_oembed_answer_fetches_nothing_more(monkeypatch, answer):
+    monkeypatch.undo()
+    calls = []
+
+    def get(url, cap):
+        calls.append(url)
+        return answer
+
+    monkeypatch.setattr(thumbs, "_get", get)
+    with pytest.raises(thumbs.ThumbnailError):
+        thumbs.fetch(OEMBED)
+    assert calls == [OEMBED]
 
 
 def test_decode_caps_bytes_and_pixels(qtbot):
