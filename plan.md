@@ -118,10 +118,10 @@ the milestone named.
 
 | ID | Problem | Root cause (checked in code) | Fix in |
 |---|---|---|---|
-| **P1** | The app does not know if a link is video, audio or image. Every yt-dlp result gets the same video presets, including SoundCloud and other audio-only pages. Direct audio/video files get only "Original file". | `DownloadsPage._fill_presets(file=…)` picks presets only by route kind. No field in the analyze result says "audio-only" or "image". **S** | ✅ R1 (detection), R2 (presets) |
-| **P2** | No format list like 9xbuddy/ytmp3. Options are hidden in Preset + Quality dropdowns. The "All formats" table is read-only. | Plan decision in M3 ("no per-row download"). **S** | R2 |
-| **P3** | No format conversion at download time (MP4/MKV/WebM, MP3 bitrates, FLAC/WAV, PNG/WebP). The Converters tab was the wrong fix. | Presets are a fixed list of 6. **S + C** | R2 |
-| **P4** | The "File name" field or column appears everywhere. The owner wants to click the title and edit it. | `PreviewCard.name_edit`, `PlaylistCard` col 6, Spotify col 9. **S + C** | R2, R5 |
+| **P1** | The app does not know if a link is video, audio or image. Every yt-dlp result gets the same video presets, including SoundCloud and other audio-only pages. Direct audio/video files get only "Original file". | `DownloadsPage._fill_presets(file=…)` picks presets only by route kind. No field in the analyze result says "audio-only" or "image". **S** | ✅ R1 (detection), ✅ R2 (format rows) |
+| **P2** | No format list like 9xbuddy/ytmp3. Options are hidden in Preset + Quality dropdowns. The "All formats" table is read-only. | Plan decision in M3 ("no per-row download"). **S** | ✅ R2 |
+| **P3** | No format conversion at download time (MP4/MKV/WebM, MP3 bitrates, FLAC/WAV, PNG/WebP). The Converters tab was the wrong fix. | Presets are a fixed list of 6. **S + C** | ✅ R2 |
+| **P4** | The "File name" field or column appears everywhere. The owner wants to click the title and edit it. | `PreviewCard.name_edit`, `PlaylistCard` col 6, Spotify col 9. **S + C** | ✅ R2 (single item, playlist table), R5 |
 | **P5** | Most non-YouTube videos (Instagram, TikTok, X, Vimeo…) show a blank preview. | `ytdlp._thumbnail_url` only accepts `*.ytimg.com`, `*.ggpht.com`, `*.googleusercontent.com` (`_THUMB_HOST_SUFFIXES`). Everything else is dropped. **S** | R3 |
 | **P6** | Direct video/audio file links show no preview and no info (duration, resolution, bitrate). | `HttpEngine` analyze builds a preview only for images. **S** | R3 |
 | **P7** | **Social-media images are blocked while videos work** (Instagram photos/carousels, TikTok photo slideshows, Facebook photos). | They go to gallery-dl, which now needs a login for Instagram ("HTTP redirect to login page", gallery-dl issue #9564, June 2026). TikTok returns 403. yt-dlp ignores photos ("no video in this post"). Our knowledge notes confirm: *"Instagram redirects to login, TikTok profiles 403 (Sept 2026)"*. **S** | R4 |
@@ -510,6 +510,22 @@ Tags always on. Inline title editing. File name fields removed. Crop checkbox re
 **Accept:** from one YouTube video, download 1080p MP4, 720p MKV, MP3 320, M4A and the PNG thumbnail.
 Every audio file has tags and a cover, checked with mutagen. The edited title becomes the file name and
 `TIT2` stays the original.
+
+> **✅ Done (2026-09-24), accepted by the owner.** Code commit `232f315`. Reviewed by Codex (main implementation,
+> supporting changes, follow-up fixtures, the H.264 row fix and the restored UI tests).
+> Tests: **1293 passed, 1 skipped, 20 deselected (network), ruff clean.**
+> - One `ResultCard` drawn only from `MediaResult`, with Video / Audio / Image tabs and a Download button per row.
+>   Row requests `{tab, row_id, container, edited_title}` are built by `core.presets.row_download_options` and
+>   re-checked by the worker's `presets.parse_row_request`. Playlist, Spotify and spotDL jobs still use `parse_request`.
+> - Row ids: `v:<h>:<mp4|webm>`, `a:mp3:<kbps>`, `a:m4a|opus|flac|wav`, `i:<w>x<h>|best`, and `v:|a:|i:orig` for direct files and gallery-dl.
+>   MP4 rows ask for H.264 (`avc1`) first. "Save video as" MP4/MKV/WebM/MOV/AVI; image rows can save as original/JPG/PNG/WebP.
+> - Tags and cover on every audio format; WAV gets tags only and its row says so. The edited title becomes the file name; `TIT2` stays the original.
+>   File name fields and columns and the crop checkbox are gone.
+> - Acceptance (Big Buck Bunny, `aqz-KE-bpKQ`): 1080p MP4 (h264+aac), 720p MKV, MP3 320 with an edited title, M4A, Opus, FLAC
+>   (title, artist and cover checked with mutagen), WAV (tags checked with ffprobe) and a PNG thumbnail.
+> - Carried forward: direct-video audio extraction and frame rows (R3, need ffmpeg/ffprobe). YouTube over-reports some
+>   thumbnail sizes (the "1920x1080" PNG was 1278x720). A job that fails after the cover step leaves its `.jpg`, which pushes the next
+>   file with the same name to "(2)". The gallery grid's own format combo is still Original/JPG/PNG (R4).
 
 ### R3 — Previews everywhere
 §5.6. Kept thumbnail fetcher, `og:image` fallback, FFmpeg frame grab, ffprobe info for direct files.
