@@ -266,6 +266,9 @@ def test_analyzing_a_track_lists_it_with_bounded_text(fake_spotdl):
     result, events = _run({"mode": "analyze"})
     listing = spotify.parse_listing(result)
     assert (listing.kind, listing.spotify_id) == ("track", T1)
+    assert (result["kind"], result["tabs"], result["site"]) == ("playlist", ["tracks"], "Spotify")
+    assert result["entries"] == result["tracks"] and len(result["entries"]) == 1
+    assert result["webpage"] == f"https://open.spotify.com/track/{T1}"
     (track,) = listing.tracks
     assert track.title == "Title with [link] link"
     assert track.artists == ("Pitbull", "Sensato") and track.duration == 85.0
@@ -285,6 +288,7 @@ def test_analyzing_an_album_uses_one_listing_pass_and_counts_unusable_rows(fake_
     assert listing.owner == "Pitbull"  # an album's artist arrives as a dict, not text
     assert [t.track_id for t in listing.tracks] == [T1]
     assert listing.skipped == 1
+    assert [e["id"] for e in result["entries"]] == [T1]
 
 
 def test_a_missing_track_reads_as_not_found(fake_spotdl):

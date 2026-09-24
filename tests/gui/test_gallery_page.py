@@ -199,3 +199,18 @@ def test_restored_gallery_jobs_come_back_paused(qtbot, monkeypatch, runs, tmp_pa
     job = downloads.jobs["g1"]
     assert job.state == "paused" and job.spec.engine == "gallerydl"
     assert isinstance(job.spec, JobSpec) and runs == []
+
+
+def test_a_one_photo_post_still_opens_in_the_gallery_card(page, runs, qtbot):
+    """kind "image" from gallery-dl: the card is chosen by the answering engine until R2."""
+    from stuff_downloader.core import protocol
+
+    page.url_edit.setText(URL)
+    page.analyze()
+    result = protocol.media_result(
+        "image", ["image"], "One photo", URL, site="Instagram", extractor="Instagram",
+        items=[{"index": 1, "kind": "image", "ext": "jpg"}], truncated=False,
+    )  # fmt: skip
+    runs[-1].emit("result", **result)
+    qtbot.waitUntil(lambda: not page.gallery_card.isHidden())
+    assert page.preview.isHidden()

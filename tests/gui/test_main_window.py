@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 from PyQt6.QtCore import Qt
 
-from stuff_downloader.core import presets, router, settings, tools
+from stuff_downloader.core import presets, protocol, router, settings, tools
 from stuff_downloader.core.protocol import Event
 from stuff_downloader.gui import pages, theme
 from stuff_downloader.gui.main_window import MainWindow, tool_health_text
@@ -1345,3 +1345,34 @@ def test_every_job_row_is_written_by_one_function(window, runs, qtbot):
     source = inspect.getsource(pages.DownloadsPage)
     callers = [line.strip() for line in source.splitlines() if "store.add_job(" in line]
     assert callers == ["self.store.add_job("], callers
+
+
+def test_a_link_pasted_without_https_is_completed_and_walks_the_core_chain(window, runs, qtbot):
+    """P14 and plan §5.3: the page engines answer first; the direct engine only last."""
+    page = window.downloads_page
+    page.url_edit.setText("pbs.twimg.com/media/Gx1AbC?format=jpg&name=large")
+    page.analyze()
+    full = "https://pbs.twimg.com/media/Gx1AbC?format=jpg&name=large"
+    assert page.url_edit.text() == full
+    assert router.ADDED_SCHEME_NOTE in page.message_label.text()
+    assert (runs[0].spec.engine, runs[0].spec.url) == ("ytdlp", full)
+    runs[0].emit("error", code="unsupported", message="ERROR: Unsupported URL: [link]")
+    assert runs[1].spec.engine == "gallerydl"
+    runs[1].emit("error", code="unsupported", message="unsupported url: no gallery found")
+    assert runs[2].spec.engine == "http" and len(runs) == 3
+    image = protocol.media_result(
+        "image", ["image"], "Gx1AbC", full, site="Direct file", ext="jpg",
+        preview={"data": _png_b64(40, 30)}, formats=[],
+    )  # fmt: skip
+    runs[2].on_event(Event("result", runs[2].spec.job_id, image))
+    qtbot.waitUntil(lambda: not page.preview.isHidden())
+    assert not page.preview.image_format_combo.isHidden()
+    assert page._thumb is not None
+
+
+def test_a_real_failure_does_not_move_down_the_chain(window, runs):
+    page = window.downloads_page
+    page.url_edit.setText("https://www.example.com/post/123")
+    page.analyze()
+    runs[0].emit("error", code="download_error", message="HTTP Error 500: Server Error")
+    assert len(runs) == 1 and page.preview.isHidden()

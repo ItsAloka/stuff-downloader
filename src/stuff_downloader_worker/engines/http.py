@@ -40,7 +40,7 @@ from typing import Any
 from urllib.parse import unquote, urljoin, urlsplit
 
 from ..names import safe_output_name
-from ..protocol import JobSpec
+from ..protocol import JobSpec, media_result
 from .base import Emit, EngineError
 
 PRESET_ID = "original_file"
@@ -61,6 +61,16 @@ MEDIA_EXTENSIONS = frozenset(
     }
 )  # fmt: skip
 IMAGE_EXTENSIONS = frozenset({".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".bmp"})
+VIDEO_EXTENSIONS = frozenset(
+    {".mp4", ".m4v", ".webm", ".mkv", ".mov", ".avi", ".flv", ".wmv", ".3gp", ".ts"}
+)
+# The image types we save, each with the extension a file of that type gets. An image is judged
+# by its Content-Type, not its URL: a `?format=jpg` link has no extension at all, and a `.png`
+# path can serve a JPEG. Any other image/* type (SVG above all) is refused, not saved.
+IMAGE_TYPES = {
+    "image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
+    "image/gif": ".gif", "image/avif": ".avif", "image/bmp": ".bmp",
+}  # fmt: skip
 MAX_PREVIEW_BYTES = 5 * 1024 * 1024
 PREVIEW_SECONDS = 15.0
 _GENERIC_TYPES = frozenset({"application/octet-stream", "binary/octet-stream", ""})
@@ -259,6 +269,13 @@ def file_name(url: str, resp: http.client.HTTPResponse) -> str:
     """Content-Disposition, else the last URL path segment; extension from the type if absent."""
     raw = _disposition_name(resp) or unquote(urlsplit(url).path.rsplit("/", 1)[-1])
     name = safe_file_name(raw)
+    image_ext = IMAGE_TYPES.get(_content_type(resp))
+    if image_ext:
+        # The file is named by what it is: a PNG served from ".../photo.jpg" is saved as .png.
+        stem, ext = os.path.splitext(name)
+        valid_exts = {".jpg", ".jpeg"} if image_ext == ".jpg" else {image_ext}
+        if ext.lower() not in valid_exts:
+            name = (stem if ext.lower() in MEDIA_EXTENSIONS else name) + image_ext
     if "." not in name:
         guessed = mimetypes.guess_extension(_content_type(resp)) or ""
         if guessed.lower() in MEDIA_EXTENSIONS:
@@ -268,10 +285,28 @@ def file_name(url: str, resp: http.client.HTTPResponse) -> str:
 
 def is_media(name: str, content_type: str) -> bool:
     """Whether a response is a media file: a media type, or a generic one with a media name."""
-    if content_type.split("/")[0] in ("video", "audio", "image"):
-        return content_type not in ("image/svg+xml",)
+    if content_type.startswith("image/"):
+        return content_type in IMAGE_TYPES
+    if content_type.split("/")[0] in ("video", "audio"):
+        return True
     ext = os.path.splitext(name)[1].lower()
     return content_type in _GENERIC_TYPES and ext in MEDIA_EXTENSIONS
+
+
+def media_kind(name: str, content_type: str) -> tuple[str, list[str]]:
+    """(kind, tabs) for a file ``is_media`` accepted: by MIME, by extension only when generic."""
+    major = content_type.split("/")[0]
+    if content_type in _GENERIC_TYPES:
+        ext = os.path.splitext(name)[1].lower()
+        if ext in IMAGE_EXTENSIONS:
+            major = "image"
+        else:
+            major = "video" if ext in VIDEO_EXTENSIONS else "audio"
+    if major == "image":
+        return "image", ["image"]
+    if major == "audio":
+        return "audio", ["audio", "image"]
+    return "video", ["video", "audio", "image"]
 
 
 def _candidates(folder: Path, name: str):
@@ -408,10 +443,10 @@ class HttpEngine:
             conn.close()
         emit("stage", {"stage": "completed"})
         stem, ext = os.path.splitext(name)
+        kind, tabs = media_kind(name, ctype)
         info: dict[str, Any] = {
-            "kind": "file",
-            "title": stem or name,
             "extractor": "Direct file",
+            "site": "Direct file",
             "ext": ext.lstrip(".").lower(),
             "content_type": ctype[:60],
             "resumable": resumable,
@@ -419,12 +454,12 @@ class HttpEngine:
         }
         if total is not None:
             info["filesize"] = total
-        is_image = ext.lower() in IMAGE_EXTENSIONS or ctype.startswith("image/")
-        if is_image and (total is None or total <= MAX_PREVIEW_BYTES):
-            preview = _image_preview(url, emit)
-            if preview is not None:
-                info["thumbnail"] = {"data": base64.b64encode(preview).decode("ascii")}
-        return info
+        preview = None
+        if kind == "image" and (total is None or total <= MAX_PREVIEW_BYTES):
+            data = _image_preview(url, emit)
+            if data is not None:
+                preview = {"data": base64.b64encode(data).decode("ascii")}
+        return media_result(kind, tabs, stem or name, url, preview=preview, **info)
 
     def _download(self, job: JobSpec, emit: Emit) -> dict[str, Any]:
         folder = Path(job.output_dir)
@@ -436,10 +471,11 @@ class HttpEngine:
             if resp.status not in (200, 206):
                 raise http_error(resp.status, resp.reason)
             name = file_name(final, resp)
+            probe_type = _content_type(resp)
             chosen = safe_output_name(job.options.get("output_name"))
             if chosen:
                 name = chosen + Path(name).suffix
-            if not is_media(name, _content_type(resp)):
+            if not is_media(name, probe_type):
                 raise EngineError("unsupported", "unsupported url: that link is not a media file")
         finally:
             conn.close()
@@ -472,6 +508,10 @@ class HttpEngine:
                 raise EngineError("download_error", "the partial file no longer matches; retry")
             if resp.status not in (200, 206):
                 raise http_error(resp.status, resp.reason)
+            if probe_type in IMAGE_TYPES and _content_type(resp) != probe_type:
+                # The name was chosen from the first answer's type; a different image type now
+                # would be saved under the wrong extension.
+                raise EngineError("unsupported", "unsupported url: the image type changed")
             if resp.status == 206 and _range_start(resp) != offset:
                 raise EngineError("download_error", "the site sent the wrong part of the file")
             if resp.status == 200:

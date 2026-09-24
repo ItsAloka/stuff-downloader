@@ -365,3 +365,87 @@ def test_a_malformed_spotify_id_is_invalid(text):
 
 def test_spotify_jobs_share_one_rate_limited_group():
     assert social_group(f"https://open.spotify.com/track/{SPOTIFY_TRACK}") == "spotify"
+
+
+# ── P14: scheme-less links, neutral wording, the analyze chain (plan §5.3, R1) ─────────────
+from stuff_downloader.core import router as _router  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    ("text", "kind", "url"),
+    [
+        (
+            "pbs.twimg.com/media/Gx1AbC?format=jpg&name=large",
+            "video",
+            "https://pbs.twimg.com/media/Gx1AbC?format=jpg&name=large",
+        ),
+        ("cdn.example.com/a/photo.jpg", "file", "https://cdn.example.com/a/photo.jpg"),
+        (
+            "www.youtube.com/watch?v=dQw4w9WgXcQ",
+            "youtube",
+            "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        ),
+        ("x.com/someone/status/1/photo/1", "gallery", "https://x.com/someone/status/1/photo/1"),
+    ],
+)
+def test_a_link_without_a_scheme_gets_https_and_a_note(text, kind, url):
+    r = route(text)
+    assert (r.kind, r.url) == (kind, url)
+    assert r.note == _router.ADDED_SCHEME_NOTE
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "localhost/x",
+        "192.168.1.10/cam.jpg",
+        "printer.local/scan.png",
+        "mailto:someone@example.com",
+        "javascript:alert(1)",
+        "just-a-word",
+        "//example.com/a",
+    ],
+)
+def test_a_fragment_that_is_not_a_public_host_is_refused_neutrally(text):
+    r = route(text)
+    assert not r.ok and not r.note
+    assert r.reason == _router.INCOMPLETE_LINK_REASON
+    assert "video" not in r.reason.lower()
+
+
+def test_a_full_link_gets_no_note():
+    assert route("https://cdn.example.com/a/photo.jpg").note == ""
+
+
+def test_router_refusals_never_assume_the_link_is_a_video():
+    for reason in (
+        _router.SITE_UNSUPPORTED_REASON,
+        _router.INCOMPLETE_LINK_REASON,
+        route("example.com").reason,
+        route("ftp://example.com/a.jpg").reason,
+    ):
+        assert reason and "video page" not in reason.lower()
+
+
+def test_the_analyze_chain_is_decided_in_core():
+    page = route("https://www.example.com/post/123")
+    assert page.kind == "video"
+    chain = _router.analyze_fallbacks(page)
+    assert [(r.kind, r.engine) for r in chain] == [("gallery", "gallerydl"), ("file", "http")]
+    assert all(r.url == page.url for r in chain)
+    # Nothing else falls back, and a direct file is only ever probed after the page engines.
+    for text in (
+        "https://cdn.example.com/a.mp4",
+        "https://www.instagram.com/p/C0ffee123/",
+        "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+        f"https://open.spotify.com/track/{SPOTIFY_TRACK}",
+    ):
+        assert _router.analyze_fallbacks(route(text)) == []
+
+
+@pytest.mark.parametrize(
+    ("code", "falls_back"),
+    [("unsupported", True), ("download_error", False), ("timeout", False), (None, False)],
+)
+def test_only_an_unsupported_answer_moves_down_the_chain(code, falls_back):
+    assert _router.should_fall_back(code) is falls_back

@@ -1,7 +1,8 @@
 """Reports which interpreter and engine modules this worker actually runs with. No network.
 
 Options: ``modules`` (list of import names, max 20). Used by self-tests and the §8.1 spike to
-prove a worker runs in the expected engine env.
+prove a worker runs in the expected engine env. It is not a media engine: it has no analyze
+mode and never returns a MediaResult, so a ``mode`` option is refused.
 """
 
 from __future__ import annotations
@@ -26,6 +27,8 @@ class ProbeEngine:
     name = "probe"
 
     def download(self, job: JobSpec, emit: Emit) -> dict[str, Any]:
+        if "mode" in job.options:
+            raise EngineError("bad_options", "the probe engine has no modes")
         modules = job.options.get("modules", [])
         if not isinstance(modules, list) or len(modules) > 20:
             raise EngineError("bad_options", "'modules' must be a list of at most 20 names")

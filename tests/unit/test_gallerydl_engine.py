@@ -238,15 +238,46 @@ def cfg(state, key, section="extractor"):
 def test_analyze_returns_rebuilt_rows_and_never_an_item_url(fake_gdl):
     result, events = _run({"mode": "analyze"})
     assert result["kind"] == "gallery" and result["extractor"] == "Instagram"
+    assert result["tabs"] == ["gallery"] and result["site"] == "Instagram"
     assert result["title"] == "Sunset at the beach" and result["uploader"] == "some.user"
     rows = result["items"]
     assert [r["index"] for r in rows] == [1, 2, 3, 4]
     assert rows[0] | {} == {**rows[0], "kind": "image", "ext": "jpg", "width": 1080, "height": 1350}
     assert rows[1]["kind"] == "video" and "thumbnail" not in rows[1]
-    text = json.dumps(result)
+    # The post's own durable link is the one URL allowed out; no item URL ever is.
+    assert result["webpage"] == URL
+    text = json.dumps({k: v for k, v in result.items() if k != "webpage"})
     assert "SUPERSECRET" not in text and "cdninstagram" not in text and "http" not in text
     assert "_secret" not in text
     assert [k for k, _ in events if k == "stage"] == ["stage", "stage"]
+
+
+def test_an_x_post_with_one_photo_is_an_image(fake_gdl, monkeypatch):
+    extractor = sys.modules["gallery_dl.extractor"]
+    find = extractor.find
+
+    def twitter(url):
+        extr = find(url)
+        extr.category = "twitter"
+        return extr
+
+    monkeypatch.setattr(extractor, "find", twitter)
+    fake_gdl["items"] = [
+        ("https://pbs.twimg.com/media/Gx1AbC?format=jpg&name=orig", {"extension": "jpg"})
+    ]
+    fake_gdl["post"] = {"content": "A photo", "author": {"name": "someone"}}
+    result, _ = _run({"mode": "analyze"}, url="https://x.com/someone/status/1234567890")
+    assert (result["kind"], result["tabs"]) == ("image", ["image"])
+    assert result["site"] == "Twitter" and len(result["items"]) == 1
+    from stuff_downloader.core.protocol import validate_media_result
+
+    validate_media_result(json.loads(json.dumps(result)))
+
+
+def test_a_post_with_one_clip_is_a_video(fake_gdl):
+    fake_gdl["items"] = [("https://scontent.cdninstagram.com/b.mp4", {"extension": "mp4"})]
+    result, _ = _run({"mode": "analyze"})
+    assert (result["kind"], result["tabs"]) == ("video", ["video"])
 
 
 def test_previews_only_from_https_public_hosts(fake_gdl):

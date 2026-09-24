@@ -582,7 +582,7 @@ class DownloadsPage(QWidget):
         self._login_retry_job_id = ""
         # Engines still to try when the one a link was routed to says "unsupported" (plan §5.3
         # steps 3-5): a page yt-dlp cannot read may be a gallery, or the media file itself.
-        self._fallbacks: list[str] = []
+        self._fallbacks: list[router.Route] = []
         self._gallery: gallery.Gallery | None = None
         # Spotify (plan §6.3): the listing, the matches known so far (track id -> Match), and
         # the match lookups waiting and running. A lookup is a short job, never a queue row.
@@ -885,8 +885,11 @@ class DownloadsPage(QWidget):
             self.preview.hide()
             self._show_message(route.reason, error=True)
             return
+        if route.note:
+            # The link was completed (https:// added); show the owner what is being analyzed.
+            self.url_edit.setText(router.complete_link(self.url_edit.text())[0])
         self._route = route
-        self._fallbacks = ["gallery", "file"] if route.kind == "video" else []
+        self._fallbacks = router.analyze_fallbacks(route)
         self._start_analyze(route)
 
     def _start_analyze(self, route: router.Route) -> None:
@@ -920,9 +923,8 @@ class DownloadsPage(QWidget):
         if route.is_spotify:
             self._show_message("Reading Spotify… this can take up to a minute.")
         else:
-            self._show_message(
-                "Reading the playlist…" if route.is_playlist else "Analyzing link…"
-            )
+            reading = "Reading the playlist…" if route.is_playlist else "Analyzing link…"
+            self._show_message(f"{route.note} {reading}" if route.note else reading)
         self.analyze_button.setEnabled(False)
         self.analyze_cancel_button.show()
         self._analyze_timer.start(
@@ -957,10 +959,9 @@ class DownloadsPage(QWidget):
                 self._show_message("")
                 return
             route = self._route
-            if code == "unsupported" and route is not None and self._fallbacks:
-                # Plan §5.3: yt-dlp does not know the page, so gallery-dl gets a turn, then the
-                # direct engine — which checks the Content-Type before treating it as a file.
-                self._route = replace(route, kind=self._fallbacks.pop(0))
+            if router.should_fall_back(code) and route is not None and self._fallbacks:
+                # The chain is core's (router.analyze_fallbacks); this only walks it.
+                self._route = self._fallbacks.pop(0)
                 self._start_analyze(self._route)
                 return
             message = event.data.get("message")
@@ -974,15 +975,20 @@ class DownloadsPage(QWidget):
                 self._login_site = cookies.site_key(route.url)
                 self.login_button.setVisible(bool(self._login_site))
             return
+        result = event.data
         self._show_message("")
-        if event.data.get("kind") == "playlist":
-            self.show_playlist(event.data)
-        elif event.data.get("kind") == "gallery":
-            self.show_gallery(event.data)
-        elif event.data.get("kind") == "spotify":
-            self.show_spotify(event.data)
+        # Until the result card (R2) draws every kind itself, the existing cards are picked by
+        # the engine that answered: a gallery-dl post with one photo is kind "image" but is
+        # still downloaded through the gallery card.
+        route = self._route
+        if route is not None and route.is_spotify:
+            self.show_spotify(result)
+        elif result.get("kind") == "playlist":
+            self.show_playlist(result)
+        elif route is not None and route.is_gallery:
+            self.show_gallery(result)
         else:
-            self.show_preview(event.data)
+            self.show_preview(result)
 
     def show_preview(self, info: dict[str, Any]) -> None:
         self._info = info
@@ -1014,7 +1020,8 @@ class DownloadsPage(QWidget):
             card.playlist_label.setText(refusal)
 
         self._thumb = None
-        thumb = info.get("thumbnail")
+        # "preview" is the MediaResult field; "thumbnail" is what pre-R1 results carried.
+        thumb = info.get("preview") or info.get("thumbnail")
         if isinstance(thumb, dict) and isinstance(thumb.get("data"), str):
             try:
                 # Byte- and pixel-capped: a direct image link sends the image itself here.

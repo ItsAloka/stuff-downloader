@@ -37,7 +37,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from stuff_downloader_worker import tagging
 from stuff_downloader_worker.engines.base import Emit, EngineError
-from stuff_downloader_worker.protocol import JobSpec
+from stuff_downloader_worker.protocol import JobSpec, media_result
 
 PRESET_ID = "spotify_mp3"
 MAX_TRACKS = 500
@@ -544,16 +544,24 @@ class SpotDlEngine:
             )
         truncated = len(rows) > MAX_TRACKS
         emit("stage", {"stage": "completed"})
-        return {
-            "kind": "spotify",
-            "spotify_kind": kind,
-            "spotify_id": spotify_id,
-            "title": title,
-            "owner": owner,
-            "tracks": rows[:MAX_TRACKS],
-            "skipped": skipped,
-            "truncated": truncated,
-        }
+        # Even one song is listed as a playlist of one: it is matched and downloaded the same way.
+        # The rows are the MediaResult entries; "tracks" is the same list, which core.spotify
+        # still parses until the result card (R2) reads entries.
+        listed = rows[:MAX_TRACKS]
+        return media_result(
+            "playlist",
+            ["tracks"],
+            title,
+            url,
+            entries=listed,
+            site="Spotify",
+            spotify_kind=kind,
+            spotify_id=spotify_id,
+            owner=owner,
+            tracks=listed,
+            skipped=skipped,
+            truncated=truncated,
+        )
 
     # ── match ─────────────────────────────────────────────────────────────────────────────
     @staticmethod

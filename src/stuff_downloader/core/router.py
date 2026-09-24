@@ -5,6 +5,10 @@ id, so tracking parameters and anything else in the pasted text never reach the 
 to any other site cannot be rebuilt from an id — we do not know the site's URL grammar — so it
 is instead reduced to scheme, host, path and query, with credentials and the fragment dropped,
 and only after the host is shown to be a public internet name.
+
+A link pasted without its scheme (``pbs.twimg.com/media/…``) is completed with ``https://``
+when it starts with a public host name (plan §5.3, P14). Refusals are worded without assuming
+the link is a video, since it may equally be a song, a photo or a file.
 """
 
 from __future__ import annotations
@@ -12,7 +16,7 @@ from __future__ import annotations
 import ipaddress
 import re
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
@@ -39,7 +43,11 @@ SITE_PRIVATE_HOST_REASON = (
     "That link points at this machine or a private network, not a public website."
 )
 SITE_CREDENTIALS_REASON = "Links with a username or password in them are not supported."
-SITE_UNSUPPORTED_REASON = "That site is not supported yet. Paste a link to a public video page."
+SITE_UNSUPPORTED_REASON = (
+    "That is a site's home page. Paste the link to the video, song, photo or file itself."
+)
+INCOMPLETE_LINK_REASON = "That isn't a complete link. Copy the full address starting with https://"
+ADDED_SCHEME_NOTE = "Added https:// to the start of the link."
 
 # Spotify's marketing site holds no tracks. Handing it to the video engine would fail with
 # something the owner cannot act on, so it is refused by name instead.
@@ -65,6 +73,9 @@ _SHORT_HOSTS = {"youtu.be", "www.youtu.be"}
 _PATH_PREFIXES = ("shorts", "live", "embed", "v")
 
 MAX_URL_LENGTH = 2048
+# A pasted fragment that starts with a host name: labels, an optional port, then the end or a
+# path/query/fragment. Anything else without "://" (mailto:, javascript:, a bare word) is not.
+_SCHEMELESS_HOST = re.compile(r"(?:[A-Za-z0-9-]+\.)+[A-Za-z0-9-]+(?::\d{1,5})?(?=[/?#]|$)")
 
 # A link whose path ends in one of these is the media file itself, not a page about it, so it
 # goes to the direct HTTP engine. The engine re-checks the Content-Type before saving anything,
@@ -90,6 +101,7 @@ class Route:
     playlist_reason: str = ""  # why a named playlist cannot be downloaded, when it cannot
     music: bool = False
     reason: str = ""
+    note: str = ""  # something the owner should know about how the link was read
     spotify_kind: str = ""  # "track" | "album" | "playlist" (spotify only)
     spotify_id: str = ""
 
@@ -353,8 +365,46 @@ def _route_site(parts: Any) -> Route:
     return Route("video", url=_site_url(parts))
 
 
-def route(text: str) -> Route:
+# Plan §5.3: which engines analyze a link, in order. The first is the route's own engine; the
+# rest get a turn only when the one before reports the link unsupported. A page on an unknown
+# site may be a photo post (gallery-dl) or, last, a file served without an extension (the direct
+# engine, which checks the Content-Type before calling it one). Nothing probes a link as a
+# direct file before its own engine has answered.
+_ANALYZE_FALLBACKS = {"video": ("gallery", "file")}
+
+
+def analyze_fallbacks(route_: Route) -> list[Route]:
+    """The routes to try, in order, after ``route_``'s own engine calls the link unsupported."""
+    return [replace(route_, kind=kind) for kind in _ANALYZE_FALLBACKS.get(route_.kind, ())]
+
+
+def should_fall_back(code: str | None) -> bool:
+    """Whether an analyze error means "not this engine's kind of link", not a real failure."""
+    return code == "unsupported"
+
+
+def complete_link(text: str) -> tuple[str, str]:
+    """``text`` with ``https://`` added when it is a scheme-less public link, and a note saying so.
+
+    Only a fragment that starts with a public host name is completed; anything else comes back
+    unchanged with no note, for ``route`` to refuse.
+    """
     raw = (text or "").strip()
+    if "://" in raw:
+        return raw, ""
+    match = _SCHEMELESS_HOST.match(raw)
+    if not match or not is_public_host(match.group(0).split(":")[0]):
+        return raw, ""
+    return "https://" + raw, ADDED_SCHEME_NOTE
+
+
+def route(text: str) -> Route:
+    raw, note = complete_link(text)
+    routed = _route(raw)
+    return replace(routed, note=note) if note and routed.ok else routed
+
+
+def _route(raw: str) -> Route:
     if not raw:
         return Route("invalid", reason="Paste a link first.")
     if len(raw) > MAX_URL_LENGTH or any(ch.isspace() for ch in raw):
@@ -365,10 +415,12 @@ def route(text: str) -> Route:
         parts.port  # noqa: B018 - raises on a malformed port, which _site_url would otherwise hit
     except ValueError:
         return Route("invalid", reason="That doesn't look like a valid link.")
+    if "://" not in raw:
+        return Route("invalid", reason=INCOMPLETE_LINK_REASON)
     if parts.scheme.lower() not in ("http", "https"):
         return Route("invalid", reason="Only http and https links are supported.")
     if not host:
-        return Route("invalid", reason="That doesn't look like a valid link.")
+        return Route("invalid", reason=INCOMPLETE_LINK_REASON)
     if parts.username or parts.password:
         return Route("unsupported", reason=SITE_CREDENTIALS_REASON)
 

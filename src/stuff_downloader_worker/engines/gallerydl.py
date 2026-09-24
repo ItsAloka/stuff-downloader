@@ -31,7 +31,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .. import site_login
-from ..protocol import JobSpec
+from ..protocol import JobSpec, media_result
 from .base import Emit, EngineError
 from .http import is_public_name
 from .ytdlp import redact_urls
@@ -130,6 +130,15 @@ def item_row(position: int, url: str, kwdict: dict[str, Any]) -> dict[str, Any]:
     return row
 
 
+def media_kind(rows: list[dict[str, Any]]) -> tuple[str, list[str]]:
+    """(kind, tabs) by item count (plan §5.3): one photo is an image, one clip a video."""
+    if len(rows) == 1 and rows[0]["kind"] == "image":
+        return "image", ["image"]
+    if len(rows) == 1 and rows[0]["kind"] == "video":
+        return "video", ["video"]
+    return "gallery", ["gallery"]
+
+
 def _title(post: dict[str, Any], extractor_name: str) -> str:
     for key in ("title", "description", "content", "caption", "gallery_title", "album"):
         text = _short(post.get(key))
@@ -223,7 +232,9 @@ class GalleryDlEngine:
         root.setLevel(logging.WARNING)
         try:
             if mode == "analyze":
-                return self._analyze(gjob, Message, extr, category, emit, version.__version__)
+                return self._analyze(
+                    gjob, Message, extr, category, emit, version.__version__, job.url
+                )
             archive = bool(opts.get("archive"))
             return self._download(gjob, config, job, extr, items, archive, log, emit)
         finally:
@@ -279,7 +290,14 @@ class GalleryDlEngine:
 
     # ── analyze ────────────────────────────────────────────────────────────────────────────
     def _analyze(
-        self, gjob: Any, message: Any, extr: Any, category: str, emit: Emit, engine_version: str
+        self,
+        gjob: Any,
+        message: Any,
+        extr: Any,
+        category: str,
+        emit: Emit,
+        engine_version: str,
+        page_url: str,
     ) -> dict[str, Any]:
         emit("stage", {"stage": "analyzing"})
         data = gjob.DataJob(extr, file=None, resolve=True)
@@ -315,15 +333,20 @@ class GalleryDlEngine:
             raise EngineError("unsupported", "no media information found in that gallery")
         self._attach_previews(extr, rows, urls, emit)
         emit("stage", {"stage": "completed"})
-        return {
-            "kind": "gallery",
-            "title": _title(post, category.capitalize() or "Gallery"),
-            "uploader": _uploader(post),
-            "extractor": category.capitalize() or "Gallery",
-            "items": rows,
-            "truncated": len(data.data_urls) > MAX_ITEMS,
-            "engine_version": engine_version,
-        }
+        kind, tabs = media_kind(rows)
+        site = category.capitalize() or "Gallery"
+        return media_result(
+            kind,
+            tabs,
+            _title(post, site),
+            page_url,
+            uploader=_uploader(post),
+            site=site,
+            extractor=site,
+            items=rows,
+            truncated=len(data.data_urls) > MAX_ITEMS,
+            engine_version=engine_version,
+        )
 
     @staticmethod
     def _attach_previews(

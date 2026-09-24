@@ -136,9 +136,12 @@ def _analyze(base, path):
 def test_analyze_reports_the_file_without_downloading_it(server):
     Handler.routes["/media/clip.mp4"] = serve_file()
     info, events = _analyze(server, "/media/clip.mp4?sig=SECRET")
-    assert info["kind"] == "file" and info["title"] == "clip" and info["ext"] == "mp4"
+    assert info["kind"] == "video" and info["title"] == "clip" and info["ext"] == "mp4"
     assert info["filesize"] == len(BODY) and info["resumable"] is True
-    assert "SECRET" not in json.dumps(info) and "example.com" not in json.dumps(info)
+    # Only the durable link leaves: no query (the signature), so nothing replayable.
+    assert info["webpage"] == server + "/media/clip.mp4"
+    rest = {k: v for k, v in info.items() if k != "webpage"}
+    assert "SECRET" not in json.dumps(info) and "example.com" not in json.dumps(rest)
     assert Handler.seen[0][1]["Range"] == "bytes=0-0"
     assert [d["stage"] for k, d in events if k == "stage"] == ["analyzing", "completed"]
 
@@ -499,20 +502,20 @@ PNG = b"\x89PNG\r\n\x1a\n" + b"x" * 500
 def test_analyzing_an_image_returns_the_image_as_its_preview(server):
     Handler.routes["/p/photo.png"] = serve_file(body=PNG, ctype="image/png")
     info, _ = _analyze(server, "/p/photo.png")
-    assert base64.b64decode(info["thumbnail"]["data"]) == PNG
+    assert base64.b64decode(info["preview"]["data"]) == PNG
 
 
 def test_a_video_gets_no_image_preview(server):
     Handler.routes["/v/clip.mp4"] = serve_file()
     info, _ = _analyze(server, "/v/clip.mp4")
-    assert "thumbnail" not in info
+    assert info["preview"] is None
 
 
 def test_an_image_over_five_megabytes_gets_no_preview(server, monkeypatch):
     monkeypatch.setattr(http_engine, "MAX_PREVIEW_BYTES", 400)
     Handler.routes["/p/big.png"] = serve_file(body=PNG, ctype="image/png")
     info, _ = _analyze(server, "/p/big.png")
-    assert "thumbnail" not in info and info["filesize"] == len(PNG)
+    assert info["preview"] is None and info["filesize"] == len(PNG)
 
 
 def test_a_failed_preview_still_analyzes_the_image(server, monkeypatch):
@@ -528,8 +531,70 @@ def test_a_failed_preview_still_analyzes_the_image(server, monkeypatch):
 
     monkeypatch.setattr(http_engine, "open_url", second_call_fails)
     info, events = _analyze(server, "/p/photo.png")
-    assert info["kind"] == "file" and "thumbnail" not in info
+    assert info["kind"] == "image" and info["preview"] is None
     assert any(k == "log" and "preview failed" in d["message"] for k, d in events)
+
+
+# ── media kind by MIME (plan §5.3, R1 acceptance) ────────────────────────────────────────
+JPEG = b"\xff\xd8\xff\xe0" + b"j" * 300
+
+
+@pytest.mark.parametrize(
+    ("path", "ctype", "body", "kind", "tabs", "ext"),
+    [
+        ("/d/clip.mp4", "video/mp4", BODY, "video", ["video", "audio", "image"], "mp4"),
+        ("/d/song.mp3", "audio/mpeg", BODY, "audio", ["audio", "image"], "mp3"),
+        ("/d/photo.jpg", "image/jpeg", JPEG, "image", ["image"], "jpg"),
+        # The image is judged by its type, not its URL: no extension at all here.
+        ("/media/Gx1AbC?format=jpg&name=large", "image/jpeg", JPEG, "image", ["image"], "jpg"),
+        # A generic type falls back to the extension.
+        ("/d/tune.flac", "application/octet-stream", BODY, "audio", ["audio", "image"], "flac"),
+    ],
+    ids=["mp4", "mp3", "jpg", "format-jpg", "octet-flac"],
+)
+def test_direct_files_report_their_kind_and_tabs(server, path, ctype, body, kind, tabs, ext):
+    Handler.routes[path.split("?")[0]] = serve_file(body=body, ctype=ctype)
+    info, _ = _analyze(server, path)
+    assert (info["kind"], info["tabs"], info["ext"]) == (kind, tabs, ext)
+    assert (info["preview"] is not None) == (kind == "image")
+    protocol_check(info)
+
+
+def protocol_check(info):
+    from stuff_downloader.core.protocol import validate_media_result
+
+    assert validate_media_result(json.loads(json.dumps(info))) is not None
+
+
+def test_an_extensionless_image_is_saved_under_its_real_type(server, tmp_path):
+    Handler.routes["/media/Gx1AbC"] = serve_file(body=JPEG, ctype="image/jpeg")
+    path = "/media/Gx1AbC?format=jpg&name=large"
+    result, _ = _download(server, path, tmp_path, preset="original_file")
+    assert Path(result["files"][0]).name == "Gx1AbC.jpg"
+
+
+def test_an_image_is_named_by_its_type_not_its_path(server, tmp_path):
+    Handler.routes["/p/photo.jpg"] = serve_file(body=PNG, ctype="image/png")
+    result, _ = _download(server, "/p/photo.jpg", tmp_path, preset="original_file")
+    assert Path(result["files"][0]).name == "photo.png"
+
+
+def test_an_unlisted_image_type_is_refused(server):
+    Handler.routes["/p/logo.svg"] = serve_file(body=b"<svg/>", ctype="image/svg+xml")
+    with pytest.raises(EngineError, match="not a media file"):
+        _analyze(server, "/p/logo.svg")
+
+
+def test_an_image_whose_type_changes_mid_download_is_refused(server, tmp_path):
+    calls = []
+
+    def flip(req):
+        calls.append(1)
+        serve_file(body=JPEG, ctype="image/jpeg" if len(calls) == 1 else "image/png")(req)
+
+    Handler.routes["/p/shot"] = flip
+    with pytest.raises(EngineError, match="image type changed"):
+        _download(server, "/p/shot", tmp_path, preset="original_file")
 
 
 # ── image format (item 6B) ────────────────────────────────────────────────────────────────

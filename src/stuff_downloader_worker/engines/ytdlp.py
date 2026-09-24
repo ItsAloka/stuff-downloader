@@ -24,7 +24,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from .. import presets, site_login, tagging
-from ..protocol import JobSpec
+from ..protocol import JobSpec, media_result
 from .base import Emit, EngineError
 
 TOOLS_DIR_ENV_VAR = "STUFF_DOWNLOADER_TOOLS_DIR"
@@ -177,6 +177,61 @@ def sanitize_info(info: dict[str, Any]) -> dict[str, Any]:
     result["automatic_captions"] = sanitize_subtitles(info.get("automatic_captions"), auto=True)
     result["thumbnails"] = sanitize_thumbnails(info.get("thumbnails"))
     return result
+
+
+# Plan §5.3. yt-dlp leaves vcodec out for some generic pages, so a format with no codec facts at
+# all counts as video when its container or size says so, and as audio when its container does.
+_AUDIO_EXTS = frozenset({"mp3", "m4a", "aac", "ogg", "oga", "opus", "flac", "wav", "wma"})
+_MUSIC_HOSTS = frozenset({"music.youtube.com"})
+
+
+def _has_video(fmt: dict[str, Any]) -> bool:
+    vcodec = fmt.get("vcodec")
+    if vcodec is not None:
+        return vcodec != "none"
+    if fmt.get("height") or fmt.get("width"):
+        return True
+    return fmt.get("acodec") in (None, "none") and fmt.get("ext") not in _AUDIO_EXTS
+
+
+def media_kind(info: dict[str, Any], url: str) -> tuple[str, list[str]]:
+    """(kind, tabs) for one analyzed page, from the sanitized info and the analyzed URL.
+
+    YouTube Music, or a YouTube upload that names a track and an artist (Topic channels, Art
+    Tracks), is a song that also has a video. A page whose every format is audio (SoundCloud,
+    Bandcamp…) is audio with a cover and nothing else. Anything with a video stream is a video.
+    """
+    formats = [f for f in info.get("formats") or [] if isinstance(f, dict)]
+    host = (urlsplit(url).hostname or "").lower()
+    youtube = str(info.get("extractor") or "").lower().startswith("youtube")
+    if host in _MUSIC_HOSTS or (youtube and info.get("track") and info.get("artist")):
+        return "audio", ["audio", "video", "image"]
+    if formats and not any(_has_video(f) for f in formats):
+        return "audio", ["audio", "image"]
+    return "video", ["video", "audio", "image"]
+
+
+def _site_name(info: dict[str, Any]) -> str | None:
+    name = info.get("extractor")
+    return name[:60] if isinstance(name, str) and name else None
+
+
+def analyze_result(
+    summary: dict[str, Any], url: str, preview: dict[str, Any] | None
+) -> dict[str, Any]:
+    """The sanitized page as a MediaResult, with the legacy fields the current UI reads."""
+    kind, tabs = media_kind(summary, url)
+    fields = {k: v for k, v in summary.items() if k != "title"}
+    fields.setdefault("uploader", summary.get("channel"))
+    fields["site"] = _site_name(summary)
+    title = summary.get("title") or "Untitled"
+    return media_result(kind, tabs, title, url, preview=preview, **fields)
+
+
+def playlist_result(listing: dict[str, Any], url: str) -> dict[str, Any]:
+    """A playlist listing as a MediaResult; its rows are the MediaResult ``entries``."""
+    fields = {k: v for k, v in listing.items() if k not in ("kind", "title")}
+    return media_result("playlist", ["tracks"], listing["title"], url, **fields)
 
 
 def sanitize_subtitles(raw: Any, auto: bool) -> list[dict[str, Any]]:
@@ -418,15 +473,15 @@ class YtDlpEngine:
                     listing = sanitize_playlist(info)
                     listing["engine_version"] = yt_dlp.version.__version__
                     emit("stage", {"stage": "completed"})
-                    return listing
+                    return playlist_result(listing, job.url)
                 if is_playlist:
                     raise EngineError("unsupported", "that link is a playlist, not a video")
                 summary = sanitize_info(info)
                 summary["engine_version"] = yt_dlp.version.__version__
                 if request is None:
-                    summary["thumbnail"] = self._thumbnail_preview(ydl, info, emit)
+                    preview = self._thumbnail_preview(ydl, info, emit)
                     emit("stage", {"stage": "completed"})
-                    return summary
+                    return analyze_result(summary, job.url, preview)
                 return self._download(ydl, info, request, summary, files, stage, emit)
         except yt_dlp.utils.DownloadError as exc:
             raise EngineError(*describe_download_error(str(exc))) from exc

@@ -1,7 +1,8 @@
 """Offline fake engine: emits realistic stages and progress without touching the network or disk.
 
 Options: ``steps`` (int, 1-1000), ``delay`` (seconds per step, 0-5), ``fail`` (bool),
-``total_bytes`` (int).
+``total_bytes`` (int). With ``mode`` "analyze" it returns a video MediaResult instead, so
+analyze-mode plumbing can be exercised offline; any other ``mode`` is refused.
 """
 
 from __future__ import annotations
@@ -9,7 +10,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from ..protocol import JobSpec
+from ..protocol import JobSpec, media_result
 from .base import Emit, EngineError
 
 
@@ -24,6 +25,15 @@ class FakeEngine:
 
     def download(self, job: JobSpec, emit: Emit) -> dict[str, Any]:
         opts = job.options
+        mode = opts.get("mode", "download")
+        if mode == "analyze":
+            emit("stage", {"stage": "analyzing"})
+            emit("stage", {"stage": "completed"})
+            return media_result(
+                "video", ["video", "audio", "image"], "Fake video", job.url, site="Fake"
+            )
+        if mode != "download":
+            raise EngineError("bad_options", f"unknown mode {mode!r}")
         steps = int(_bounded(opts.get("steps"), 10, 1, 1000))
         delay = _bounded(opts.get("delay"), 0.05, 0, 5)
         total = int(_bounded(opts.get("total_bytes"), 1_000_000, 1, 10**12))

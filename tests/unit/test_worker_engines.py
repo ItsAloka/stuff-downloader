@@ -74,6 +74,7 @@ def fake_ytdlp(monkeypatch):
         {"url": "https://i.ytimg.com/vi/x/hq.jpg", "width": 480, "height": 360},
         {"url": "http://i.ytimg.com/vi/x/sq.jpg", "width": 544, "height": 544},
     ]
+    state["raw"] = raw
 
     class Resp:
         def __init__(self, data):
@@ -102,7 +103,7 @@ def fake_ytdlp(monkeypatch):
             assert download is False
             if state["raise"]:
                 raise FakeDownloadError(state["raise"])
-            return json.loads(json.dumps(raw))
+            return json.loads(json.dumps(state["raw"]))
 
         def urlopen(self, url):
             state["thumb_url"] = url
@@ -153,9 +154,93 @@ def test_analyze_returns_sanitized_info_and_safe_thumbnail(fake_ytdlp):
     assert result["title"] and result["engine_version"] == "2026.08.19"
     assert all("url" not in f for f in result["formats"])
     assert fake_ytdlp["thumb_url"] == "https://i.ytimg.com/vi/x/hq.jpg"  # https + known host only
-    assert result["thumbnail"]["data"]
+    assert result["preview"]["data"]
     assert events[0] == ("stage", {"stage": "analyzing"})
     assert fake_ytdlp["opts"]["noplaylist"] is True
+
+
+# ── media kind (plan §5.3, R1 acceptance) ────────────────────────────────────────────────
+def _analyze_page(url):
+    spec = JobSpec("j1", "ytdlp", url, ".", {"mode": "analyze"})
+    result = get_engine("ytdlp").download(spec, lambda *_: None)
+    from stuff_downloader.core.protocol import validate_media_result
+
+    validate_media_result(json.loads(json.dumps(result)))  # what core receives, re-parsed
+    return result
+
+
+def test_a_youtube_video_is_a_video_opening_on_the_video_tab(fake_ytdlp):
+    result = _analyze_page("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    assert result["kind"] == "video"
+    assert result["tabs"] == ["video", "audio", "image"]
+    assert result["site"] and result["title"]
+
+
+def test_a_youtube_music_song_is_audio_that_also_offers_the_video(fake_ytdlp):
+    result = _analyze_page("https://music.youtube.com/watch?v=dQw4w9WgXcQ")
+    assert result["kind"] == "audio"
+    assert result["tabs"] == ["audio", "video", "image"]
+
+
+def test_a_topic_upload_with_track_and_artist_is_audio(fake_ytdlp):
+    fake_ytdlp["raw"].update({"track": "Song", "artist": "Singer"})
+    result = _analyze_page("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    assert (result["kind"], result["tabs"]) == ("audio", ["audio", "video", "image"])
+    assert result["artist"] == "Singer"
+
+
+def test_an_audio_only_page_is_audio_without_a_video_tab(fake_ytdlp):
+    raw = fake_ytdlp["raw"]
+    raw.update({"extractor": "soundcloud", "extractor_key": "Soundcloud"})
+    raw["formats"] = [
+        {"format_id": "hls_opus_64", "ext": "opus", "vcodec": "none", "acodec": "opus"},
+        {"format_id": "http_mp3_128", "ext": "mp3", "vcodec": "none", "acodec": "mp3"},
+    ]
+    result = _analyze_page("https://soundcloud.com/artist/a-song")
+    assert (result["kind"], result["tabs"]) == ("audio", ["audio", "image"])
+
+
+def test_a_format_without_codec_facts_is_judged_by_its_container(fake_ytdlp):
+    raw = fake_ytdlp["raw"]
+    raw["extractor_key"] = "Generic"
+    raw["formats"] = [{"format_id": "0", "ext": "mp3"}]
+    assert _analyze_page("https://example.com/a")["kind"] == "audio"
+    raw["formats"] = [{"format_id": "0", "ext": "mp4"}]
+    assert _analyze_page("https://example.com/a")["kind"] == "video"
+
+
+def test_a_playlist_listing_is_a_playlist_media_result(fake_ytdlp):
+    fake_ytdlp["raw"] = {
+        "_type": "playlist",
+        "id": "PL1234567890",
+        "title": "Mix",
+        "entries": [{"id": "dQw4w9WgXcQ", "title": "One"}],
+    }
+    url = "https://www.youtube.com/playlist?list=PL1234567890"
+    spec = JobSpec("j1", "ytdlp", url, ".", {"mode": "playlist"})
+    result = get_engine("ytdlp").download(spec, lambda *_: None)
+    assert (result["kind"], result["tabs"]) == ("playlist", ["tracks"])
+    assert result["entries"][0]["id"] == "dQw4w9WgXcQ"
+    assert result["webpage"] == url
+
+
+def test_the_webpage_is_the_analyzed_link_without_tokens(fake_ytdlp):
+    result = _analyze_page("https://www.youtube.com/watch?v=dQw4w9WgXcQ&si=track")
+    assert result["webpage"] == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    result = _analyze_page("https://cdn.example.com/v/clip?token=SECRET#t=1")
+    assert result["webpage"] == "https://cdn.example.com/v/clip"
+
+
+def test_the_fake_engine_analyzes_offline_and_refuses_unknown_modes():
+    result = get_engine("fake").download(_spec("fake", mode="analyze"), lambda *_: None)
+    assert (result["kind"], result["tabs"][0]) == ("video", "video")
+    with pytest.raises(EngineError, match="mode"):
+        get_engine("fake").download(_spec("fake", mode="playlist"), lambda *_: None)
+
+
+def test_the_probe_engine_has_no_analyze_mode():
+    with pytest.raises(EngineError, match="no modes"):
+        get_engine("probe").download(_spec("probe", mode="analyze"), None)
 
 
 def test_download_emits_stages_progress_and_file(fake_ytdlp, tmp_path):
