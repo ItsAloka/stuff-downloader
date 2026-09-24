@@ -118,7 +118,7 @@ the milestone named.
 
 | ID | Problem | Root cause (checked in code) | Fix in |
 |---|---|---|---|
-| **P1** | The app does not know if a link is video, audio or image. Every yt-dlp result gets the same video presets, including SoundCloud and other audio-only pages. Direct audio/video files get only "Original file". | `DownloadsPage._fill_presets(file=…)` picks presets only by route kind. No field in the analyze result says "audio-only" or "image". **S** | R1, R2 |
+| **P1** | The app does not know if a link is video, audio or image. Every yt-dlp result gets the same video presets, including SoundCloud and other audio-only pages. Direct audio/video files get only "Original file". | `DownloadsPage._fill_presets(file=…)` picks presets only by route kind. No field in the analyze result says "audio-only" or "image". **S** | ✅ R1 (detection), R2 (presets) |
 | **P2** | No format list like 9xbuddy/ytmp3. Options are hidden in Preset + Quality dropdowns. The "All formats" table is read-only. | Plan decision in M3 ("no per-row download"). **S** | R2 |
 | **P3** | No format conversion at download time (MP4/MKV/WebM, MP3 bitrates, FLAC/WAV, PNG/WebP). The Converters tab was the wrong fix. | Presets are a fixed list of 6. **S + C** | R2 |
 | **P4** | The "File name" field or column appears everywhere. The owner wants to click the title and edit it. | `PreviewCard.name_edit`, `PlaylistCard` col 6, Spotify col 9. **S + C** | R2, R5 |
@@ -131,7 +131,7 @@ the milestone named.
 | **P11** | Downloads/queue UI got worse: huge buttons, tall cards, two rows of bulk buttons. | R-1, and the queue header split into two `QHBoxLayout`s. **C** | R5 |
 | **P12** | Spotify → YouTube "mirror" picks the wrong recording for less-popular songs. A lyric upload scored 94 as certain (Chinese sample). A Sinhala match was 4.8 s short. | Matching uses a title/artist/duration score only. It does not prefer official "song" (Topic/Art Track) results or album context. **S** | R6 |
 | **P13** | The Spotify pipeline is slow and fragile: about 10 s per spotDL free-client call and about 30 s per YTM search per track. The spotDL env also **cannot be redistributed** (spotapi / spotipyfree have no licence). | spotDL used as the metadata layer. **S** | R6 |
-| **P14** | A pasted fragment (e.g. `pbs.twimg.com/media/…` with no `https://`) gets a video-only error. | The router rejects it with video wording. It could add `https://` itself when the host is valid. **S** | R1 |
+| **P14** | A pasted fragment (e.g. `pbs.twimg.com/media/…` with no `https://`) gets a video-only error. | The router rejects it with video wording. It could add `https://` itself when the host is valid. **S** | ✅ R1 |
 | **P15** | Uncertain Spotify matches block the whole batch, or silently become "No match". | R-4, R-5. **C** | R6 |
 | **P16** | Titles in tables cannot be copied. | Table text is not selectable. **S** (Codex fix kept) | R5 |
 | **P17** | Converters tab is clutter. | `8969ee1`. **C** | ✅ R0 |
@@ -479,6 +479,22 @@ Neutral error text. One analyze fallback chain decided in core, with no direct-f
 (drops R-8).
 **Accept:** fixture tests for YouTube video, YTM song, SoundCloud (audio-only), a direct mp4 / mp3 / jpg,
 a `format=jpg` link with no extension, and an X photo post each return the correct `kind` and tabs.
+
+> **✅ Done (2026-09-24), accepted by the owner.** Code commit `d2dbe40`. Reviewed by Codex; its two
+> confirmed findings (a required durable `webpage`, and `entries` on every playlist) were fixed before approval.
+> Tests: **1229 passed, 1 skipped, 20 deselected (network), ruff clean.**
+> - `MediaResult` is built by `protocol.media_result` and checked by `validate_media_result`, with both protocol copies
+>   byte-identical. The row lists (`video_rows`/`audio_rows`/`image_rows`) are empty until R2 fills them.
+> - Detection follows §5.3 in `ytdlp.media_kind`, `http.media_kind` (MIME first) and `gallerydl.media_kind`. Spotify and YouTube lists are `playlist`.
+> - `IMAGE_TYPES` is re-applied: files are named by their real type, SVG and other types are refused, and a download whose type changes mid-way is refused.
+> - P14: `router.complete_link` adds `https://` to a scheme-less public host and shows a note. The error text is neutral.
+> - The fallback chain is owned by core (`router.analyze_fallbacks` / `should_fall_back`: video page → gallery-dl → direct file,
+>   only on `unsupported`). R-8 is dropped; there is no up-front file probe.
+> - Acceptance tests: `test_worker_engines` (YT video, YTM song, Topic, SoundCloud), `test_http_engine` (mp4/mp3/jpg,
+>   `?format=jpg`), `test_gallerydl_engine` (X photo post), `test_router`, `test_protocol`, and GUI chain tests.
+> - Carried to later milestones: pages.py still picks cards by route for Spotify and gallery-dl (R2 result card); core does not yet
+>   validate MediaResult on receipt, because old-shape GUI fixtures exist in 7 test files (R2); gallery items still carry a per-item
+>   `thumbnail` key read by `core/gallery.py` (R3).
 
 ### R2 — Result card, format tabs, title editing
 The Result card per §5.8. Video / Audio / Image rows per §5.4 with a Download button on each row.
