@@ -392,3 +392,88 @@ def test_a_failing_analyze_raises_a_classified_engine_error(fake_ytdlp):
         get_engine("ytdlp").download(_spec("ytdlp", mode="analyze"), emit)
     assert excinfo.value.code == "unsupported"
     assert "SECRET" not in excinfo.value.message and "://" not in excinfo.value.message
+
+
+
+# ── the format catalog (plan §5.4, R2) ─────────────────────────────────────────────────────
+def test_a_video_offers_one_row_per_existing_height_with_our_ids(fake_ytdlp):
+    result = _analyze_page("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    rows = result["video_rows"]
+    heights = [r["height"] for r in rows]
+    assert heights == sorted(set(heights), reverse=True)
+    assert all(r["id"] == f"v:{r['height']}:{r['container']}" for r in rows)
+    (default,) = [r for r in rows if r["default"]]
+    assert default["vcodec"] == "H.264" and default["height"] <= 1080
+    assert all(r["size"] is None or r["size"] > 0 for r in rows)
+    text = json.dumps(result)
+    assert "SECRET" not in text and all("format_id" not in r for r in rows)
+
+
+def test_audio_rows_cover_mp3_bitrates_m4a_opus_flac_and_wav(fake_ytdlp):
+    result = _analyze_page("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    ids = [r["id"] for r in result["audio_rows"]]
+    assert ids[:5] == ["a:mp3:320", "a:mp3:256", "a:mp3:192", "a:mp3:128", "a:mp3:64"]
+    assert ids[5:] == ["a:m4a", "a:opus", "a:flac", "a:wav"]
+    m4a = result["audio_rows"][5]
+    assert m4a["copy"] is True  # the source has AAC, so M4A is a copy
+    wav = result["audio_rows"][-1]
+    assert wav["no_cover"] is True and "no embedded cover" in wav["lossless_note"]
+    mp3 = result["audio_rows"][0]
+    assert mp3["size_is_estimate"] and mp3["size"] == int(result["duration"] * 320_000 / 8)
+    assert result["source_audio"]["codec"] in ("Opus", "AAC")
+
+
+def test_image_rows_are_the_thumbnail_sizes_that_exist(fake_ytdlp):
+    result = _analyze_page("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    assert [r["id"] for r in result["image_rows"]] == ["i:9999x9999", "i:544x544", "i:480x360"]
+
+
+def test_an_audio_only_page_has_no_video_rows_and_no_opus_row_without_opus(fake_ytdlp):
+    fake_ytdlp["raw"]["formats"] = [
+        {"format_id": "a1", "ext": "mp3", "vcodec": "none", "acodec": "mp3", "abr": 128}
+    ]
+    result = _analyze_page("https://soundcloud.com/artist/song")
+    assert result["video_rows"] == [] and "video" not in result["tabs"]
+    ids = [r["id"] for r in result["audio_rows"]]
+    assert "a:opus" not in ids and "a:m4a" in ids
+    assert result["audio_rows"][5]["copy"] is False  # no AAC source: encoded at 256 kbps
+
+
+def test_a_row_download_reaches_yt_dlp_as_fixed_options(fake_ytdlp, tmp_path):
+    out = tmp_path / "Edited.mp3"
+    fake_ytdlp["write"] = out
+    spec = JobSpec(
+        "j1",
+        "ytdlp",
+        "https://www.youtube.com/watch?v=x",
+        str(tmp_path),
+        {"mode": "download", "tab": "audio", "row_id": "a:mp3:192", "edited_title": "Edited"},
+    )
+    result = get_engine("ytdlp").download(spec, lambda *_: None)
+    opts = fake_ytdlp["opts"]
+    assert opts["outtmpl"] == "Edited.%(ext)s"
+    assert opts["postprocessors"][1]["preferredquality"] == "192"
+    assert result["files"] == [str(out)] and result["preset"] == "mp3_music"
+
+
+def test_an_image_row_keeps_only_the_chosen_thumbnail(fake_ytdlp, tmp_path, monkeypatch):
+    from stuff_downloader_worker.engines import ytdlp
+
+    seen = {}
+    monkeypatch.setattr(
+        ytdlp.YtDlpEngine,
+        "_download",
+        staticmethod(lambda ydl, info, *rest: seen.update(info) or {"files": []}),
+    )
+    spec = JobSpec(
+        "j1",
+        "ytdlp",
+        "https://www.youtube.com/watch?v=x",
+        str(tmp_path),
+        {"mode": "download", "tab": "image", "row_id": "i:480x360", "container": "png"},
+    )
+    get_engine("ytdlp").download(spec, lambda *_: None)
+    assert [(t["width"], t["height"]) for t in seen["thumbnails"]] == [(480, 360)]
+    spec.options["row_id"] = "i:1x1"
+    with pytest.raises(EngineError):
+        get_engine("ytdlp").download(spec, lambda *_: None)

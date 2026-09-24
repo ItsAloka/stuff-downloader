@@ -7,11 +7,13 @@ from pathlib import Path
 
 import pytest
 
-from stuff_downloader.core import cookies, settings, tools
+from stuff_downloader.core import cookies, protocol, settings, tools
 from stuff_downloader.core.protocol import Event
 from stuff_downloader.gui import pages
 from stuff_downloader.gui.main_window import MainWindow
 from stuff_downloader.gui.widgets import SiteLoginDialog
+from stuff_downloader_worker.engines import http as worker_http
+from stuff_downloader_worker.engines import ytdlp as worker_ytdlp
 
 FIXTURE = Path(__file__).resolve().parents[1] / "unit" / "fixtures" / "youtube_video.json"
 PRIVATE = "ERROR: [instagram] abc: Login required to access this post"
@@ -61,14 +63,27 @@ def _stored_options(page):
     return [(json.loads(r[0]), r[1]) for r in rows]
 
 
-FILE_INFO = {
-    "kind": "file",
-    "title": "clip",
-    "extractor": "Direct file",
-    "ext": "mp4",
-    "filesize": 2048,
-    "formats": [],
-}
+def file_info(url="https://cdn.example.com/v/clip.mp4"):
+    """The direct engine's MediaResult for a video file, with its one Original row."""
+    return protocol.media_result(
+        "video",
+        ["video"],
+        "clip",
+        url,
+        site="Direct file",
+        extractor="Direct file",
+        ext="mp4",
+        filesize=2048,
+        formats=[],
+        **worker_http.file_rows("video", "mp4", 2048),
+    )
+
+
+def page_info(url, **fields):
+    """The recorded yt-dlp page as the worker's MediaResult."""
+    info = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    info.update(fields)
+    return worker_ytdlp.analyze_result(info, url, None)
 
 
 # ── direct files ─────────────────────────────────────────────────────────────────────────
@@ -76,34 +91,37 @@ def test_a_direct_file_is_analyzed_and_downloaded_by_the_http_engine(page, runs,
     _analyze(page, "https://cdn.example.com/v/clip.mp4?sig=SECRET")
     (run,) = runs
     assert run.spec.engine == "http" and run.spec.options == {"mode": "analyze"}
-    run.emit("result", **FILE_INFO)
-    qtbot.waitUntil(lambda: not page.preview.isHidden())
-    combo = page.preview.preset_combo
-    assert [combo.itemData(i) for i in range(combo.count())] == ["original_file"]
-    assert not page.preview.resolution_combo.isEnabled()
-    assert page.preview.crop_check.isHidden() and page.preview.compatible_check.isHidden()
-    assert "2.0 KB" in page.preview.meta_label.text()
+    run.emit("result", **file_info())
+    qtbot.waitUntil(lambda: not page.result_card.isHidden())
+    card = page.result_card
+    assert card.tab_names() == ["video"]
+    assert [r["id"] for r in card.rows("video")] == ["v:orig"]
+    assert card.cell_text("video", 0, 2) == "2.0 KB"
     job = page.start_download()
     assert job.spec.engine == "http"
-    # The untouched name field is only a hint: the worker keeps the file's own name.
-    assert page.preview.name_edit.placeholderText() == "clip"
-    assert job.spec.options == {"mode": "download", "preset": "original_file"}
+    # The untouched title is not a name: the worker keeps the file's own name.
+    assert job.spec.options == {
+        "mode": "download",
+        "tab": "video",
+        "row_id": "v:orig",
+        "container": "mp4",
+    }
     ((options, url),) = _stored_options(page)
     assert url == "https://cdn.example.com/v/clip.mp4"  # the token never reaches disk
     assert "SECRET" not in json.dumps(options)
 
 
-def test_a_video_page_after_a_file_gets_the_video_presets_back(page, runs, qtbot):
+def test_a_video_page_after_a_file_gets_its_own_rows_back(page, runs, qtbot):
     _analyze(page, "https://cdn.example.com/clip.mp4")
-    runs[-1].emit("result", **FILE_INFO)
-    qtbot.waitUntil(lambda: not page.preview.isHidden())
+    runs[-1].emit("result", **file_info("https://cdn.example.com/clip.mp4"))
+    qtbot.waitUntil(lambda: not page.result_card.isHidden())
     _analyze(page, "https://youtu.be/dQw4w9WgXcQ")
-    runs[-1].emit("result", **json.loads(FIXTURE.read_text(encoding="utf-8")))
-    qtbot.waitUntil(lambda: not page.preview.isHidden())
-    combo = page.preview.preset_combo
-    ids = [combo.itemData(i) for i in range(combo.count())]
-    assert "original_file" not in ids and "video_1080" in ids
-    assert combo.currentData() == "video_1080"
+    runs[-1].emit("result", **page_info(runs[-1].spec.url))
+    qtbot.waitUntil(lambda: not page.result_card.isHidden())
+    card = page.result_card
+    ids = [r["id"] for r in card.rows("video")]
+    assert "v:orig" not in ids and "v:1080:mp4" in ids
+    assert card.tab_names() == ["video", "audio", "image"]
 
 
 def test_an_unknown_page_falls_back_to_gallery_then_direct_engine_once_each(page, runs):
@@ -175,8 +193,8 @@ def test_choosing_a_login_saves_the_choice_and_retries_with_it(page, runs, monke
     assert retry.spec.options["site_login"] == firefox.to_dict()
 
     # The download carries it to the worker, but the stored job never does.
-    retry.emit("result", **json.loads(FIXTURE.read_text(encoding="utf-8")))
-    qtbot.waitUntil(lambda: not page.preview.isHidden())
+    retry.emit("result", **page_info(retry.spec.url))
+    qtbot.waitUntil(lambda: not page.result_card.isHidden())
     job = page.start_download()
     assert "site_login" not in job.spec.options
     worker_spec = page._with_site_login(job.spec)
@@ -267,11 +285,13 @@ def test_track_rows_list_subtitles_captions_and_thumbnails():
 
 def test_the_advanced_table_shows_track_rows(page, runs, qtbot):
     _analyze(page, "https://youtu.be/dQw4w9WgXcQ")
-    info = json.loads(FIXTURE.read_text(encoding="utf-8"))
-    info["subtitles"] = [{"lang": "en", "exts": ["vtt"], "auto": False}]
-    info["thumbnails"] = [{"width": 1280, "height": 720}]
+    info = page_info(
+        runs[-1].spec.url,
+        subtitles=[{"lang": "en", "exts": ["vtt"], "auto": False}],
+        thumbnails=[{"width": 1280, "height": 720}],
+    )
     runs[-1].emit("result", **info)
-    qtbot.waitUntil(lambda: not page.preview.isHidden())
+    qtbot.waitUntil(lambda: not page.result_card.isHidden())
     table = page.advanced_table
     kinds = [table.item(r, 0).text() for r in range(table.rowCount())]
     assert "Subtitles" in kinds and "Thumbnail" in kinds
@@ -280,8 +300,8 @@ def test_the_advanced_table_shows_track_rows(page, runs, qtbot):
 # ── the offer also follows a failed download (review finding) ────────────────────────────
 def _queued_instagram_job(page, runs, qtbot):
     _analyze(page, "https://www.instagram.com/reel/abc/")
-    runs[-1].emit("result", **json.loads(FIXTURE.read_text(encoding="utf-8")))
-    qtbot.waitUntil(lambda: not page.preview.isHidden())
+    runs[-1].emit("result", **page_info(runs[-1].spec.url))
+    qtbot.waitUntil(lambda: not page.result_card.isHidden())
     job = page.start_download()
     run = runs[-1]
     assert run.spec.job_id == job.spec.job_id and run.started
@@ -319,8 +339,8 @@ def test_other_download_failures_do_not_offer_a_login(page, runs, qtbot):
 
 def test_a_failed_direct_file_download_never_offers_a_login(page, runs, qtbot):
     _analyze(page, "https://cdn.example.com/clip.mp4")
-    runs[-1].emit("result", **FILE_INFO)
-    qtbot.waitUntil(lambda: not page.preview.isHidden())
+    runs[-1].emit("result", **file_info("https://cdn.example.com/clip.mp4"))
+    qtbot.waitUntil(lambda: not page.result_card.isHidden())
     page.start_download()
     runs[-1].emit("error", code="download_error", message="HTTP Error 401: Unauthorized")
     assert page.login_button.isHidden()
@@ -335,9 +355,12 @@ def test_a_new_analyze_forgets_a_pending_job_retry(page, runs, monkeypatch, qtbo
     assert page._login_retry_job_id == "" and page.login_button.isHidden()
 
 
-def test_a_typed_direct_file_name_reaches_the_job_spec(page, runs, qtbot):
+def test_an_edited_direct_file_title_reaches_the_job_spec(page, runs, qtbot):
     _analyze(page, "https://cdn.example.com/v/clip.mp4")
-    runs[-1].emit("result", **FILE_INFO)
-    qtbot.waitUntil(lambda: not page.preview.isHidden())
-    page.preview.name_edit.setText("  holiday  ")
-    assert page.start_download().spec.options["output_name"] == "holiday"
+    runs[-1].emit("result", **file_info())
+    qtbot.waitUntil(lambda: not page.result_card.isHidden())
+    editor = page.result_card.title_editor
+    editor.start_editing()
+    editor.edit.setText("  holiday  ")
+    editor.edit.editingFinished.emit()
+    assert page.start_download().spec.options["edited_title"] == "holiday"

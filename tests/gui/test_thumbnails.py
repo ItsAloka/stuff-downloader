@@ -12,10 +12,12 @@ from PyQt6.QtWidgets import QTableWidgetItem
 from test_main_window import _analyzed
 from test_playlist_queue import expand, listing, runs, window  # noqa: F401  (fixtures)
 
+from stuff_downloader.core import protocol
 from stuff_downloader.core.gallery import GalleryItem
 from stuff_downloader.core.protocol import Event
 from stuff_downloader.core.spotify import Match
 from stuff_downloader.gui import thumbs
+from stuff_downloader_worker.engines import http as worker_http
 
 VID = "dQw4w9WgXcQ"
 RED = QColor("#ff0000")
@@ -164,18 +166,21 @@ def test_a_direct_image_link_previews_the_real_image(window, runs, qtbot):  # no
     page.url_edit.setText("https://cdn.example.com/p/photo.png")
     page.analyze()
     run = runs[-1]
-    payload = {
-        "kind": "file",
-        "title": "photo",
-        "extractor": "Direct file",
-        "ext": "png",
-        "filesize": 100,
-        "formats": [],
-        "thumbnail": {"data": base64.b64encode(png(64, 36, "#00ff00")).decode()},
-    }
+    payload = protocol.media_result(
+        "image",
+        ["image"],
+        "photo",
+        "https://cdn.example.com/p/photo.png",
+        site="Direct file",
+        ext="png",
+        filesize=100,
+        formats=[],
+        preview={"data": base64.b64encode(png(64, 36, "#00ff00")).decode()},
+        **worker_http.file_rows("image", "png", 100),
+    )
     # Posted directly: the payload's own "kind" would shadow FakeRun.emit's argument.
     run.on_event(Event("result", run.spec.job_id, payload))
-    qtbot.waitUntil(lambda: not page.preview.isHidden())
+    qtbot.waitUntil(lambda: not page.result_card.isHidden())
     assert page._thumb is not None
     assert page._thumb.toImage().pixelColor(10, 10) == QColor("#00ff00")
     job = page.start_download()
@@ -184,7 +189,7 @@ def test_a_direct_image_link_previews_the_real_image(window, runs, qtbot):  # no
 
 def test_an_oversized_preview_falls_back_to_the_placeholder(window, runs, qtbot):  # noqa: F811
     huge = base64.b64encode(png(thumbs.MAX_SIDE + 1, 2)).decode()
-    page = _analyzed(window, runs, qtbot, thumbnail={"data": huge})
+    page = _analyzed(window, runs, qtbot, preview={"data": huge})
     assert page._thumb is None
 
 

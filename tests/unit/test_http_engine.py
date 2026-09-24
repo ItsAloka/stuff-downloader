@@ -542,13 +542,13 @@ JPEG = b"\xff\xd8\xff\xe0" + b"j" * 300
 @pytest.mark.parametrize(
     ("path", "ctype", "body", "kind", "tabs", "ext"),
     [
-        ("/d/clip.mp4", "video/mp4", BODY, "video", ["video", "audio", "image"], "mp4"),
-        ("/d/song.mp3", "audio/mpeg", BODY, "audio", ["audio", "image"], "mp3"),
+        ("/d/clip.mp4", "video/mp4", BODY, "video", ["video"], "mp4"),
+        ("/d/song.mp3", "audio/mpeg", BODY, "audio", ["audio"], "mp3"),
         ("/d/photo.jpg", "image/jpeg", JPEG, "image", ["image"], "jpg"),
         # The image is judged by its type, not its URL: no extension at all here.
         ("/media/Gx1AbC?format=jpg&name=large", "image/jpeg", JPEG, "image", ["image"], "jpg"),
         # A generic type falls back to the extension.
-        ("/d/tune.flac", "application/octet-stream", BODY, "audio", ["audio", "image"], "flac"),
+        ("/d/tune.flac", "application/octet-stream", BODY, "audio", ["audio"], "flac"),
     ],
     ids=["mp4", "mp3", "jpg", "format-jpg", "octet-flac"],
 )
@@ -556,6 +556,7 @@ def test_direct_files_report_their_kind_and_tabs(server, path, ctype, body, kind
     Handler.routes[path.split("?")[0]] = serve_file(body=body, ctype=ctype)
     info, _ = _analyze(server, path)
     assert (info["kind"], info["tabs"], info["ext"]) == (kind, tabs, ext)
+    assert [row["id"] for row in info[f"{kind}_rows"]] == [f"{kind[0]}:orig"]
     assert (info["preview"] is not None) == (kind == "image")
     protocol_check(info)
 

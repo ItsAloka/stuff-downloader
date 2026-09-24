@@ -7,6 +7,7 @@ postprocessor argument or executable path.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -178,3 +179,74 @@ def analyze_options() -> dict[str, Any]:
 
 def playlist_options() -> dict[str, Any]:
     return {"mode": "playlist"}
+
+
+# ── Result-card rows (plan §5.4, §8 R2) ─────────────────────────────────────────────────────
+# One row's download is {tab, row_id, container, edited_title}. Row ids are the worker's own
+# (v:1080:mp4, a:mp3:320, i:1280x720, v:orig…); this mirrors the worker's validation.
+ROW_TABS = ("video", "audio", "image")
+VIDEO_CONTAINERS = ("mp4", "mkv", "webm", "mov", "avi")
+REENCODE_CONTAINERS = frozenset({"mov", "avi"})
+IMAGE_SAVE_FORMATS = ("original", "jpg", "png", "webp")
+DEFAULT_CONTAINER = "mp4"
+MAX_EDITED_TITLE = 300
+_ROW_ID = {
+    "video": re.compile(r"v:(orig|[1-9][0-9]{0,3}:(mp4|webm))"),
+    "audio": re.compile(r"a:(orig|mp3:(320|256|192|128|64)|m4a|opus|flac|wav)"),
+    "image": re.compile(r"i:(orig|best|[1-9][0-9]{0,4}x[1-9][0-9]{0,4})"),
+}
+_AUDIO_NAMES = {"m4a": "M4A", "opus": "Opus", "flac": "FLAC", "wav": "WAV", "orig": "Original"}
+
+
+def row_download_options(
+    tab: str, row_id: str, container: str | None = None, edited_title: str | None = None
+) -> dict[str, Any]:
+    """The job ``options`` for one Result-card row. Mirrors the worker's validation."""
+    if tab not in ROW_TABS:
+        raise ValueError(f"unknown tab {tab!r}")
+    if not isinstance(row_id, str) or not _ROW_ID[tab].fullmatch(row_id):
+        raise ValueError(f"unknown row {row_id!r}")
+    options: dict[str, Any] = {"mode": "download", "tab": tab, "row_id": row_id}
+    if tab == "video":
+        container = container or DEFAULT_CONTAINER
+        if container not in VIDEO_CONTAINERS:
+            raise ValueError(f"unknown container {container!r}")
+        options["container"] = container
+    elif tab == "image":
+        container = container or "original"
+        if container not in IMAGE_SAVE_FORMATS:
+            raise ValueError(f"unknown image format {container!r}")
+        options["container"] = container
+    title = (edited_title or "").strip()
+    if title:
+        options["edited_title"] = title[:MAX_EDITED_TITLE]
+    return options
+
+
+def is_row_options(options: dict[str, Any]) -> bool:
+    return isinstance(options.get("row_id"), str)
+
+
+def row_kind(options: dict[str, Any]) -> str:
+    """What a row download saves: "video", "audio" or "thumbnail" (an image row)."""
+    tab = options.get("tab")
+    return "thumbnail" if tab == "image" else tab if tab in ("video", "audio") else "file"
+
+
+def row_label(options: dict[str, Any]) -> str:
+    """A short description of a row download for queue cards and History."""
+    tab, row_id = options.get("tab"), str(options.get("row_id") or "")
+    container = str(options.get("container") or "")
+    parts = row_id.split(":")
+    if tab == "video":
+        quality = "Original file" if parts[1:2] == ["orig"] else f"{parts[1]}p"
+        return f"Video · {quality} · {container.upper()}"
+    if tab == "audio":
+        if parts[1:2] == ["mp3"]:
+            return f"MP3 · {parts[2]} kbps"
+        return f"Audio · {_AUDIO_NAMES.get(parts[1] if len(parts) > 1 else '', 'Audio')}"
+    if tab == "image":
+        size = parts[1] if len(parts) > 1 and "x" in parts[1] else ""
+        fmt = "Original" if container in ("", "original") else container.upper()
+        return "  ".join(p for p in (f"Image · {fmt}", size) if p)
+    return "Download"

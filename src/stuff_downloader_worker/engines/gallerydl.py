@@ -26,14 +26,15 @@ import collections
 import logging
 import os
 import re
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from .. import site_login
+from .. import presets, site_login
 from ..protocol import JobSpec, media_result
 from .base import Emit, EngineError
-from .http import is_public_name
+from .http import is_public_name, move_into_place
 from .ytdlp import redact_urls
 
 PRESET_ID = "gallery_original"
@@ -139,6 +140,35 @@ def media_kind(rows: list[dict[str, Any]]) -> tuple[str, list[str]]:
     return "gallery", ["gallery"]
 
 
+def single_item_fields(kind: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
+    """A single photo or clip's one Result-card row, saved as the site's original file
+    (plan §5.4: a gallery video is always the original MP4), and its preview."""
+    if kind not in ("image", "video"):
+        return {}
+    item = rows[0]
+    row: dict[str, Any] = {
+        "id": presets.ORIGINAL_ROW_IDS[kind],
+        "original": True,
+        "ext": item.get("ext"),
+        "width": item.get("width"),
+        "height": item.get("height"),
+        "default": True,
+    }
+    if kind == "video":
+        row.update({"container": item.get("ext"), "fixed_container": True})
+    return {f"{kind}_rows": [row], "preview": item.get("thumbnail")}
+
+
+def rename_single(result: dict[str, Any], edited_title: str | None) -> dict[str, Any]:
+    """The one file of a single-item download renamed to the owner's edited title."""
+    files = result.get("files") or []
+    if not edited_title or len(files) != 1:
+        return result
+    source = Path(files[0])
+    final = move_into_place(source, source.parent, edited_title + source.suffix)
+    return {**result, "title": final.stem, "files": [str(final)]}
+
+
 def _title(post: dict[str, Any], extractor_name: str) -> str:
     for key in ("title", "description", "content", "caption", "gallery_title", "album"):
         text = _short(post.get(key))
@@ -198,6 +228,7 @@ class GalleryDlEngine:
 
         opts = dict(job.options)
         login = opts.pop("site_login", None)
+        edited_title: str | None = None
         login_source = self._login_source(login) if login is not None else None
         mode = opts.get("mode", "analyze")
         if mode == "analyze":
@@ -207,6 +238,14 @@ class GalleryDlEngine:
         elif mode == "download":
             from ..image_convert import IMAGE_OPTION_KEYS, parse_image_options
 
+            if presets.is_row_request(opts):
+                # The Result card's one row for a single photo or clip (plan §5.4).
+                request = presets.parse_row_request(opts, original_only=True)
+                edited_title = request.edited_title
+                opts = {"mode": "download", "preset": PRESET_ID, "items": [1]}
+                if request.tab == "image" and request.container != "original":
+                    opts["image_format"] = request.container
+                job = replace(job, options=opts)
             if (
                 set(opts) - ({"mode", "preset", "items", "archive"} | IMAGE_OPTION_KEYS)
                 or opts.get("preset") != PRESET_ID
@@ -236,7 +275,8 @@ class GalleryDlEngine:
                     gjob, Message, extr, category, emit, version.__version__, job.url
                 )
             archive = bool(opts.get("archive"))
-            return self._download(gjob, config, job, extr, items, archive, log, emit)
+            result = self._download(gjob, config, job, extr, items, archive, log, emit)
+            return rename_single(result, edited_title)
         finally:
             root.removeHandler(log)
             root.setLevel(previous_level)
@@ -340,6 +380,7 @@ class GalleryDlEngine:
             tabs,
             _title(post, site),
             page_url,
+            **single_item_fields(kind, rows),
             uploader=_uploader(post),
             site=site,
             extractor=site,

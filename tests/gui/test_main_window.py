@@ -7,11 +7,12 @@ from pathlib import Path
 import pytest
 from PyQt6.QtCore import Qt
 
-from stuff_downloader.core import presets, protocol, router, settings, tools
+from stuff_downloader.core import protocol, router, settings, tools
 from stuff_downloader.core.protocol import Event
 from stuff_downloader.gui import pages, theme
 from stuff_downloader.gui.main_window import MainWindow, tool_health_text
 from stuff_downloader.gui.widgets import format_bytes, format_eta
+from stuff_downloader_worker.engines import ytdlp as worker_ytdlp
 
 MISSING_FFMPEG = tools.ToolStatus("ffmpeg", None, None, "missing", "not found")
 FOUND_DENO = tools.ToolStatus("deno", "C:/deno.exe", "deno 2.0", "path")
@@ -121,6 +122,17 @@ class FakeRun:
     def emit(self, kind, **data):
         self.on_event(Event(kind, self.spec.job_id, data))
 
+    def emit_result(self, data):
+        """A result whose own fields include "kind" (a MediaResult), which emit() cannot take."""
+        self.on_event(Event("result", self.spec.job_id, data))
+
+
+def media(url=None, preview=None, **fields):
+    """The recorded yt-dlp page as the worker's MediaResult, with ``fields`` changed first."""
+    info = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    info.update(fields)
+    return worker_ytdlp.analyze_result(info, url or VID_URL, preview)
+
 
 @pytest.fixture
 def runs(monkeypatch):
@@ -143,23 +155,21 @@ def _png_b64(width, height):
     return base64.b64encode(bytes(buffer.data())).decode("ascii")
 
 
-def _analyzed(window, runs, qtbot, url=VID_URL, **extra):
+def _analyzed(window, runs, qtbot, url=VID_URL, preview=None, **extra):
     page = window.downloads_page
     page.url_edit.setText(url)
     page.analyze()
     run = runs[-1]
-    info = json.loads(FIXTURE.read_text(encoding="utf-8"))
-    info.update(extra)
     run.emit("stage", stage="analyzing")
-    run.emit("result", **info)
-    qtbot.waitUntil(lambda: not page.preview.isHidden())
+    run.emit_result(media(runs[-1].spec.url, preview, **extra))
+    qtbot.waitUntil(lambda: not page.result_card.isHidden())
     return page
 
 
 def test_downloads_initial_empty_state(window):
     page = window.downloads_page
     assert not page.empty_state.isHidden()
-    assert page.preview.isHidden()
+    assert page.result_card.isHidden()
     assert page.queue_summary.text() == "Nothing running"
     assert page.jobs == {}
 
@@ -181,7 +191,7 @@ def test_analyze_rejects_bad_links_without_starting_a_worker(window, runs, url, 
     page.analyze()
     assert runs == []
     assert needle in page.message_label.text().lower()
-    assert not page.message_label.isHidden() and page.preview.isHidden()
+    assert not page.message_label.isHidden() and page.result_card.isHidden()
 
 
 def test_analyze_accepts_a_public_link_from_another_site(window, runs):
@@ -208,52 +218,149 @@ def test_analyze_sends_normalized_url_and_no_engine_options(window, runs, qtbot)
     assert len(runs) == 1
 
 
-def test_preview_lists_only_existing_heights_and_caps_by_preset(window, runs, qtbot):
-    page = _analyzed(window, runs, qtbot, thumbnail={"data": _png_b64(160, 90)})
-    card = page.preview
+def test_the_result_card_lists_the_rows_that_exist_in_mediaresult_tab_order(
+    window, runs, qtbot
+):
+    page = _analyzed(window, runs, qtbot, preview={"data": _png_b64(160, 90)})
+    card = page.result_card
     assert (
-        card.title_label.text()
+        card.title_editor.title()
         == "Big Buck Bunny 60fps 4K - Official Blender Foundation Short Film"
     )
     assert page.analyze_button.isEnabled() and page.analyze_cancel_button.isHidden()
     assert card.playlist_label.isHidden()
-
-    def heights():
-        combo = card.resolution_combo
-        return [combo.itemData(i) for i in range(combo.count())]
-
-    card.preset_combo.setCurrentIndex(card.preset_combo.findData("video_best"))
-    assert heights() == [None, 2160, 1440, 1080, 720, 480, 360, 240, 144]
-    card.preset_combo.setCurrentIndex(card.preset_combo.findData("video_720"))
-    assert heights() == [None, 720, 480, 360, 240, 144]
-    card.preset_combo.setCurrentIndex(card.preset_combo.findData("mp3_music"))
-    assert not card.resolution_combo.isEnabled()
-    assert card.compatible_check.isHidden() and not card.crop_check.isHidden()
-    assert card.cover.pixmap().width() == card.cover.pixmap().height()  # square preview
-    card.crop_check.setChecked(False)
-    assert card.cover.pixmap().width() > card.cover.pixmap().height()
+    assert card.tab_names() == ["video", "audio", "image"][: len(card.tab_names())]
+    assert card.current_tab() == "video"
+    heights = [row["height"] for row in card.rows("video")]
+    assert heights == [2160, 1440, 1080, 720, 480, 360, 240, 144]
+    # ★ is the highest H.264 height up to 1080p, and every row has its own Download button.
+    assert [r["id"] for r in card.rows("video") if r.get("default")] == ["v:1080:mp4"]
+    assert "★" in card.cell_text("video", 2, 1) and "H.264" in card.cell_text("video", 2, 1)
+    assert all(card.download_button("video", r) for r in range(len(heights)))
+    assert card.cover.pixmap() is not None and not card.cover.pixmap().isNull()
 
 
-def test_playlist_and_music_links(window, runs, qtbot):
+def test_audio_rows_offer_every_format_and_say_where_the_cover_is_missing(window, runs, qtbot):
+    page = _analyzed(window, runs, qtbot)
+    card = page.result_card
+    ids = [row["id"] for row in card.rows("audio")]
+    assert ids[:5] == ["a:mp3:320", "a:mp3:256", "a:mp3:192", "a:mp3:128", "a:mp3:64"]
+    assert {"a:m4a", "a:flac", "a:wav"} <= set(ids)
+    wav = ids.index("a:wav")
+    assert "no embedded cover" in card.cell_text("audio", wav, 1)
+    assert card.cell_text("audio", 0, 2).startswith("~")  # an MP3 size is an estimate
+    assert card.source_label.text().startswith("Source audio: ")
+    assert "do not add quality" in card.audio_note.text()
+
+
+def test_a_row_download_sends_only_our_row_id_and_the_chosen_container(
+    window, runs, qtbot
+):
+    page = _analyzed(window, runs, qtbot)
+    card = page.result_card
+    card.container_combo.setCurrentIndex(card.container_combo.findData("mkv"))
+    row = next(i for i, r in enumerate(card.rows("video")) if r["id"] == "v:720:mp4")
+    assert "MKV" == card.cell_text("video", row, 0)
+    card.download_button("video", row).click()
+    assert runs[-1].spec.options == {
+        "mode": "download",
+        "tab": "video",
+        "row_id": "v:720:mp4",
+        "container": "mkv",
+    }
+    assert "format_id" not in runs[-1].spec.options
+    # MOV re-encodes, and every row says so before anything is downloaded.
+    card.container_combo.setCurrentIndex(card.container_combo.findData("mov"))
+    assert "re-encodes" in card.cell_text("video", row, 1)
+
+
+def test_an_edited_title_becomes_the_file_name_and_restores_with_one_click(
+    window, runs, qtbot
+):
+    page = _analyzed(window, runs, qtbot)
+    editor = page.result_card.title_editor
+    editor.label.mousePressEvent(None)  # one click turns the title into a text box
+    assert editor.is_editing()
+    editor.edit.setText("My Clip")
+    editor.edit.editingFinished.emit()
+    assert not editor.is_editing() and editor.edited_title() == "My Clip"
+    assert not editor.reset.isHidden()
+    job = page.start_row_download("audio", "a:mp3:320")
+    assert runs[-1].spec.options["edited_title"] == "My Clip" and job.title == "My Clip"
+    editor.restore()
+    assert editor.edited_title() is None and editor.reset.isHidden()
+    page.start_row_download("audio", "a:mp3:320")
+    assert "edited_title" not in runs[-1].spec.options
+
+
+def test_escape_cancels_a_title_edit(window, runs, qtbot):
+    from PyQt6.QtCore import QEvent
+    from PyQt6.QtGui import QKeyEvent
+
+    page = _analyzed(window, runs, qtbot)
+    editor = page.result_card.title_editor
+    editor.start_editing()
+    editor.edit.setText("Nope")
+    editor.edit.keyPressEvent(
+        QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_Escape, Qt.KeyboardModifier.NoModifier)
+    )
+    assert not editor.is_editing() and editor.edited_title() is None
+
+
+def test_a_row_the_card_does_not_show_is_never_queued(window, runs, qtbot):
+    page = _analyzed(window, runs, qtbot)
+    before = len(runs)
+    assert page.start_row_download("video", "v:4320:mp4") is None
+    assert page.start_row_download("audio", "a:mp3:999") is None
+    assert len(runs) == before
+
+
+def test_music_links_open_on_the_audio_tab(window, runs, qtbot):
     page = _analyzed(
         window, runs, qtbot, url="https://music.youtube.com/watch?v=dQw4w9WgXcQ&list=RDAMVM1"
     )
-    assert not page.preview.playlist_label.isHidden()
-    assert page.preview.preset_combo.currentData() == "mp3_music"
+    assert not page.result_card.playlist_label.isHidden()
+    assert page.result_card.current_tab() == "audio"
     assert runs[0].spec.url == "https://music.youtube.com/watch?v=dQw4w9WgXcQ"
 
 
-def test_each_analyzed_route_gets_a_fresh_preset_default(window, runs, qtbot):
-    page = _analyzed(
-        window, runs, qtbot, url="https://music.youtube.com/watch?v=dQw4w9WgXcQ"
-    )
-    assert page.preview.preset_combo.currentData() == "mp3_music"
+def test_each_analyzed_link_starts_on_its_own_tab_and_mp4(window, runs, qtbot):
+    page = _analyzed(window, runs, qtbot, url="https://music.youtube.com/watch?v=dQw4w9WgXcQ")
+    card = page.result_card
+    card.container_combo.setCurrentIndex(card.container_combo.findData("avi"))
+    assert card.current_tab() == "audio"
 
-    # A new ordinary YouTube video must not inherit the previous music choice.
+    # A new ordinary YouTube video must not inherit the previous link's choices.
     page.url_edit.setText(VID_URL)
     page.analyze()
-    runs[-1].emit("result", **json.loads(FIXTURE.read_text(encoding="utf-8")))
-    assert page.preview.preset_combo.currentData() == presets.DEFAULT_PRESET_ID
+    runs[-1].emit_result(media())
+    assert card.current_tab() == "video" and card.container() == "mp4"
+
+
+def test_a_result_the_core_cannot_validate_is_refused(window, runs, qtbot):
+    page = window.downloads_page
+    page.url_edit.setText(VID_URL)
+    page.analyze()
+    runs[-1].emit("result", title="old shape", formats=[])
+    assert page.result_card.isHidden()
+    assert "cannot read" in page.message_label.text()
+
+
+def test_the_result_card_has_no_file_name_field_and_no_crop_checkbox(window, runs, qtbot):
+    from PyQt6.QtWidgets import QCheckBox, QLabel, QLineEdit
+
+    page = _analyzed(window, runs, qtbot)
+    card = page.result_card
+    texts = [w.text() for w in card.findChildren(QLabel)]
+    texts += [w.text() for w in card.findChildren(QCheckBox)]
+    assert not any("file name" == t.strip().lower() for t in texts)
+    assert not any("crop" in t.lower() for t in texts)
+    assert not card.findChildren(QCheckBox)
+    # The only text box is the title editor's own, in the title's place.
+    assert card.findChildren(QLineEdit) == [card.title_editor.edit]
+    for tab, table in card.tables.items():
+        headers = [table.horizontalHeaderItem(c).text() for c in range(table.columnCount())]
+        assert "File name" not in headers, tab
 
 
 def test_youtube_music_playlist_resets_to_mp3(window):
@@ -279,7 +386,7 @@ def test_analyze_error_timeout_and_cancel(window, runs, qtbot):
     page.analyze()
     runs[-1].emit("error", code="download_error", message="ERROR: Private video")
     assert page.message_label.text() == "This video is private on the site."
-    assert page.preview.isHidden() and page.analyze_button.isEnabled()
+    assert page.result_card.isHidden() and page.analyze_button.isEnabled()
 
     page.analyze()
     page._analyze_timeout()
@@ -297,19 +404,15 @@ def test_download_job_progress_completion_and_file_actions(
 
     window.settings_page.set_folder(str(tmp_path))
     page = _analyzed(window, runs, qtbot)
-    card = page.preview
-    card.preset_combo.setCurrentIndex(card.preset_combo.findData("video_best"))
-    card.resolution_combo.setCurrentIndex(card.resolution_combo.findData(1440))
-    card.compatible_check.setChecked(False)
-    job = page.start_download()
+    job = page.start_download()  # the ★ row of the tab on show
     run = runs[-1]
     assert run.spec.options == {
         "mode": "download",
-        "preset": "video_best",
-        "height": 1440,
-        "compatible": False,
-        "crop_cover": True,
+        "tab": "video",
+        "row_id": "v:1080:mp4",
+        "container": "mp4",
     }
+    assert job.card.details_label.text() == "Video · 1080p · MP4"
     assert run.spec.url == "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
     assert run.spec.output_dir == str(tmp_path)
     assert page.empty_state.isHidden() and page.queue_summary.text() == "1 active"
@@ -395,7 +498,7 @@ def test_missing_engine_runtime_fails_cleanly(window, monkeypatch, tmp_path):
     assert "engine runtime not found" in page.message_label.text()
 
     page._route = router.route(VID_URL)
-    page._info = {"title": "t"}
+    page.show_result(media())
     job = page.start_download()
     assert job.state == "failed" and job.card.chip.text() == "Failed"
     assert "engine runtime not found" in job.card.details_label.text()
@@ -1022,7 +1125,7 @@ def test_advanced_view_is_read_only_and_says_so(window, runs, qtbot):
     table = page.advanced_table
     assert table.editTriggers() == table.EditTrigger.NoEditTriggers
     assert table.selectionMode() == table.SelectionMode.NoSelection
-    assert "preset above" in page.advanced_note.text()
+    assert "row above" in page.advanced_note.text()
 
 
 def test_advanced_view_is_hidden_when_the_site_offers_no_formats(window, runs, qtbot):
@@ -1057,37 +1160,37 @@ def test_a_site_title_with_markup_is_shown_as_text_not_rendered(window, runs, qt
         title="<b>bold</b> <img src=x>",
         extractor="Vimeo",
     )
-    card = page.preview
-    assert card.title_label.text() == "<b>bold</b> <img src=x>"
-    assert card.title_label.textFormat() == Qt.TextFormat.PlainText
+    card = page.result_card
+    assert card.title_editor.label.text() == "<b>bold</b> <img src=x>"
+    assert card.title_editor.label.textFormat() == Qt.TextFormat.PlainText
+    assert card.meta_label.textFormat() == Qt.TextFormat.PlainText
     assert "Vimeo" in card.meta_label.text()
 
 
-def test_the_site_name_is_only_shown_for_links_that_are_not_youtube(window, runs, qtbot):
+def test_the_site_name_comes_from_the_mediaresult(window, runs, qtbot):
     page = _analyzed(window, runs, qtbot, extractor="Youtube")
-    assert "Youtube" not in page.preview.meta_label.text()
+    assert page.result_card.meta_label.text().endswith("Youtube")
 
 
-def test_another_sites_video_downloads_through_the_preset_flow(window, runs, qtbot, tmp_path):
+def test_another_sites_video_downloads_through_its_rows(window, runs, qtbot, tmp_path):
     page = _analyzed(window, runs, qtbot, url=SITE_URL, extractor="Vimeo")
-    page.preview.preset_combo.setCurrentIndex(page.preview.preset_combo.findData("video_1080"))
-    page.start_download()
+    page.start_row_download("video", "v:720:mp4")
     spec = runs[-1].spec
     assert spec.engine == "ytdlp" and spec.url == SITE_URL
-    assert spec.options["mode"] == "download" and spec.options["preset"] == "video_1080"
+    assert spec.options["mode"] == "download" and spec.options["row_id"] == "v:720:mp4"
     assert "format_id" not in spec.options and "url" not in spec.options
 
 
 def test_a_title_containing_an_em_dash_is_not_mistaken_for_a_missing_title(window, runs, qtbot):
     page = _analyzed(window, runs, qtbot, title="Song — Live at the Hall")
-    assert page.preview.title_label.text() == "Song — Live at the Hall"
+    assert page.result_card.title_editor.title() == "Song — Live at the Hall"
     page = _analyzed(window, runs, qtbot, title="   ")
-    assert page.preview.title_label.text() == "Untitled"
+    assert page.result_card.title_editor.title() == "Untitled"
 
 
 def test_a_site_that_reports_no_name_simply_shows_no_name(window, runs, qtbot):
     page = _analyzed(window, runs, qtbot, url=SITE_URL, extractor=None, uploader="", duration=None)
-    assert page.preview.meta_label.text() == ""
+    assert page.result_card.meta_label.text() == ""
 
 
 # --- Security rework: a tokenized generic link must not reach the database -------------------
@@ -1223,7 +1326,7 @@ def test_a_blank_title_generic_download_puts_no_token_in_history(window, runs, q
     page = _analyzed(window, runs, qtbot, url=TOKEN_URL, extractor="Generic", title=None)
     job = page.start_download()
     record = page.store.get(job.spec.job_id)
-    assert record.title == TOKEN_SAFE and "SECRET" not in record.title
+    assert record.title == "Untitled" and "SECRET" not in record.title
     assert record.url == TOKEN_SAFE and "SECRET" not in record.url
     # ...and not in the queue card or the in-memory job either.
     assert "SECRET" not in job.title
@@ -1328,7 +1431,7 @@ def test_a_retried_generic_job_is_recorded_under_the_same_rules(window, runs, qt
     retried = page.store.get(job.spec.job_id)
     assert job.spec.job_id != first_id
     assert retried.url == TOKEN_SAFE and retried.url_redacted is True
-    assert retried.title == TOKEN_SAFE and "SECRET" not in retried.title
+    assert retried.title == "Untitled" and "SECRET" not in retried.title
     # The live spec keeps the real link, exactly as the first attempt did.
     assert job.spec.url == TOKEN_URL
     page.shutdown()
@@ -1363,10 +1466,13 @@ def test_a_link_pasted_without_https_is_completed_and_walks_the_core_chain(windo
     image = protocol.media_result(
         "image", ["image"], "Gx1AbC", full, site="Direct file", ext="jpg",
         preview={"data": _png_b64(40, 30)}, formats=[],
+        image_rows=[{"id": "i:orig", "original": True, "ext": "jpg", "default": True}],
     )  # fmt: skip
     runs[2].on_event(Event("result", runs[2].spec.job_id, image))
-    qtbot.waitUntil(lambda: not page.preview.isHidden())
-    assert not page.preview.image_format_combo.isHidden()
+    qtbot.waitUntil(lambda: not page.result_card.isHidden())
+    # A direct image: one Original row on the Image tab, savable as JPG / PNG / WebP.
+    assert page.result_card.tab_names() == ["image"]
+    assert [r["id"] for r in page.result_card.rows("image")] == ["i:orig"]
     assert page._thumb is not None
 
 
@@ -1375,4 +1481,4 @@ def test_a_real_failure_does_not_move_down_the_chain(window, runs):
     page.url_edit.setText("https://www.example.com/post/123")
     page.analyze()
     runs[0].emit("error", code="download_error", message="HTTP Error 500: Server Error")
-    assert len(runs) == 1 and page.preview.isHidden()
+    assert len(runs) == 1 and page.result_card.isHidden()

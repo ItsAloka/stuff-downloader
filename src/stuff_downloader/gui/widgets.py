@@ -16,7 +16,6 @@ from PyQt6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -31,6 +30,7 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -46,7 +46,7 @@ from ..core.spotify import (
     is_uncertain,
     match_score,
 )
-from .theme import set_state
+from .theme import ACCENT, BORDER, SURFACE, SURFACE_HOVER, TEXT, TEXT_DIM, set_state
 from .thumbs import decode_image
 
 # Drags carry the job id only: a drop from another application can never be mistaken for a
@@ -288,28 +288,286 @@ def square_crop(pixmap: QPixmap) -> QPixmap:
     return pixmap.copy(x, y, side, side)
 
 
-class PreviewCard(Card):
-    """Analyze result: cover, title, playlist prompt and the preset/quality pickers."""
+class ElidedLabel(QLabel):
+    """A one-line label that shows as much of its text as fits, then "…" (plan §5.8).
+
+    The full text is kept, reported by ``full_text()`` and shown in the tooltip, and the size
+    hint is the full text's width, so a layout gives it room up to what the text needs.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("")
+        self._full = ""
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setMinimumWidth(40)
+        self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
+
+    def setText(self, text: str) -> None:  # noqa: N802 - Qt override
+        self._full = text
+        self.setToolTip(plain_tooltip(text))
+        self._elide()
+        self.updateGeometry()
+
+    def full_text(self) -> str:
+        return self._full
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt override
+        hint = super().sizeHint()
+        return QSize(self.fontMetrics().horizontalAdvance(self._full) + 4, hint.height())
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        super().resizeEvent(event)
+        self._elide()
+
+    def _elide(self) -> None:
+        shown = self.fontMetrics().elidedText(self._full, Qt.TextElideMode.ElideRight, self.width())
+        super().setText(shown)
+
+
+class TitleEditor(QWidget):
+    """The title as a label with a small ✎ (plan §5.5).
+
+    One click turns it into a text box in the same place. Enter or clicking away saves, Esc
+    cancels, and ↺ restores the original. The edited title only names the file; tags keep the
+    source's real title.
+    """
+
+    edited = pyqtSignal(str)
 
     def __init__(self) -> None:
         super().__init__()
+        self._original = ""
+        self._current = ""
+        self._cancelled = False
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        self.label = ElidedLabel()
+        self.label.setObjectName("resultTitle")
+        self.label.setStyleSheet("font-weight:600; font-size:12pt;")
+        self.label.setTextFormat(Qt.TextFormat.PlainText)
+        self.label.setCursor(Qt.CursorShape.IBeamCursor)
+        self.label.setToolTip("Click to change the file name")
+        self.label.mousePressEvent = lambda _event: self.start_editing()  # type: ignore[method-assign]
+        self.edit = _TitleLineEdit(self)
+        self.edit.setMaxLength(300)
+        self.edit.hide()
+        self.pencil = QPushButton("✎")
+        self.pencil.setObjectName("iconButton")
+        self.pencil.setToolTip("Edit the title used for the file name")
+        self.reset = QPushButton("↺")
+        self.reset.setObjectName("iconButton")
+        self.reset.setToolTip("Restore the original title")
+        self.reset.hide()
+        # The label takes the width its text needs, so ✎ and ↺ sit right after the title.
+        row.addWidget(self.label)
+        row.addWidget(self.edit, 1)
+        row.addWidget(self.pencil, 0, Qt.AlignmentFlag.AlignTop)
+        row.addWidget(self.reset, 0, Qt.AlignmentFlag.AlignTop)
+        self._spacer = QWidget()  # the rest of the row, hidden while the text box fills it
+        row.addWidget(self._spacer, 1)
+        self.pencil.clicked.connect(self.start_editing)
+        self.reset.clicked.connect(self.restore)
+        self.edit.editingFinished.connect(self._finish)
+
+    def set_title(self, title: str) -> None:
+        self._original = self._current = title
+        self._show_label()
+
+    def title(self) -> str:
+        return self._current
+
+    def edited_title(self) -> str | None:
+        """The owner's title, or None while it is the original."""
+        text = self._current.strip()
+        return text if text and text != self._original else None
+
+    def is_editing(self) -> bool:
+        return not self.edit.isHidden()
+
+    def start_editing(self) -> None:
+        self._cancelled = False
+        self.edit.setText(self._current)
+        self.label.hide()
+        self.pencil.hide()
+        self._spacer.hide()
+        self.edit.show()
+        self.edit.setFocus()
+        self.edit.selectAll()
+
+    def cancel(self) -> None:
+        self._cancelled = True
+        self._show_label()
+
+    def restore(self) -> None:
+        self._current = self._original
+        self._show_label()
+        self.edited.emit(self._current)
+
+    def _finish(self) -> None:
+        if self.edit.isHidden():
+            return
+        if not self._cancelled:
+            self._current = self.edit.text().strip() or self._original
+            self.edited.emit(self._current)
+        self._show_label()
+
+    def _show_label(self) -> None:
+        self.edit.hide()
+        self.label.setText(self._current)
+        self.label.show()
+        self._spacer.show()
+        self.pencil.show()
+        self.reset.setVisible(self.edited_title() is not None)
+
+
+class _TitleLineEdit(QLineEdit):
+    def __init__(self, owner: TitleEditor) -> None:
+        super().__init__()
+        self._owner = owner
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802 - Qt override
+        if event.key() == Qt.Key.Key_Escape:
+            self._owner.cancel()
+            return
+        super().keyPressEvent(event)
+
+
+RESULT_TABS = {"video": "Video", "audio": "Audio", "image": "Image"}
+ROW_COLUMNS = ("Format", "Quality", "Size", "")
+VIDEO_CONTAINER_LABELS = (
+    ("MP4", "mp4"),
+    ("MKV", "mkv"),
+    ("WebM", "webm"),
+    ("MOV (re-encodes)", "mov"),
+    ("AVI (re-encodes)", "avi"),
+)
+IMAGE_SAVE_LABELS = (("Original", "original"), ("JPG", "jpg"), ("PNG", "png"), ("WebP", "webp"))
+_ROW_TEXT_LIMIT = 60
+
+
+def _row_text(value: object) -> str:
+    """One printable, single-line cell from a MediaResult field; "" for anything else."""
+    if value is None or isinstance(value, bool):
+        return ""
+    text = " ".join(str(value).split())
+    return "".join(ch for ch in text if ch.isprintable())[:_ROW_TEXT_LIMIT]
+
+
+def _whole(value: object) -> int | None:
+    if isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
+        return int(value)
+    return None
+
+
+def row_size(row: dict) -> str:
+    size = _whole(row.get("size"))
+    if size is None:
+        return "unknown"
+    return ("~" if row.get("size_is_estimate") else "") + format_bytes(size)
+
+
+def video_row_cells(row: dict, container: str) -> tuple[str, str]:
+    """(Format, Quality) for a Video-tab row saved as ``container`` (plan §5.4)."""
+    source = _row_text(row.get("container")).lower()
+    if row.get("original"):
+        quality = f"Original file (as served){' · ' + source.upper() if source else ''}"
+        fmt = source.upper() if row.get("fixed_container") else container.upper()
+        return fmt or "Original", quality
+    height = _whole(row.get("height"))
+    fps = _whole(row.get("fps"))
+    parts = [f"{height}p{fps if fps and fps > 30 else ''}" if height else "Video"]
+    if row.get("hdr") is True:
+        parts.append("HDR")
+    codec = _row_text(row.get("vcodec"))
+    if codec:
+        parts.append(codec)
+    if codec == "H.264":
+        parts.append("plays everywhere")
+    elif codec == "AV1":
+        parts.append("(not supported by older players)")
+    quality = " · ".join(parts)
+    if row.get("default") is True:
+        quality += " ★"
+    reencode = container in ("mov", "avi") or (container == "webm" and source != "webm")
+    if reencode:
+        quality += " (re-encodes, slower)"
+    return container.upper(), quality
+
+
+def audio_row_cells(row: dict) -> tuple[str, str]:
+    """(Format, Quality) for an Audio-tab row (plan §5.4)."""
+    fmt = _row_text(row.get("label")) or "Audio"
+    codec = _row_text(row.get("codec")).lower()
+    bitrate = _whole(row.get("bitrate"))
+    if row.get("original"):
+        quality = "Original file (as served)"
+    elif codec == "mp3":
+        quality = f"{bitrate} kbps" if bitrate else "MP3"
+    elif codec in ("aac", "opus"):
+        name = "AAC" if codec == "aac" else "Opus"
+        if row.get("copy") is True:
+            quality = f"{name} original (no re-encode)"
+            if bitrate:
+                quality += f" · ~{bitrate} kbps"
+        else:
+            quality = f"{name} {bitrate} kbps" if bitrate else name
+    else:
+        quality = _row_text(row.get("lossless_note")) or fmt
+    if row.get("no_cover") is True and "cover" not in quality:
+        quality += " · no embedded cover"
+    if row.get("default") is True:
+        quality += " ★"
+    return fmt, quality
+
+
+def image_row_cells(row: dict, fmt: str) -> tuple[str, str]:
+    """(Format, Quality) for an Image-tab row saved as ``fmt`` (plan §5.4)."""
+    width, height = _whole(row.get("width")), _whole(row.get("height"))
+    ext = _row_text(row.get("ext")).upper()
+    if width and height:
+        quality = f"{width}×{height}"
+    elif row.get("original"):
+        quality = "Original image"
+    else:
+        quality = "Best available"
+    if fmt == "original" and ext:
+        quality += f" · {ext}"
+    if row.get("default") is True:
+        quality += " ★"
+    return ("Original" if fmt == "original" else fmt.upper()), quality
+
+
+class ResultCard(Card):
+    """One analyzed link (plan §5.8): preview, editable title, and Video / Audio / Image tabs
+    of rows, each with its own Download button. Drawn only from the MediaResult."""
+
+    download_requested = pyqtSignal(str, str)  # tab, row id
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._result: dict = {}
+        self._rows: dict[str, list[dict]] = {}
         top = QHBoxLayout()
         top.setSpacing(14)
         self.cover = QLabel("🎞")
-        self.cover.setFixedSize(160, 90)
+        self.cover.setFixedSize(240, 135)
         self.cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cover.setStyleSheet("background:#133247; color:#4cc2ff; border-radius:8px;")
         text_col = QVBoxLayout()
         text_col.setSpacing(4)
-        self.title_label = QLabel("")
-        self.title_label.setStyleSheet("font-weight:600; font-size:12pt;")
-        self.title_label.setWordWrap(True)
-        self.title_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.title_editor = TitleEditor()
         self.meta_label = QLabel("")
         self.meta_label.setObjectName("muted")
+        self.meta_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.source_label = QLabel("")
+        self.source_label.setObjectName("muted")
+        self.source_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.source_label.hide()
         self.playlist_label = QLabel("This link is part of a playlist.")
         self.playlist_label.setObjectName("muted")
         self.playlist_label.setWordWrap(True)
+        self.playlist_label.setTextFormat(Qt.TextFormat.PlainText)
         self.playlist_label.hide()
         self.playlist_button = QPushButton("☰  Whole playlist…")
         self.playlist_button.setToolTip("Open the playlist and choose which songs to download")
@@ -321,51 +579,192 @@ class PreviewCard(Card):
         playlist_row.setContentsMargins(0, 0, 0, 0)
         playlist_row.addWidget(self.playlist_label, 1)
         playlist_row.addWidget(self.playlist_button)
-        text_col.addWidget(self.title_label)
-        text_col.addWidget(self.meta_label)
-        text_col.addWidget(playlist_box)
+        for widget in (self.title_editor, self.meta_label, self.source_label, playlist_box):
+            text_col.addWidget(widget)
         text_col.addStretch(1)
-        top.addWidget(self.cover)
+        top.addWidget(self.cover, 0, Qt.AlignmentFlag.AlignTop)
         top.addLayout(text_col, 1)
         self.body.addLayout(top)
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(10)
-        grid.setVerticalSpacing(8)
-        self.preset_combo = QComboBox()
-        self.resolution_combo = QComboBox()
-        for combo in (self.preset_combo, self.resolution_combo):
-            combo.setMinimumWidth(220)
-            combo.setSizePolicy(QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed)
-        self.compatible_check = QCheckBox("Most compatible (H.264/AAC MP4, plays everywhere)")
-        self.compatible_check.setChecked(True)
-        self.crop_check = QCheckBox("Crop cover to a square")
-        self.crop_check.setChecked(True)
-        self.name_edit = QLineEdit()
-        self.name_edit.setPlaceholderText("Use the suggested file name")
-        self.download_button = QPushButton("⬇  Download")
-        self.download_button.setObjectName("primary")
-        grid.addWidget(QLabel("Preset"), 0, 0)
-        grid.addWidget(self.preset_combo, 0, 1)
-        grid.addWidget(QLabel("Quality"), 1, 0)
-        grid.addWidget(self.resolution_combo, 1, 1)
-        grid.addWidget(self.compatible_check, 2, 1)
-        grid.addWidget(self.crop_check, 3, 1)
-        grid.addWidget(QLabel("File name"), 4, 0)
-        grid.addWidget(self.name_edit, 4, 1)
-        # Direct image links only (item 6): shown by the page when the file is an image.
-        self.image_format_label = QLabel("Save as")
-        self.image_format_combo = image_format_combo()
-        grid.addWidget(self.image_format_label, 5, 0)
-        grid.addWidget(self.image_format_combo, 5, 1)
-        self.image_format_label.hide()
-        self.image_format_combo.hide()
-        grid.setColumnStretch(1, 1)
-        self.body.addLayout(grid)
-        buttons = QHBoxLayout()
-        buttons.addStretch(1)
-        buttons.addWidget(self.download_button)
-        self.body.addLayout(buttons)
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.tabBar().setDrawBase(False)  # the pane's top border is the only line
+        # The theme has no tab rules; without these the tabs are Fusion's light grey.
+        self.tabs.setStyleSheet(
+            f"QTabWidget::pane {{ border: none; border-top: 1px solid {BORDER}; }}"
+            f"QTabBar::tab {{ background: {SURFACE}; color: {TEXT_DIM};"
+            f" border: 1px solid {BORDER}; border-bottom: none; padding: 6px 14px;"
+            " margin-right: 4px; border-top-left-radius: 6px; border-top-right-radius: 6px; }"
+            f"QTabBar::tab:selected {{ background: {SURFACE_HOVER}; color: {TEXT};"
+            f" border-color: {ACCENT}; }}"
+            f"QTabBar::tab:hover {{ color: {TEXT}; }}"
+        )
+        self.tables: dict[str, QTableWidget] = {}
+        self.pages: dict[str, QWidget] = {}
+        self.container_combo = QComboBox()
+        for label, value in VIDEO_CONTAINER_LABELS:
+            self.container_combo.addItem(label, value)
+        self.container_combo.setToolTip(
+            "MP4, MKV and WebM are a quick remux when the codecs allow it. "
+            "MOV and AVI are re-encoded, which is slower."
+        )
+        self.image_format_combo = QComboBox()
+        for label, value in IMAGE_SAVE_LABELS:
+            self.image_format_combo.addItem(label, value)
+        self.audio_note = QLabel("")
+        self.audio_note.setObjectName("muted")
+        self.audio_note.setWordWrap(True)
+        self.audio_note.setTextFormat(Qt.TextFormat.PlainText)
+        extras = {
+            "video": ("Save video as", self.container_combo),
+            "image": ("Save image as", self.image_format_combo),
+            "audio": ("", self.audio_note),
+        }
+        for tab in RESULT_TABS:
+            page = QWidget()
+            box = QVBoxLayout(page)
+            box.setContentsMargins(0, 8, 0, 0)
+            box.setSpacing(6)
+            caption, widget = extras[tab]
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            if caption:
+                row.addStretch(1)
+                row.addWidget(QLabel(caption))
+            row.addWidget(widget, 0 if caption else 1)
+            box.addLayout(row)
+            table = QTableWidget(0, len(ROW_COLUMNS))
+            table.setObjectName("formatTable")
+            # The theme's 8px item padding also shrinks cell widgets, clipping the buttons.
+            table.setStyleSheet("QTableWidget::item { padding: 0px 8px; }")
+            table.setHorizontalHeaderLabels(list(ROW_COLUMNS))
+            table.verticalHeader().setVisible(False)
+            table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+            table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+            table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            table.setWordWrap(False)
+            table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            header = table.horizontalHeader()
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)  # set from the buttons
+            box.addWidget(table)
+            box.addStretch(1)  # spare height goes below the rows, never above them
+            self.tables[tab] = table
+            self.pages[tab] = page
+        self.body.addWidget(self.tabs)
+        self.container_combo.currentIndexChanged.connect(lambda _: self._fill("video"))
+        self.image_format_combo.currentIndexChanged.connect(lambda _: self._fill("image"))
+
+    # ── filling ───────────────────────────────────────────────────────────────────────────
+    def set_result(self, result: dict, rows: dict[str, list[dict]]) -> None:
+        """Show ``result``'s tabs, in its order, with the rows the page already checked."""
+        self._result = result
+        self._rows = rows
+        self.container_combo.blockSignals(True)
+        self.container_combo.setCurrentIndex(0)  # each link starts as MP4
+        self.container_combo.blockSignals(False)
+        self.image_format_combo.blockSignals(True)
+        self.image_format_combo.setCurrentIndex(0)
+        self.image_format_combo.blockSignals(False)
+        self.tabs.clear()
+        for tab in result.get("tabs") or []:
+            if tab in RESULT_TABS and rows.get(tab):
+                self._fill(tab)
+                count = len(rows[tab])
+                self.tabs.addTab(self.pages[tab], f"{RESULT_TABS[tab]} {count}")
+        self.tabs.setVisible(self.tabs.count() > 0)
+        if self.tabs.count():
+            self.tabs.setCurrentIndex(0)
+
+    def tab_names(self) -> list[str]:
+        """The tabs shown, in order, as MediaResult tab names."""
+        names = {page: tab for tab, page in self.pages.items()}
+        return [names[self.tabs.widget(i)] for i in range(self.tabs.count())]
+
+    def current_tab(self) -> str | None:
+        names = self.tab_names()
+        index = self.tabs.currentIndex()
+        return names[index] if 0 <= index < len(names) else None
+
+    def rows(self, tab: str) -> list[dict]:
+        return list(self._rows.get(tab) or [])
+
+    def container(self) -> str:
+        return self.container_combo.currentData() or "mp4"
+
+    def image_format(self) -> str:
+        return self.image_format_combo.currentData() or "original"
+
+    def download_button(self, tab: str, row: int) -> QPushButton | None:
+        widget = self.tables[tab].cellWidget(row, 3)
+        return widget if isinstance(widget, QPushButton) else None
+
+    def cell_text(self, tab: str, row: int, column: int) -> str:
+        item = self.tables[tab].item(row, column)
+        return item.text() if item is not None else ""
+
+    def _fill(self, tab: str) -> None:
+        rows = self._rows.get(tab) or []
+        table = self.tables[tab]
+        table.setRowCount(len(rows))
+        fixed = bool(rows) and all(r.get("fixed_container") is True for r in rows)
+        self.container_combo.setEnabled(not fixed)
+        for index, row in enumerate(rows):
+            if tab == "video":
+                fmt, quality = video_row_cells(row, self.container())
+            elif tab == "audio":
+                fmt, quality = audio_row_cells(row)
+            else:
+                fmt, quality = image_row_cells(row, self.image_format())
+            for column, text in enumerate((fmt, quality, row_size(row))):
+                item = QTableWidgetItem(text)
+                item.setToolTip(plain_tooltip(text))
+                table.setItem(index, column, item)
+            button = table.cellWidget(index, 3)
+            if not isinstance(button, QPushButton):
+                button = QPushButton("⬇  Download")
+                button.setObjectName("rowButton")  # the theme's compact in-table button
+                table.setCellWidget(index, 3, button)
+            try:
+                button.clicked.disconnect()
+            except TypeError:
+                pass  # a new button has nothing connected yet
+            row_id = str(row.get("id"))
+            button.clicked.connect(
+                lambda _=False, t=tab, r=row_id: self.download_requested.emit(t, r)
+            )
+        self._fit_buttons(table)
+        height = table.horizontalHeader().height() + 4
+        height += sum(table.rowHeight(r) for r in range(table.rowCount()))
+        table.setFixedHeight(min(height, 420))
+
+    @staticmethod
+    def _fit_buttons(table: QTableWidget) -> None:
+        """Rows and the button column sized from the (styled) Download buttons.
+
+        Contents-sizing ignores cell widgets, and a button's size hint is only right once the
+        stylesheet has been applied, so each button is polished before it is measured.
+        """
+        table.resizeRowsToContents()
+        width = 0
+        for index in range(table.rowCount()):
+            button = table.cellWidget(index, 3)
+            if button is None:
+                continue
+            button.ensurePolished()
+            hint = button.sizeHint()
+            width = max(width, hint.width())
+            table.setRowHeight(index, max(table.rowHeight(index), hint.height() + 10, 34))
+        if width:
+            table.horizontalHeader().resizeSection(3, width + 24)  # 0 8px padding + grid
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt override
+        # The theme may only reach the buttons once the card is shown; measure again then.
+        super().showEvent(event)
+        for tab in self.tab_names():
+            self._fill(tab)
 
 
 class GroupCard(Card):
@@ -402,7 +801,7 @@ class GroupCard(Card):
 class PlaylistCard(Card):
     """The playlist expansion table: checkbox · # · title · artist · duration · state."""
 
-    COLUMNS = ("", "#", "Title", "Artist", "Length", "", "File name")
+    COLUMNS = ("", "#", "Title (click to edit)", "Artist", "Length", "")
     TITLE_COLUMN = 2
 
     def __init__(self) -> None:
@@ -421,8 +820,14 @@ class PlaylistCard(Card):
         self.table.setIconSize(ROW_THUMB)
         self.table.setHorizontalHeaderLabels(list(self.COLUMNS))
         self.table.verticalHeader().setVisible(False)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        # Only the Title cell is editable (its item flags); a click on it starts editing.
+        self.table.setEditTriggers(
+            QAbstractItemView.EditTrigger.SelectedClicked
+            | QAbstractItemView.EditTrigger.DoubleClicked
+            | QAbstractItemView.EditTrigger.EditKeyPressed
+            | QAbstractItemView.EditTrigger.CurrentChanged
+        )
         self.table.setMinimumHeight(220)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
@@ -431,7 +836,6 @@ class PlaylistCard(Card):
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeMode.Stretch)
         self.body.addWidget(self.table)
 
         controls = QHBoxLayout()
@@ -478,23 +882,22 @@ class PlaylistCard(Card):
             cells = (str(entry.index), entry.title, entry.uploader)
             for column, text in enumerate(cells, start=1):
                 item = QTableWidgetItem(text)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if column == self.TITLE_COLUMN:
                     item.setIcon(_placeholder_icon())
+                    item.setData(Qt.ItemDataRole.UserRole, entry.title)
+                    item.setToolTip("Click to change the file name")
+                    if entry.selectable:
+                        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
                 if not entry.selectable:
                     item.setForeground(QColor("#8aa0b4"))
                 self.table.setItem(row, column, item)
             for column, text in ((4, format_duration(entry.duration)), (5, entry.unavailable)):
                 item = QTableWidgetItem(text)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 if not entry.selectable:
                     item.setForeground(QColor("#8aa0b4"))
                 self.table.setItem(row, column, item)
-            # Empty means "use the default name" (e.g. "Artist - Title" for music); only
-            # text the user types is sent, so the title is just a hint.
-            name = QLineEdit()
-            name.setObjectName("cellEdit")  # compact, so it fits the 30px row
-            name.setPlaceholderText(entry.title)
-            name.setEnabled(entry.selectable)
-            self.table.setCellWidget(row, 6, name)
 
     def selected_rows(self) -> list[int]:
         rows = []
@@ -533,10 +936,16 @@ class PlaylistCard(Card):
         return range(first, min(count, last + 6))
 
     def output_name(self, row: int) -> str | None:
-        """The name the user typed for ``row``, or ``None`` to keep the default name."""
-        widget = self.table.cellWidget(row, 6)
-        text = widget.text().strip() if isinstance(widget, QLineEdit) else ""
-        return text or None
+        """The title the owner edited for ``row``, or ``None`` to keep the default name.
+
+        An untouched (or restored) title is not a name: music keeps "Artist - Title".
+        """
+        item = self.table.item(row, self.TITLE_COLUMN)
+        if item is None:
+            return None
+        text = item.text().strip()
+        original = item.data(Qt.ItemDataRole.UserRole)
+        return text if text and text != original else None
 
 
 class MatchDialog(QDialog):

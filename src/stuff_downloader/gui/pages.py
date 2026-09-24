@@ -42,7 +42,6 @@ from PyQt6.QtWidgets import (
 from ..core import (
     cookies,
     errors,
-    formats,
     gallery,
     history,
     paths,
@@ -57,7 +56,7 @@ from ..core import (
     scheduler as scheduling,
 )
 from ..core.names import MAX_STEM, safe_output_name
-from ..core.protocol import Event, JobSpec
+from ..core.protocol import Event, JobSpec, ProtocolError, validate_media_result
 from ..core.runner import JobRun, WorkerRuntimeMissing
 from . import theme
 from .bridge import EventBridge
@@ -70,7 +69,7 @@ from .widgets import (
     JobCard,
     MatchDialog,
     PlaylistCard,
-    PreviewCard,
+    ResultCard,
     SiteLoginDialog,
     SpotifyCard,
     format_bytes,
@@ -79,7 +78,6 @@ from .widgets import (
     page_header,
     plain_tooltip,
     section_title,
-    square_crop,
 )
 
 JOB_CHIPS = {
@@ -261,6 +259,42 @@ def _preset(preset_id: Any) -> presets.Preset:
         return SPOTIFY_PRESET
     return presets.get(preset_id)
 
+
+def known_options(options: dict[str, Any]) -> bool:
+    """True when saved job options name a download this version can run again."""
+    if presets.is_row_options(options):
+        try:
+            presets.row_download_options(
+                options.get("tab"),
+                options.get("row_id"),
+                options.get("container"),
+                options.get("edited_title"),
+            )
+        except (TypeError, ValueError):
+            return False
+        return True
+    try:
+        _preset(options.get("preset"))
+    except ValueError:
+        return False
+    return True
+
+
+def job_label(options: dict[str, Any]) -> str:
+    """What a job saves, for its queue card: the row it came from, or its preset."""
+    if presets.is_row_options(options):
+        return presets.row_label(options)
+    return _preset(options.get("preset")).label
+
+
+def job_kind(options: dict[str, Any]) -> str:
+    """"video", "audio", "thumbnail", "file" or "gallery" for a job's options; "" if unknown."""
+    if not known_options(options):
+        return ""
+    if presets.is_row_options(options):
+        return presets.row_kind(options)
+    return _preset(options.get("preset")).kind
+
 # A generic link's query can be the signed token that makes it work, so history stores the
 # link without it (see history.Store._migrate). Such a job can name the page but cannot be
 # replayed, and the owner is told that plainly rather than handed a download that will fail.
@@ -432,6 +466,31 @@ def track_rows(info: Any) -> list[tuple[str, ...]]:
     return rows
 
 
+def result_rows(info: dict[str, Any], tab: str) -> list[dict[str, Any]]:
+    """A MediaResult tab's rows that name a download this version can queue."""
+    rows = []
+    for row in info.get(f"{tab}_rows") or []:
+        try:
+            presets.row_download_options(tab, row.get("id"))
+        except (TypeError, ValueError):
+            continue
+        rows.append(row)
+    return rows
+
+
+def source_audio_text(source: Any) -> str:
+    """ "Source audio: Opus ~160 kbps" from a MediaResult, or "" when it is unknown."""
+    if not isinstance(source, dict):
+        return ""
+    codec = _cell(source.get("codec"), 20)
+    if codec in ("—", "unknown"):
+        return ""
+    kbps = source.get("abr_kbps")
+    if _is_number(kbps) and kbps > 0:
+        return f"Source audio: {codec} ~{int(kbps)} kbps"
+    return f"Source audio: {codec}"
+
+
 def _page_layout(widget: QWidget) -> QVBoxLayout:
     """Create a responsive page whose natural contents scroll instead of being compressed."""
     widget.setObjectName("page")
@@ -600,15 +659,10 @@ class DownloadsPage(QWidget):
         paste_card.body.addWidget(self.folder_hint)
         layout.addWidget(paste_card)
 
-        self.preview = PreviewCard()
-        self.preview.hide()
-        for preset in presets.PRESETS:
-            self.preview.preset_combo.addItem(preset.label, preset.id)
-        self.preview.preset_combo.setCurrentIndex(
-            self.preview.preset_combo.findData(presets.DEFAULT_PRESET_ID)
-        )
+        self.result_card = ResultCard()
+        self.result_card.hide()
         self._build_advanced_section()
-        layout.addWidget(self.preview)
+        layout.addWidget(self.result_card)
 
         self.playlist_card = PlaylistCard()
         self.playlist_card.hide()
@@ -665,10 +719,8 @@ class DownloadsPage(QWidget):
         self.paste_button.clicked.connect(self._paste)
         self.analyze_cancel_button.clicked.connect(self.cancel_analyze)
         self.login_button.clicked.connect(self.offer_site_login)
-        self.preview.preset_combo.currentIndexChanged.connect(self._update_options)
-        self.preview.crop_check.toggled.connect(self._update_cover)
-        self.preview.download_button.clicked.connect(self.start_download)
-        self.preview.playlist_button.clicked.connect(self.open_playlist)
+        self.result_card.download_requested.connect(self.start_row_download)
+        self.result_card.playlist_button.clicked.connect(self.open_playlist)
         self.clear_queue_button.clicked.connect(self.clear_finished_jobs)
         self.playlist_card.download_button.clicked.connect(self.start_playlist_download)
         self.gallery_card.download_button.clicked.connect(self.start_gallery_download)
@@ -701,17 +753,16 @@ class DownloadsPage(QWidget):
 
     # ── advanced formats ─────────────────────────────────────────────────────────────────
     def _build_advanced_section(self) -> None:
-        """The "All formats" disclosure, added to the preview card above its buttons.
+        """The "All formats" disclosure, added to the bottom of the Result card.
 
-        It lives here rather than in PreviewCard because it is filled from analyze results and
-        is deliberately read-only: it reports what the site offers, and the download still uses
-        the preset chosen above it.
+        It is filled from the analyze result and is read-only: it reports every stream the site
+        offers. Downloads come from the Video / Audio / Image rows above it.
         """
         self.advanced_button = QPushButton("▸  All formats")
         self.advanced_button.setCheckable(True)
         self.advanced_button.setToolTip("Show every format this site offers for this video")
         self.advanced_note = QLabel(
-            "What the site offers. Downloads use the preset above, not a row here."
+            "Every stream the site offers. Download from a row above."
         )
         self.advanced_note.setObjectName("muted")
         self.advanced_note.setWordWrap(True)
@@ -739,20 +790,18 @@ class DownloadsPage(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.addWidget(self.advanced_button)
         row.addStretch(1)
-        # The card's own layout is top / grid / buttons, so the disclosure goes before buttons.
-        self.preview.body.insertLayout(self.preview.body.count() - 1, row)
-        self.preview.body.insertWidget(self.preview.body.count() - 1, self.advanced_box)
+        self.result_card.body.addLayout(row)
+        self.result_card.body.addWidget(self.advanced_box)
         self.advanced_button.toggled.connect(self._toggle_advanced)
 
     def _toggle_advanced(self, shown: bool) -> None:
         self.advanced_box.setVisible(shown and self.advanced_table.rowCount() > 0)
         self.advanced_button.setText("▾  All formats" if shown else "▸  All formats")
 
-    def _site_label(self, info: dict[str, Any]) -> str:
-        """Which site this came from, for a link that is not YouTube. "" when it is."""
-        if self._route is None or self._route.is_youtube:
-            return ""
-        site = info.get("extractor")
+    @staticmethod
+    def _site_label(info: dict[str, Any]) -> str:
+        """The MediaResult's site name, as one short plain cell; "" when it has none."""
+        site = info.get("site")
         return _cell(site, SITE_LIMIT) if isinstance(site, str) and site.strip() else ""
 
     def _fill_advanced(self, info: dict[str, Any]) -> None:
@@ -862,9 +911,6 @@ class DownloadsPage(QWidget):
             return False
         return True
 
-    def selected_preset(self) -> presets.Preset:
-        return presets.get(self.preview.preset_combo.currentData())
-
     def _reset_route_preset(self, combo: QComboBox, *, playlist_mode: bool = False) -> None:
         """Choose a fresh default for this analyzed route; never inherit the previous link's UI."""
         preset_id = (
@@ -882,7 +928,7 @@ class DownloadsPage(QWidget):
             return
         route = router.route(self.url_edit.text())
         if not route.ok:
-            self.preview.hide()
+            self.result_card.hide()
             self._show_message(route.reason, error=True)
             return
         if route.note:
@@ -895,7 +941,7 @@ class DownloadsPage(QWidget):
     def _start_analyze(self, route: router.Route) -> None:
         self._info = {}
         self._listing = None
-        self.preview.hide()
+        self.result_card.hide()
         self.playlist_card.hide()
         self.gallery_card.hide()
         self._gallery = None
@@ -975,40 +1021,51 @@ class DownloadsPage(QWidget):
                 self._login_site = cookies.site_key(route.url)
                 self.login_button.setVisible(bool(self._login_site))
             return
-        result = event.data
+        try:
+            result = validate_media_result(event.data)
+        except ProtocolError:
+            self._show_message(
+                "The downloader sent a result this version cannot read.", error=True
+            )
+            return
         self._show_message("")
-        # Until the result card (R2) draws every kind itself, the existing cards are picked by
-        # the engine that answered: a gallery-dl post with one photo is kind "image" but is
-        # still downloaded through the gallery card.
-        route = self._route
-        if route is not None and route.is_spotify:
+        # Chosen by what the link holds, never by the engine or route that read it (§5.2).
+        kind = result["kind"]
+        if kind == "playlist" and result.get("spotify_kind"):
             self.show_spotify(result)
-        elif result.get("kind") == "playlist":
+        elif kind == "playlist":
             self.show_playlist(result)
-        elif route is not None and route.is_gallery:
+        elif kind == "gallery":
             self.show_gallery(result)
         else:
-            self.show_preview(result)
+            self.show_result(result)
 
-    def show_preview(self, info: dict[str, Any]) -> None:
+    def show_result(self, info: dict[str, Any]) -> None:
+        """Draw one video, song or image (plan §5.8) from its MediaResult."""
         self._info = info
-        card = self.preview
-        # Title, uploader and site name are written by whoever owns the page. Since M3 that can
-        # be any site, so the labels are pinned to plain text: a title containing markup is
-        # shown as the characters it is, never rendered as rich text.
-        for label in (card.title_label, card.meta_label, card.playlist_label):
-            label.setTextFormat(Qt.TextFormat.PlainText)
+        card = self.result_card
         title = info.get("title")
-        card.title_label.setText(
+        card.title_editor.set_title(
             _cell(title, TITLE_LIMIT) if isinstance(title, str) and title.strip() else "Untitled"
         )
-        card.title_label.setToolTip(plain_tooltip(card.title_label.text()))
         meta = [
-            str(info.get("artist") or info.get("uploader") or ""),
+            _cell(info.get("artist") or info.get("uploader"), TITLE_LIMIT)
+            if isinstance(info.get("artist") or info.get("uploader"), str)
+            else "",
             format_duration(info.get("duration")),
             self._site_label(info),
         ]
-        card.meta_label.setText("  ·  ".join(m for m in meta if m))
+        card.meta_label.setText("  ·  ".join(m for m in meta if m and m != "—"))
+        card.source_label.setText(source_audio_text(info.get("source_audio")))
+        card.source_label.setVisible(bool(card.source_label.text()))
+        card.audio_note.setText(
+            "Tags and a cover are always added (WAV gets tags only). "
+            + (
+                "Higher MP3 bitrates do not add quality."
+                if card.source_label.text()
+                else ""
+            )
+        )
         route = self._route
         has_playlist = bool(route and route.playlist_id)
         refusal = route.playlist_reason if route else ""
@@ -1020,8 +1077,7 @@ class DownloadsPage(QWidget):
             card.playlist_label.setText(refusal)
 
         self._thumb = None
-        # "preview" is the MediaResult field; "thumbnail" is what pre-R1 results carried.
-        thumb = info.get("preview") or info.get("thumbnail")
+        thumb = info.get("preview")
         if isinstance(thumb, dict) and isinstance(thumb.get("data"), str):
             try:
                 # Byte- and pixel-capped: a direct image link sends the image itself here.
@@ -1030,75 +1086,21 @@ class DownloadsPage(QWidget):
                 image = None
             if image is not None:
                 self._thumb = QPixmap.fromImage(image)
-
-        is_file = bool(route and route.is_file)
-        self._fill_presets(file=is_file)
-        is_image = is_file and str(info.get("ext") or "").lower() in presets.IMAGE_EXTENSIONS
-        card.image_format_label.setVisible(is_image)
-        card.image_format_combo.setVisible(is_image)
-        card.image_format_combo.setCurrentIndex(0)  # each link starts as "Original"
-        if is_file and _is_number(info.get("filesize")):
-            parts = (self._site_label(info), format_bytes(info["filesize"]))
-            card.meta_label.setText("  ·  ".join(m for m in parts if m))
-        route_url = self._route.url if self._route else ""
-        # A hint only: an untouched name field keeps the worker's default file name.
-        card.name_edit.clear()
-        card.name_edit.setPlaceholderText(safe_job_title(info.get("title"), route_url))
-        raw_formats = info.get("formats")
-        self._choices = formats.resolution_choices(
-            raw_formats if isinstance(raw_formats, list) else []
-        )
-        self._reset_route_preset(card.preset_combo)
-        self._fill_advanced(info)
-        self._update_options()
-        card.show()
-
-    def _fill_presets(self, file: bool) -> None:
-        """A direct file has one preset; a video page has the yt-dlp ones."""
-        combo = self.preview.preset_combo
-        wanted = [presets.FILE_PRESET] if file else list(presets.PRESETS)
-        if [combo.itemData(i) for i in range(combo.count())] == [p.id for p in wanted]:
-            return
-        combo.blockSignals(True)
-        combo.clear()
-        for preset in wanted:
-            combo.addItem(preset.label, preset.id)
-        default = presets.FILE_PRESET.id if file else presets.DEFAULT_PRESET_ID
-        combo.setCurrentIndex(max(0, combo.findData(default)))
-        combo.blockSignals(False)
-
-    def _update_options(self) -> None:
-        preset = presets.get(self.preview.preset_combo.currentData())
-        combo = self.preview.resolution_combo
-        combo.clear()
-        combo.addItem("Auto / Best", AUTO_HEIGHT)
-        if preset.picks_resolution:
-            for choice in getattr(self, "_choices", []):
-                if preset.max_height is None or choice.height <= preset.max_height:
-                    combo.addItem(choice.label, choice.height)
-        combo.setEnabled(preset.picks_resolution)
-        self.preview.compatible_check.setVisible(preset.picks_resolution)
-        self.preview.crop_check.setVisible(preset.id in ("mp3_music", "thumbnail"))
-        self._update_cover()
-
-    def _update_cover(self) -> None:
-        cover = self.preview.cover
+        cover = card.cover
         if self._thumb is None:
             cover.setPixmap(QPixmap())
-            cover.setText("🎞")
-            return
-        preset = presets.get(self.preview.preset_combo.currentData())
-        pixmap = self._thumb
-        if preset.id in ("mp3_music", "thumbnail") and self.preview.crop_check.isChecked():
-            pixmap = square_crop(pixmap)
-        cover.setPixmap(
-            pixmap.scaled(
-                cover.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
+            cover.setText("🎵" if info.get("kind") == "audio" else "🎞")
+        else:
+            cover.setPixmap(
+                self._thumb.scaled(
+                    cover.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
             )
-        )
-
+        card.set_result(info, {tab: result_rows(info, tab) for tab in ("video", "audio", "image")})
+        self._fill_advanced(info)
+        card.show()
 
     # ── playlists ────────────────────────────────────────────────────────────────────────
     def open_playlist(self) -> None:
@@ -1127,7 +1129,7 @@ class DownloadsPage(QWidget):
             box = card.checkbox(row)
             if box is not None:
                 box.toggled.connect(self._update_playlist_selection)
-        self.preview.hide()
+        self.result_card.hide()
         card.show()
 
     def _set_playlist_selection(self, checked: bool) -> None:
@@ -1212,7 +1214,7 @@ class DownloadsPage(QWidget):
         card.set_items(listing.items)
         card.grid.blockSignals(False)
         self._update_gallery_selection()
-        self.preview.hide()
+        self.result_card.hide()
         self.playlist_card.hide()
         card.show()
 
@@ -1278,7 +1280,7 @@ class DownloadsPage(QWidget):
             if box is not None:
                 box.toggled.connect(self._update_spotify_selection)
         self._update_spotify_selection()
-        self.preview.hide()
+        self.result_card.hide()
         self.playlist_card.hide()
         self.gallery_card.hide()
         if not listing.tracks:
@@ -1595,7 +1597,7 @@ class DownloadsPage(QWidget):
         self.queue_layout.insertWidget(0, job_card)
         job_card.set_state(JOB_CHIPS["queued"], "queued")
         job_card.set_draggable(True)
-        job_card.details_label.setText(_preset(spec.options["preset"]).label)
+        job_card.details_label.setText(job_label(spec.options))
         self._record_job(spec, title, group_id)
         return job
 
@@ -1683,11 +1685,7 @@ class DownloadsPage(QWidget):
                     record.job_id, "failed", error_message=LINK_REDACTED_REASON
                 )
                 continue
-            if not isinstance(record.options.get("preset"), str):
-                continue
-            try:
-                _preset(record.options["preset"])
-            except ValueError:
+            if not known_options(record.options):
                 continue
             spec = JobSpec(
                 job_id=record.job_id,
@@ -1715,25 +1713,19 @@ class DownloadsPage(QWidget):
         return jobs
 
     # ── downloads ────────────────────────────────────────────────────────────────────────
-    def start_download(self) -> QueuedJob | None:
+    def start_row_download(self, tab: str, row_id: str) -> QueuedJob | None:
+        """Queue one row of the Result card: {tab, row_id, container, edited_title} (§8 R2)."""
         if self._route is None or not self._route.ok or not self._info:
             return None
-        card = self.preview
-        if self._route.is_file:
-            image_format = (
-                card.image_format_combo.currentData()
-                if not card.image_format_combo.isHidden()
-                else None
-            )
-            options = presets.file_download_options(card.name_edit.text(), image_format)
-        else:
-            options = presets.download_options(
-                card.preset_combo.currentData(),
-                card.resolution_combo.currentData(),
-                compatible=card.compatible_check.isChecked(),
-                crop_cover=card.crop_check.isChecked(),
-                output_name=card.name_edit.text(),
-            )
+        card = self.result_card
+        if row_id not in {str(r.get("id")) for r in card.rows(tab)}:
+            return None
+        container = {"video": card.container(), "image": card.image_format()}.get(tab)
+        edited = card.title_editor.edited_title()
+        try:
+            options = presets.row_download_options(tab, row_id, container, edited)
+        except ValueError:
+            return None
         spec = JobSpec(
             job_id=uuid.uuid4().hex,
             engine=self._route.engine,
@@ -1741,12 +1733,22 @@ class DownloadsPage(QWidget):
             output_dir=str(self._settings.effective_download_dir()),
             options=options,
         )
-        job = self._add_job(spec, safe_job_title(self._info.get("title"), self._route.url))
+        title = edited or self._info.get("title")
+        job = self._add_job(spec, safe_job_title(title, self._route.url))
         if self._thumb is not None:  # the analyzed cover, or the direct image itself
             job.card.set_thumbnail(self._thumb.toImage())
         self.empty_state.hide()
         self.scheduler.submit(spec)
         return job
+
+    def start_download(self) -> QueuedJob | None:
+        """Download the ★ row of the tab on show (the first row when none is marked)."""
+        tab = self.result_card.current_tab()
+        rows = self.result_card.rows(tab) if tab else []
+        if not rows:
+            return None
+        row = next((r for r in rows if r.get("default") is True), rows[0])
+        return self.start_row_download(tab, str(row.get("id")))
 
     def download_again(self, record: history.JobRecord) -> QueuedJob | None:
         """Queue a fresh job from a history row. The historical record is left untouched.
@@ -1754,8 +1756,7 @@ class DownloadsPage(QWidget):
         The new job gets its own id and no group: it is a download of the same link, not a
         re-run of the playlist the original belonged to.
         """
-        preset_id = record.options.get("preset")
-        if not record.url or not isinstance(preset_id, str):
+        if not record.url or not known_options(record.options):
             return None
         if record.url_redacted:
             # The stored link names the page but not the video. Hand it back as a starting
@@ -1763,10 +1764,6 @@ class DownloadsPage(QWidget):
             # thing or fail with something they cannot act on.
             self.url_edit.setText(record.url)
             self._show_message(LINK_REDACTED_REASON, error=True)
-            return None
-        try:
-            _preset(preset_id)
-        except ValueError:
             return None
         spec = JobSpec(
             job_id=uuid.uuid4().hex,
@@ -1800,7 +1797,7 @@ class DownloadsPage(QWidget):
         job.state = "active"
         card.set_draggable(False)
         card.set_state("Starting", "active")
-        card.details_label.setText(_preset(job.spec.options["preset"]).label)
+        card.details_label.setText(job_label(job.spec.options))
         card.cancel_button.setEnabled(True)
         card.cancel_button.show()
         self.store.set_state(job.spec.job_id, "active")
@@ -2298,11 +2295,11 @@ class HistoryPage(QWidget):
 
     @staticmethod
     def _record_type(record: history.JobRecord) -> str:
-        """Classify a saved job from its persisted preset without trusting arbitrary text."""
-        try:
-            return _preset(record.preset).kind
-        except ValueError:
-            return ""
+        """Classify a saved job from its persisted options without trusting arbitrary text."""
+        options = dict(record.options or {})
+        if not presets.is_row_options(options):
+            options["preset"] = record.preset
+        return job_kind(options)
 
     def selected_record(self) -> history.JobRecord | None:
         row = self.table.currentRow()

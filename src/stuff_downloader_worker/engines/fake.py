@@ -30,7 +30,53 @@ class FakeEngine:
             emit("stage", {"stage": "analyzing"})
             emit("stage", {"stage": "completed"})
             return media_result(
-                "video", ["video", "audio", "image"], "Fake video", job.url, site="Fake"
+                "video",
+                ["video", "audio", "image"],
+                "Fake video",
+                job.url,
+                site="Fake",
+                duration=60,
+                video_rows=[
+                    {
+                        "id": "v:1080:mp4",
+                        "height": 1080,
+                        "vcodec": "H.264",
+                        "container": "mp4",
+                        "size": 20_000_000,
+                        "size_is_estimate": True,
+                        "default": True,
+                    },
+                    {
+                        "id": "v:720:mp4",
+                        "height": 720,
+                        "vcodec": "H.264",
+                        "container": "mp4",
+                        "size": 9_000_000,
+                        "size_is_estimate": True,
+                    },
+                ],
+                audio_rows=[
+                    {
+                        "id": "a:mp3:320",
+                        "label": "MP3",
+                        "codec": "mp3",
+                        "bitrate": 320,
+                        "size": 2_400_000,
+                        "size_is_estimate": True,
+                        "default": True,
+                    },
+                    {
+                        "id": "a:wav",
+                        "label": "WAV",
+                        "codec": "wav",
+                        "size": 11_520_000,
+                        "size_is_estimate": True,
+                        "no_cover": True,
+                        "lossless_note": "uncompressed · no embedded cover",
+                    },
+                ],
+                image_rows=[{"id": "i:1280x720", "width": 1280, "height": 720, "default": True}],
+                source_audio={"codec": "Opus", "abr_kbps": 160},
             )
         if mode != "download":
             raise EngineError("bad_options", f"unknown mode {mode!r}")

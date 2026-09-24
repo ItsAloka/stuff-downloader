@@ -8,7 +8,7 @@ import json
 import pytest
 from PyQt6.QtCore import Qt
 
-from stuff_downloader.core import cookies, settings, tools
+from stuff_downloader.core import cookies, protocol, settings, tools
 from stuff_downloader.core.protocol import Event, JobSpec
 from stuff_downloader.gui import pages
 from stuff_downloader.gui.main_window import MainWindow
@@ -68,14 +68,17 @@ def gallery_result(n=4):
         for i in range(1, n + 1)
     ]
     items[0]["thumbnail"] = {"data": _png()}
-    return {
-        "kind": "gallery",
-        "title": "Sunset at the beach",
-        "uploader": "some.user",
-        "extractor": "Instagram",
-        "items": items,
-        "truncated": False,
-    }
+    return protocol.media_result(
+        "gallery",
+        ["gallery"],
+        "Sunset at the beach",
+        URL,
+        uploader="some.user",
+        site="Instagram",
+        extractor="Instagram",
+        items=items,
+        truncated=False,
+    )
 
 
 def _analyzed(page, runs, qtbot, url=URL):
@@ -101,7 +104,7 @@ def test_a_gallery_shows_a_checkable_grid_with_everything_selected(page, runs, q
     assert "some.user" in card.meta_label.text() and "4 items" in card.meta_label.text()
     assert not card.grid.item(0).icon().isNull()  # the preview became an icon
     assert card.grid.item(1).icon().isNull() and "🎞" in card.grid.item(1).text()
-    assert page.preview.isHidden() and card.selection_label.text() == "4 selected"
+    assert page.result_card.isHidden() and card.selection_label.text() == "4 selected"
 
 
 def test_download_sends_exactly_the_ticked_positions(page, runs, qtbot):
@@ -201,16 +204,27 @@ def test_restored_gallery_jobs_come_back_paused(qtbot, monkeypatch, runs, tmp_pa
     assert isinstance(job.spec, JobSpec) and runs == []
 
 
-def test_a_one_photo_post_still_opens_in_the_gallery_card(page, runs, qtbot):
-    """kind "image" from gallery-dl: the card is chosen by the answering engine until R2."""
-    from stuff_downloader.core import protocol
-
+def test_a_one_photo_post_opens_in_the_result_card_and_downloads_through_gallery_dl(
+    page, runs, qtbot
+):
+    """kind "image": the card is chosen by what the post holds, not by the engine (R2)."""
     page.url_edit.setText(URL)
     page.analyze()
     result = protocol.media_result(
         "image", ["image"], "One photo", URL, site="Instagram", extractor="Instagram",
         items=[{"index": 1, "kind": "image", "ext": "jpg"}], truncated=False,
+        image_rows=[{"id": "i:orig", "original": True, "ext": "jpg", "default": True}],
     )  # fmt: skip
     runs[-1].emit("result", **result)
-    qtbot.waitUntil(lambda: not page.gallery_card.isHidden())
-    assert page.preview.isHidden()
+    qtbot.waitUntil(lambda: not page.result_card.isHidden())
+    assert page.gallery_card.isHidden()
+    card = page.result_card
+    card.image_format_combo.setCurrentIndex(card.image_format_combo.findData("png"))
+    job = page.start_row_download("image", "i:orig")
+    assert job.spec.engine == "gallerydl"
+    assert job.spec.options == {
+        "mode": "download",
+        "tab": "image",
+        "row_id": "i:orig",
+        "container": "png",
+    }

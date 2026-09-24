@@ -250,3 +250,229 @@ def build_ydl_opts(request: DownloadRequest, output_dir: str) -> dict[str, Any]:
     if request.crop_cover and request.preset in ("mp3_music", "thumbnail"):
         opts["postprocessor_args"] = {"thumbnailsconvertor+ffmpeg_o": list(SQUARE_CROP_ARGS)}
     return opts
+
+
+# ── Result-card rows (plan §5.4, §8 R2) ─────────────────────────────────────────────────────
+# The Result card sends {tab, row_id, container, edited_title} for one row. Row ids are ours
+# (v:1080:mp4, a:mp3:320, i:1280x720); nothing the site named reaches yt-dlp. They are checked
+# here and turned into fixed selectors and postprocessors, like the presets above.
+ROW_TABS = ("video", "audio", "image")
+VIDEO_CONTAINERS = ("mp4", "mkv", "webm", "mov", "avi")
+REENCODE_CONTAINERS = frozenset({"mov", "avi"})
+IMAGE_FORMATS = ("original", "jpg", "png", "webp")
+MP3_BITRATES = (320, 256, 192, 128, 64)
+AUDIO_ROW_IDS = (*(f"a:mp3:{b}" for b in MP3_BITRATES), "a:m4a", "a:opus", "a:flac", "a:wav")
+MAX_ROW_HEIGHT = 8640
+MAX_EDITED_TITLE = 300
+_VIDEO_ROW = re.compile(r"v:([1-9][0-9]{0,3}):(mp4|webm)")
+_IMAGE_ROW = re.compile(r"i:(orig|best|([1-9][0-9]{0,4})x([1-9][0-9]{0,4}))")
+# The direct-file engine's single row per tab: the file as the site serves it.
+ORIGINAL_ROW_IDS = {"video": "v:orig", "audio": "a:orig", "image": "i:orig"}
+
+VIDEO_ROW_OUTTMPL = "%(title).150B.%(ext)s"
+# An AAC source is copied into M4A; anything else is encoded at this quality.
+M4A_TRANSCODE_KBPS = "256"
+
+
+@dataclass(frozen=True)
+class RowRequest:
+    tab: str
+    row_id: str
+    container: str | None
+    edited_title: str | None
+    height: int | None = None
+    source_ext: str | None = None  # a video row's source stream container
+    image_size: tuple[int, int] | None = None
+    # What the rest of the engine keys on: the legacy preset this row belongs to.
+    preset: str = ""
+    archive: bool = False
+    playlist_index: int | None = None
+    playlist_title: str | None = None
+    playlist_count: int | None = None
+
+    @property
+    def in_playlist(self) -> bool:
+        return False
+
+    @property
+    def audio_codec(self) -> str | None:
+        """mp3, m4a, opus, flac or wav for an audio row; None otherwise."""
+        return self.row_id.split(":")[1] if self.tab == "audio" else None
+
+    @property
+    def mp3_bitrate(self) -> int | None:
+        parts = self.row_id.split(":")
+        return int(parts[2]) if self.tab == "audio" and parts[1] == "mp3" else None
+
+
+def is_row_request(options: dict[str, Any]) -> bool:
+    return "row_id" in options
+
+
+def parse_row_request(options: dict[str, Any], *, original_only: bool = False) -> RowRequest:
+    """One Result-card row request, validated. ``original_only`` is the direct-file engine,
+    which has exactly one row per tab (``v:orig``, ``a:orig``, ``i:orig``)."""
+    allowed = {"mode", "tab", "row_id", "container", "edited_title"}
+    unknown = set(options) - allowed
+    if unknown:
+        raise EngineError("bad_options", f"unknown options: {sorted(unknown)}")
+    tab, row_id = options.get("tab"), options.get("row_id")
+    if tab not in ROW_TABS:
+        raise EngineError("bad_options", f"unknown tab {tab!r}")
+    if not isinstance(row_id, str) or not row_id.startswith(tab[0] + ":"):
+        raise EngineError("bad_options", f"row {row_id!r} is not on the {tab} tab")
+    container = options.get("container")
+    edited = options.get("edited_title")
+    if edited is not None and (not isinstance(edited, str) or len(edited) > MAX_EDITED_TITLE):
+        raise EngineError("bad_options", "'edited_title' must be a short string")
+    fields: dict[str, Any] = {}
+    if original_only:
+        if row_id != ORIGINAL_ROW_IDS[tab]:
+            raise EngineError("bad_options", f"unknown row {row_id!r}")
+    elif tab == "video":
+        match = _VIDEO_ROW.fullmatch(row_id)
+        if not match or int(match.group(1)) > MAX_ROW_HEIGHT:
+            raise EngineError("bad_options", f"unknown row {row_id!r}")
+        fields = {"height": int(match.group(1)), "source_ext": match.group(2)}
+    elif tab == "audio":
+        if row_id not in AUDIO_ROW_IDS:
+            raise EngineError("bad_options", f"unknown row {row_id!r}")
+    else:
+        match = _IMAGE_ROW.fullmatch(row_id)
+        if not match:
+            raise EngineError("bad_options", f"unknown row {row_id!r}")
+        if match.group(2):
+            fields["image_size"] = (int(match.group(2)), int(match.group(3)))
+    if tab == "video":
+        if container not in VIDEO_CONTAINERS:
+            raise EngineError("bad_options", "'container' must be mp4, mkv, webm, mov or avi")
+    elif tab == "image":
+        if container not in IMAGE_FORMATS:
+            raise EngineError("bad_options", "'container' must be original, jpg, png or webp")
+    elif container is not None:
+        raise EngineError("bad_options", "an audio row takes no container")
+    preset = {"video": "video_best", "image": "thumbnail"}.get(tab) or (
+        "mp3_music" if row_id.startswith("a:mp3:") else "audio_original"
+    )
+    return RowRequest(
+        tab=tab,
+        row_id=row_id,
+        container=container,
+        edited_title=safe_output_name(edited),
+        preset=preset,
+        **fields,
+    )
+
+
+def row_video_format(height: int, source_ext: str, container: str) -> str:
+    """The row's height in its source container first, then that height in anything, then
+    the best below it. A WebM file prefers WebM audio so it stays a remux. An MP4 row asks for
+    H.264 first: that is the stream the catalog shows for the height when one exists, and
+    yt-dlp's own "best" MP4 would otherwise be AV1."""
+    h = f"[height={height}]"
+    audio = "ba[ext=webm]" if container == "webm" else "ba[ext=m4a]"
+    avc = [f"bv*{h}[ext=mp4][vcodec^=avc1]+{audio}"] if source_ext == "mp4" else []
+    return "/".join(
+        [
+            *avc,
+            f"bv*{h}[ext={source_ext}]+{audio}",
+            f"bv*{h}[ext={source_ext}]+ba",
+            f"bv*{h}+ba",
+            f"b{h}",
+            f"bv*[height<={height}]+ba",
+            f"b[height<={height}]",
+            "bv*+ba",
+            "b",
+        ]
+    )
+
+
+def needs_reencode(container: str, source_ext: str | None) -> bool:
+    """True when saving as ``container`` re-encodes the video (plan §5.4)."""
+    if container in REENCODE_CONTAINERS:
+        return True
+    return container == "webm" and source_ext not in (None, "webm")
+
+
+def build_row_opts(request: RowRequest, output_dir: str) -> dict[str, Any]:
+    """yt-dlp options for one Result-card row (plan §8 R2). Built from fixed values only."""
+    opts: dict[str, Any] = {
+        "noplaylist": True,
+        "windowsfilenames": True,
+        "paths": {"home": output_dir},
+    }
+    named = literal_outtmpl(request.edited_title) if request.edited_title else None
+    if request.tab == "video":
+        container = request.container or "mp4"
+        if container in ("mp4", "mkv"):
+            merge = container
+            # A single progressive file is never merged; the remuxer moves it into place.
+            postprocessor = {"key": "FFmpegVideoRemuxer", "preferedformat": container}
+        else:
+            # WebM merges only VP9/AV1 with Opus/Vorbis; anything else lands in MKV and the
+            # converter re-encodes it, as do MOV and AVI (the row says "re-encodes, slower").
+            merge = "webm/mkv" if container == "webm" else "mkv"
+            postprocessor = {"key": "FFmpegVideoConvertor", "preferedformat": container}
+        opts.update(
+            {
+                "format": row_video_format(
+                    request.height or 1080, request.source_ext or "mp4", container
+                ),
+                "merge_output_format": merge,
+                "outtmpl": named or VIDEO_ROW_OUTTMPL,
+                "postprocessors": [postprocessor],
+            }
+        )
+        return opts
+    if request.tab == "audio":
+        codec = request.audio_codec or "mp3"
+        extract: dict[str, Any] = {"key": "FFmpegExtractAudio", "preferredcodec": codec}
+        if codec == "mp3":
+            fmt = "bestaudio/best"
+            extract["preferredquality"] = str(request.mp3_bitrate or 320)
+        elif codec == "m4a":
+            fmt = "bestaudio[acodec^=mp4a]/bestaudio/best"
+            extract["preferredquality"] = M4A_TRANSCODE_KBPS
+        elif codec == "opus":
+            fmt = "bestaudio[acodec=opus]/bestaudio/best"
+        else:  # flac, wav: lossless containers of the best source
+            fmt = "bestaudio/best"
+        # Tags always; a cover for every format that can hold one (WAV cannot, reliably).
+        embeds_cover = codec != "wav"
+        postprocessors: list[dict[str, Any]] = [
+            extract,
+            {"key": "FFmpegMetadata", "add_metadata": True},
+        ]
+        if embeds_cover:
+            postprocessors = [
+                {"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"},
+                *postprocessors,
+                {"key": "EmbedThumbnail", "already_have_thumbnail": False},
+            ]
+            # Native square covers are unchanged by the crop; anything else is centre-cropped.
+            opts["postprocessor_args"] = {"thumbnailsconvertor+ffmpeg_o": list(SQUARE_CROP_ARGS)}
+        opts.update(
+            {
+                "format": fmt,
+                "outtmpl": named or MUSIC_OUTTMPL,
+                "writethumbnail": embeds_cover,
+                "postprocessors": postprocessors,
+            }
+        )
+        return opts
+    # image: the chosen thumbnail, saved as it is or converted
+    fmt = request.container or "original"
+    postprocessors = []
+    if fmt != "original":
+        postprocessors.append(
+            {"key": "FFmpegThumbnailsConvertor", "format": fmt, "when": "before_dl"}
+        )
+    opts.update(
+        {
+            "skip_download": True,
+            "writethumbnail": True,
+            "outtmpl": named or VIDEO_ROW_OUTTMPL,
+            "postprocessors": postprocessors,
+        }
+    )
+    return opts

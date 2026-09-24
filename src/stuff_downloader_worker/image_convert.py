@@ -1,4 +1,4 @@
-"""Local image format conversion (item 6): Original / JPG / PNG, done with the bundled ffmpeg.
+"""Local image format conversion (item 6, R2): Original / JPG / PNG / WebP, with the bundled ffmpeg.
 
 Only the runner-provided ffmpeg is used (``engines.ytdlp.trusted_tool``), never one found on
 PATH. ffmpeg gets an argument list, no shell, no stdin and a timeout. The output is written to a
@@ -26,8 +26,8 @@ from .engines.base import EngineError
 from .engines.http import move_into_place
 from .engines.ytdlp import trusted_tool
 
-FORMATS = ("original", "jpg", "png")
-_EXTENSIONS = {"jpg": (".jpg", ".jpeg"), "png": (".png",)}
+FORMATS = ("original", "jpg", "png", "webp")
+_EXTENSIONS = {"jpg": (".jpg", ".jpeg"), "png": (".png",), "webp": (".webp",)}
 _BACKGROUND = re.compile(r"#[0-9a-fA-F]{6}")
 TIMEOUT = 120
 FIRST_FRAME_NOTE = "Animated image: only the first frame was kept."
@@ -66,6 +66,8 @@ def _ffmpeg_args(ffmpeg: Path, source: Path, output: Path, fmt: str, background:
             "[bg][fg]overlay=format=auto,format=yuvj444p"
         )
         args += ["-filter_complex", graph, "-q:v", "2"]
+    elif fmt == "webp":
+        args += ["-quality", "90"]  # libwebp; lossy like the WebP most sites serve
     return args + ["-frames:v", "1", "-update", "1", str(output)]
 
 
@@ -143,7 +145,7 @@ def parse_image_options(options: dict) -> tuple[str, str]:
     fmt = options.get("image_format", "original")
     background = options.get("image_background", DEFAULT_BACKGROUND)
     if not isinstance(fmt, str) or fmt not in FORMATS:
-        raise EngineError("bad_options", "'image_format' must be original, jpg or png")
+        raise EngineError("bad_options", "'image_format' must be original, jpg, png or webp")
     if not isinstance(background, str) or not _BACKGROUND.fullmatch(background):
         raise EngineError("bad_options", "'image_background' must be a #rrggbb colour")
     return fmt, background

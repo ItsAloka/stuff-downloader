@@ -1,7 +1,9 @@
 """Direct HTTP engine (plan §2, §M3): a plain media file link, streamed to disk with resume.
 
 Stdlib only, so it runs in any engine env. Options: ``mode`` "analyze" (default) or
-"download"; download also takes ``preset`` = "original_file". Nothing else is accepted.
+"download"; download takes ``preset`` = "original_file", or a Result-card row request
+(``tab``, ``row_id`` = ``v:orig`` / ``a:orig`` / ``i:orig``, ``container``, ``edited_title``).
+Nothing else is accepted.
 
 The URL comes from the owner, and every redirect from the site, so each hop is checked before
 it is fetched: http/https only, no credentials, a public host name, and every address that name
@@ -31,14 +33,16 @@ import os
 import re
 import socket
 import ssl
+import subprocess
 import time
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from email.message import Message
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urljoin, urlsplit
 
+from .. import presets
 from ..names import safe_output_name
 from ..protocol import JobSpec, media_result
 from .base import Emit, EngineError
@@ -377,6 +381,7 @@ def _range_start(resp: http.client.HTTPResponse) -> int | None:
 
 # ── engine ─────────────────────────────────────────────────────────────────────────────────
 
+
 def _image_preview(url: str, emit: Emit) -> bytes | None:
     """The image itself for the analyze preview: same URL checks, ≤5 MB, ≤15 s, or nothing.
 
@@ -404,6 +409,7 @@ def _image_preview(url: str, emit: Emit) -> bytes | None:
         return None
     return b"".join(chunks) if 0 < size <= MAX_PREVIEW_BYTES else None
 
+
 class HttpEngine:
     name = "http"
 
@@ -418,11 +424,16 @@ class HttpEngine:
             raise EngineError("bad_options", f"unknown mode {mode!r}")
         from ..image_convert import IMAGE_OPTION_KEYS, parse_image_options  # (import cycle)
 
-        allowed = {"mode", "preset", "output_name"} | IMAGE_OPTION_KEYS
+        if presets.is_row_request(opts):
+            opts = row_options(presets.parse_row_request(opts, original_only=True))
+            job = replace(job, options=opts)
+        allowed = {"mode", "preset", "output_name", "video_container"} | IMAGE_OPTION_KEYS
         if set(opts) - allowed or opts.get("preset") != PRESET_ID:
             raise EngineError("bad_options", "the direct engine takes only preset=original_file")
         if "output_name" in opts and not isinstance(opts["output_name"], str):
             raise EngineError("bad_options", "'output_name' must be a string")
+        if opts.get("video_container", "original") not in VIDEO_CONTAINERS:
+            raise EngineError("bad_options", "unknown video container")
         parse_image_options(opts)  # refused before any request
         return self._download(job, emit)
 
@@ -459,6 +470,10 @@ class HttpEngine:
             data = _image_preview(url, emit)
             if data is not None:
                 preview = {"data": base64.b64encode(data).decode("ascii")}
+        info.update(file_rows(kind, info["ext"], total))
+        # Extracting audio or a frame from a direct video needs ffprobe/ffmpeg on the link
+        # (plan §5.6, R3); until then a tab is offered only when it has a row.
+        tabs = [t for t in tabs if info.get(f"{t}_rows")]
         return media_result(kind, tabs, stem or name, url, preview=preview, **info)
 
     def _download(self, job: JobSpec, emit: Emit) -> dict[str, Any]:
@@ -567,6 +582,10 @@ class HttpEngine:
         fmt, background = parse_image_options(options)
         (final_name,), notes = finish_images([str(final)], fmt, background, emit)
         final = Path(final_name)  # the converted file when there was a conversion
+        container = options.get("video_container", "original")
+        if container != "original" and final.suffix.lower() != "." + container:
+            emit("stage", {"stage": "converting"})
+            final = convert_video(final, container)
         emit("stage", {"stage": "completed"})
         stem = os.path.splitext(final.name)[0]
         result: dict[str, Any] = {
@@ -579,6 +598,80 @@ class HttpEngine:
         if notes:
             result["notes"] = notes
         return result
+
+
+# ── Result-card rows for a direct file (plan §5.4) ─────────────────────────────────────────
+VIDEO_CONTAINERS = ("original", "mp4", "mkv", "webm", "mov", "avi")
+CONVERT_TIMEOUT = 3600
+
+
+def file_rows(kind: str, ext: str, size: int | None) -> dict[str, list[dict[str, Any]]]:
+    """The one row a direct file has: the file as the site serves it."""
+    row: dict[str, Any] = {
+        "id": presets.ORIGINAL_ROW_IDS[kind],
+        "original": True,
+        "ext": ext,
+        "size": size,
+        "size_is_estimate": False,
+        "default": True,
+    }
+    if kind == "video":
+        row["container"] = ext
+    elif kind == "audio":
+        row.update({"label": ext.upper() or "Audio", "codec": ext})
+    return {f"{kind}_rows": [row]}
+
+
+def row_options(request: presets.RowRequest) -> dict[str, Any]:
+    """A row request in the engine's own option names."""
+    opts: dict[str, Any] = {"mode": "download", "preset": PRESET_ID}
+    if request.edited_title:
+        opts["output_name"] = request.edited_title
+    if request.tab == "image" and request.container not in (None, "original"):
+        opts["image_format"] = request.container
+    if request.tab == "video" and request.container:
+        opts["video_container"] = request.container
+    return opts
+
+
+def convert_video(source: Path, container: str) -> Path:
+    """``source`` saved as ``container`` next to it; the original is removed on success.
+
+    MP4, MKV and WebM are tried as a stream copy first; anything that cannot be copied, and
+    MOV/AVI, is re-encoded with ffmpeg's defaults for that container. Only the runner-provided
+    ffmpeg is used, with an argument list and a timeout.
+    """
+    from .ytdlp import trusted_tool  # (import cycle)
+
+    ffmpeg = trusted_tool("ffmpeg")
+    if ffmpeg is None:
+        raise EngineError("convert_error", "FFmpeg is needed to change the video container")
+    temp = source.with_name(f".{source.stem[:40]}.converting.{container}")
+    attempts = [["-c", "copy"]] if container not in presets.REENCODE_CONTAINERS else []
+    attempts.append([])
+    try:
+        for codec_args in attempts:
+            args = [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-nostdin", "-y"]
+            args += ["-i", str(source), "-map", "0:v?", "-map", "0:a?", *codec_args, str(temp)]
+            try:
+                proc = subprocess.run(
+                    args,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=CONVERT_TIMEOUT,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise EngineError("convert_error", "video conversion timed out") from exc
+            except OSError as exc:
+                raise EngineError("convert_error", "FFmpeg could not be started") from exc
+            if proc.returncode == 0 and temp.is_file() and temp.stat().st_size:
+                final = move_into_place(temp, source.parent, f"{source.stem}.{container}")
+                source.unlink(missing_ok=True)
+                return final
+        raise EngineError("convert_error", f"could not save this video as {container.upper()}")
+    finally:
+        temp.unlink(missing_ok=True)
 
 
 def progress(done: int, total: int | None, offset: int, elapsed: float) -> dict[str, Any]:

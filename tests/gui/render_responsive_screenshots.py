@@ -2,7 +2,9 @@ from __future__ import annotations
 
 # ruff: noqa: E402, I001 -- Qt's platform must be selected before importing PyQt.
 
+import json
 import os
+import tempfile
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -12,14 +14,24 @@ from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QThreadPool
 from PyQt6.QtGui import QColor, QImage, QLinearGradient, QPainter
 from PyQt6.QtWidgets import QApplication
 
-from stuff_downloader.core import router, settings
+from stuff_downloader.core import protocol, router, settings
 from stuff_downloader.gui.pages import DownloadsPage
 from stuff_downloader.gui.theme import STYLE
 from stuff_downloader.gui.widgets import JobCard
+from stuff_downloader_worker.engines import http as worker_http
+from stuff_downloader_worker.engines import ytdlp as worker_ytdlp
 
 
-OUT = Path(__file__).with_name("screenshots")
-SIZES = {"small": (800, 600), "medium": (1280, 800), "maximized": (1920, 1080)}
+# The repo is public and screenshots stay out of it (plan §10): they go to a temp folder, or
+# to STUFF_DOWNLOADER_SCREENSHOTS. Run with QT_SCALE_FACTOR=1.5 for the 150% DPI set.
+OUT = Path(
+    os.environ.get("STUFF_DOWNLOADER_SCREENSHOTS")
+    or Path(tempfile.gettempdir()) / "stuff-downloader-screenshots"
+)
+SCALE = os.environ.get("QT_SCALE_FACTOR", "1")
+SUFFIX = "" if SCALE in ("", "1") else f"-{round(float(SCALE) * 100)}pct"
+SIZES = {"small": (800, 600), "1280x720": (1280, 720), "maximized": (1920, 1080)}
+FIXTURE = Path(__file__).resolve().parents[1] / "unit" / "fixtures" / "youtube_video.json"
 
 
 # The repo is public: screenshots show a neutral folder, never the machine's real one.
@@ -35,7 +47,7 @@ def save(page: DownloadsPage, state: str) -> None:
     for label, size in SIZES.items():
         page.resize(*size)
         QApplication.processEvents()
-        page.grab().save(str(OUT / f"responsive-{state}-{label}.png"))
+        page.grab().save(str(OUT / f"responsive-{state}-{label}{SUFFIX}.png"))
 
 
 app = QApplication.instance() or QApplication([])
@@ -67,38 +79,54 @@ def settle() -> None:
         QApplication.processEvents()
 
 
+def media(url: str, **fields) -> dict:
+    """The recorded yt-dlp page as the worker's own MediaResult (rows included)."""
+    info = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    info.update(fields)
+    preview = {"data": base64.b64encode(fake_thumbnail(url)).decode()}
+    return worker_ytdlp.analyze_result(info, url, preview)
+
+
+import base64  # noqa: E402
+
 page.thumbs.fetcher = fake_thumbnail
-page.show_preview(
-    {
-        "title": "A long analyzed song title that remains readable without covering its controls",
-        "artist": "Example Artist",
-        "duration": 247,
-        "extractor": "youtube",
-        "formats": [],
-    }
+VIDEO = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+page._route = router.route(VIDEO)
+page.show_result(
+    media(
+        VIDEO,
+        title="A long analyzed video title that remains readable without covering its rows",
+        uploader="Example Channel",
+    )
 )
 page.show()
-save(page, "preview")
-page._route = router.route("https://music.youtube.com/watch?v=dQw4w9WgXcQ")
-page.show_preview(
-    {
-        "title": "A YouTube Music song defaults to the MP3 music preset",
-        "artist": "Example Artist",
-        "duration": 247,
-        "extractor": "youtube",
-        "formats": [],
-    }
+save(page, "result-video")
+page.result_card.tabs.setCurrentIndex(1)
+save(page, "result-audio")
+page.result_card.title_editor.start_editing()
+page.result_card.title_editor.edit.setText("My edited file name")
+save(page, "result-title-editing")
+page.result_card.title_editor.edit.editingFinished.emit()
+save(page, "result-title-edited")
+
+SONG = "https://music.youtube.com/watch?v=dQw4w9WgXcQ"
+page._route = router.route(SONG)
+page.show_result(
+    media(SONG, title="A YouTube Music song opens on its Audio tab", artist="Example Artist",
+          track="Example Song")
 )
 save(page, "ytmusic-default")
 
-page.preview.hide()
+page.result_card.hide()
 page.show_playlist(
-    {
-        "kind": "playlist",
-        "id": "PL-example",
-        "title": "Responsive playlist preview",
-        "uploader": "Example Channel",
-        "entries": [
+    protocol.media_result(
+        "playlist",
+        ["tracks"],
+        "Responsive playlist preview",
+        "https://www.youtube.com/playlist?list=PL-example",
+        playlist_id="PL-example",
+        uploader="Example Channel",
+        entries=[
             {
                 "id": f"id{i:09d}",
                 "title": f"Song {i + 1}: a title long enough to demonstrate table sizing",
@@ -107,7 +135,7 @@ page.show_playlist(
             }
             for i in range(12)
         ],
-    }
+    )
 )
 settle()
 save(page, "playlist")
@@ -161,43 +189,47 @@ for card, url in zip(
         card.set_thumbnail(QImage.fromData(fake_thumbnail(url)))
 page.clear_queue_button.setEnabled(True)
 page.queue_summary.setText("1 active  ·  2 done  ·  1 failed")
-page.resize(*SIZES["medium"])
+page.resize(*SIZES["1280x720"])
 neutral(page)
 QApplication.processEvents()
-page.grab().save(str(OUT / "queue-actions-medium.png"))
+page.grab().save(str(OUT / f"queue-actions-medium{SUFFIX}.png"))
 
 # Item 4: a direct image link previews the image itself.
-import base64  # noqa: E402
-
 page.playlist_card.hide()
-page._route = router.route("https://cdn.example.com/photos/sunset.png")
-page.show_preview(
-    {
-        "kind": "file",
-        "title": "sunset",
-        "extractor": "Direct file",
-        "ext": "png",
-        "filesize": 48_213,
-        "formats": [],
-        "thumbnail": {"data": base64.b64encode(fake_thumbnail("sunset")).decode()},
-    }
+SUNSET = "https://cdn.example.com/photos/sunset.png"
+page._route = router.route(SUNSET)
+page.show_result(
+    protocol.media_result(
+        "image",
+        ["image"],
+        "sunset",
+        SUNSET,
+        site="Direct file",
+        ext="png",
+        filesize=48_213,
+        formats=[],
+        preview={"data": base64.b64encode(fake_thumbnail("sunset")).decode()},
+        **worker_http.file_rows("image", "png", 48_213),
+    )
 )
-page.preview.show()
-page.resize(*SIZES["medium"])
+page.resize(*SIZES["1280x720"])
 neutral(page)
 QApplication.processEvents()
-page.grab().save(str(OUT / "direct-image-preview-medium.png"))
+page.grab().save(str(OUT / f"direct-image-preview-medium{SUFFIX}.png"))
 
 # Item 6B: a gallery with its "Save images as" choice.
-page.preview.hide()
-page._route = router.route("https://www.instagram.com/p/ABC123/")
+page.result_card.hide()
+POST = "https://www.instagram.com/p/ABC123/"
+page._route = router.route(POST)
 page.show_gallery(
-    {
-        "kind": "gallery",
-        "title": "Example post",
-        "site": "Instagram",
-        "uploader": "example",
-        "items": [
+    protocol.media_result(
+        "gallery",
+        ["gallery"],
+        "Example post",
+        POST,
+        site="Instagram",
+        uploader="example",
+        items=[
             {
                 "index": i,
                 "kind": "image",
@@ -208,37 +240,43 @@ page.show_gallery(
             }
             for i in range(1, 7)
         ],
-    }
+    )
 )
 page.gallery_card.image_format_combo.setCurrentIndex(1)
-page.resize(*SIZES["medium"])
+page.resize(*SIZES["1280x720"])
 neutral(page)
 QApplication.processEvents()
-page.grab().save(str(OUT / "gallery-format-medium.png"))
+page.grab().save(str(OUT / f"gallery-format-medium{SUFFIX}.png"))
 
 # Item 9: Spotify matches with an uncertain one flagged, and the Change… dialog.
 from stuff_downloader.core import spotify  # noqa: E402
 from stuff_downloader.gui.widgets import MatchDialog  # noqa: E402
 
 page.gallery_card.hide()
-page._route = router.route("https://open.spotify.com/album/4aawyAB9vmqN3uQ7FjRGTy")
+ALBUM = "https://open.spotify.com/album/4aawyAB9vmqN3uQ7FjRGTy"
+page._route = router.route(ALBUM)
+TRACKS = [
+    {"id": f"{i}" * 22, "title": t, "artists": ["Example Artist"], "album": "Example",
+     "duration": d, "explicit": False}
+    for i, (t, d) in enumerate(
+        [("Opening Song", 201.0), ("Second Song", 185.0), ("Third Song", 240.0)], 1
+    )
+]
 page.show_spotify(
-    {
-        "kind": "spotify",
-        "spotify_kind": "album",
-        "spotify_id": "4aawyAB9vmqN3uQ7FjRGTy",
-        "title": "Example album",
-        "owner": "Example Artist",
-        "tracks": [
-            {"id": f"{i}" * 22, "title": t, "artists": ["Example Artist"], "album": "Example",
-             "duration": d, "explicit": False}
-            for i, (t, d) in enumerate(
-                [("Opening Song", 201.0), ("Second Song", 185.0), ("Third Song", 240.0)], 1
-            )
-        ],
-        "skipped": 0,
-        "truncated": False,
-    }
+    protocol.media_result(
+        "playlist",
+        ["tracks"],
+        "Example album",
+        ALBUM,
+        site="Spotify",
+        spotify_kind="album",
+        spotify_id="4aawyAB9vmqN3uQ7FjRGTy",
+        owner="Example Artist",
+        entries=TRACKS,
+        tracks=TRACKS,
+        skipped=0,
+        truncated=False,
+    )
 )
 listing = page._spotify
 results = [
@@ -261,10 +299,10 @@ for row, (track, (vid, title, channel, duration, cands)) in enumerate(
     page._request_spotify_thumb(row, match)
 page._update_uncertain()
 settle()
-page.resize(*SIZES["medium"])
+page.resize(*SIZES["1280x720"])
 neutral(page)
 QApplication.processEvents()
-page.grab().save(str(OUT / "spotify-uncertain-medium.png"))
+page.grab().save(str(OUT / f"spotify-uncertain-medium{SUFFIX}.png"))
 
 second = listing.tracks[1]
 current = page._spotify_matches[second.track_id]
@@ -276,6 +314,6 @@ dialog = MatchDialog(
 dialog.table.selectRow(1)
 dialog.show()
 QApplication.processEvents()
-dialog.grab().save(str(OUT / "spotify-change-dialog.png"))
+dialog.grab().save(str(OUT / f"spotify-change-dialog{SUFFIX}.png"))
 dialog.close()
 page.close()

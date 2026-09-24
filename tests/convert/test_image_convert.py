@@ -106,6 +106,25 @@ def test_jpg_to_png(tmp_path):
 
 
 @needs_ffmpeg
+def test_jpg_to_webp(tmp_path):
+    source = make(tmp_path / "photo.jpg", "color=c=blue:s=8x8", "-frames:v", "1")
+    result = convert(source, "webp")
+    assert result.path == tmp_path / "photo.webp" and result.converted
+    head = result.path.read_bytes()[:12]
+    assert head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+    r, g, b = first_pixel(result.path)
+    assert b > 200 and r < 40 and g < 40
+    assert not source.exists() and leftovers(tmp_path) == []
+
+
+def test_webp_is_an_accepted_image_format_and_a_webp_is_not_reencoded(tmp_path):
+    assert image_convert.parse_image_options({"image_format": "webp"}) == ("webp", "#ffffff")
+    source = tmp_path / "a.webp"
+    source.write_bytes(b"x")
+    assert image_convert.convert_image(source, "webp").path == source
+
+
+@needs_ffmpeg
 def test_keep_original_leaves_the_download_in_place(tmp_path):
     source = transparent_png(tmp_path)
     result = convert(source, "jpg", keep_original=True)

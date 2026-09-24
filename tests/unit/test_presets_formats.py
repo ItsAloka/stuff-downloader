@@ -106,3 +106,59 @@ def test_core_and_worker_preset_ids_match():
 )
 def test_friendly_error_messages(code, message, expected):
     assert expected.lower() in errors.friendly_message(code, message).lower()
+
+
+
+# ── Result-card rows (plan §8 R2) ──────────────────────────────────────────────────────────
+def test_row_options_mirror_the_worker_request():
+    from stuff_downloader_worker import presets as worker_presets
+
+    cases = [
+        ("video", "v:1080:mp4", "mkv", None),
+        ("video", "v:orig", None, "Clip"),
+        ("audio", "a:mp3:320", None, "  Edited  "),
+        ("audio", "a:wav", None, None),
+        ("image", "i:1280x720", "png", None),
+        ("image", "i:orig", None, None),
+    ]
+    for tab, row_id, container, title in cases:
+        options = presets.row_download_options(tab, row_id, container, title)
+        request = worker_presets.parse_row_request(
+            options, original_only=row_id.endswith(":orig")
+        )
+        assert (request.tab, request.row_id) == (tab, row_id)
+    assert presets.row_download_options("video", "v:720:webm") == {
+        "mode": "download",
+        "tab": "video",
+        "row_id": "v:720:webm",
+        "container": "mp4",
+    }
+    assert presets.row_download_options("audio", "a:m4a", None, " x ")["edited_title"] == "x"
+
+
+@pytest.mark.parametrize(
+    ("tab", "row_id", "container"),
+    [
+        ("video", "137", "mp4"),
+        ("video", "v:1080:mp4", "flv"),
+        ("audio", "a:mp3:999", None),
+        ("image", "i:orig", "tiff"),
+        ("gallery", "g:1", None),
+    ],
+)
+def test_row_options_refuse_unknown_rows(tab, row_id, container):
+    with pytest.raises(ValueError):
+        presets.row_download_options(tab, row_id, container)
+
+
+def test_row_labels_name_what_is_saved():
+    label = presets.row_label
+    video = presets.row_download_options("video", "v:1080:mp4", "mkv")
+    assert label(video) == "Video · 1080p · MKV"
+    assert label(presets.row_download_options("audio", "a:mp3:256")) == "MP3 · 256 kbps"
+    assert label(presets.row_download_options("audio", "a:flac")) == "Audio · FLAC"
+    assert (
+        label(presets.row_download_options("image", "i:1280x720", "png"))
+        == "Image · PNG  1280x720"
+    )
+    assert presets.row_kind({"tab": "image"}) == "thumbnail"

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from stuff_downloader.core import settings, spotify, tools
+from stuff_downloader.core import protocol, settings, spotify, tools
 from stuff_downloader.core.protocol import Event
 from stuff_downloader.gui import pages
 from stuff_downloader.gui.main_window import MainWindow
@@ -65,12 +65,12 @@ def track(track_id, title, artists, duration, **extra):
 
 
 def album_result(**extra):
-    return {
-        "kind": "spotify",
+    """The spotdl engine's MediaResult: a playlist whose entries are the tracks."""
+    fields = {
         "spotify_kind": "album",
         "spotify_id": ALBUM,
-        "title": "Global Warming",
         "owner": "Pitbull",
+        "site": "Spotify",
         "tracks": [
             track(T1, "Global Warming", ["Pitbull", "Sensato"], 85.0, explicit=True),
             track(T2, "Don't Stop the Party", ["Pitbull", "TJR"], 206.0),
@@ -80,6 +80,9 @@ def album_result(**extra):
         "truncated": False,
         **extra,
     }
+    fields["entries"] = fields["tracks"]
+    title = fields.pop("title", "Global Warming")
+    return protocol.media_result("playlist", ["tracks"], title, SHARE_URL, **fields)
 
 
 def match_result(track_id, video_id=VID, duration=88.0, confidence=96.0):
@@ -130,7 +133,7 @@ def test_the_listing_shows_every_track_ticked_and_says_the_audio_is_matched(page
     # The disclosure is not optional small print: it is in the card, in plain words.
     text = card.disclosure_label.text()
     assert "never downloaded" in text and "YouTube Music" in text
-    assert page.preview.isHidden() and page.playlist_card.isHidden()
+    assert page.result_card.isHidden() and page.playlist_card.isHidden()
     assert card.selection_label.text() == "3 selected"
 
 

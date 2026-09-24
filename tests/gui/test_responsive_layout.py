@@ -1,10 +1,24 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
+import pytest
 from PyQt6.QtWidgets import QScrollArea, QSizePolicy
 
-from stuff_downloader.core import playlist, settings
+from stuff_downloader.core import playlist, router, settings
 from stuff_downloader.gui.pages import DownloadsPage
-from stuff_downloader.gui.widgets import JobCard, PlaylistCard, PreviewCard, SpotifyCard
+from stuff_downloader.gui.widgets import JobCard, PlaylistCard, ResultCard, SpotifyCard
+from stuff_downloader_worker.engines import ytdlp as worker_ytdlp
+
+FIXTURE = Path(__file__).resolve().parents[1] / "unit" / "fixtures" / "youtube_video.json"
+VIDEO_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+
+
+def _media(**fields):
+    info = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    info.update(fields)
+    return worker_ytdlp.analyze_result(info, VIDEO_URL, None)
 
 
 def _intersects(a, b) -> bool:
@@ -31,19 +45,36 @@ def test_downloads_page_scrolls_instead_of_compressing_cards(qtbot):
     assert all(card.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Minimum for card in cards)
 
 
-def test_preview_cover_and_controls_keep_their_natural_geometry(qtbot):
-    card = PreviewCard()
+def test_result_cover_and_tabs_keep_their_natural_geometry(qtbot):
+    card = ResultCard()
     qtbot.addWidget(card)
-    card.title_label.setText("A very long title " * 12)
+    media = _media(title="A very long title " * 12)
+    card.title_editor.set_title(media["title"])
+    card.set_result(media, {t: media[f"{t}_rows"] for t in ("video", "audio", "image")})
     card.resize(card.minimumSizeHint())
     card.show()
     qtbot.wait(1)
 
-    assert card.cover.size().width() == 160 and card.cover.size().height() == 90
-    assert card.preset_combo.width() >= 220
-    assert card.resolution_combo.width() >= 220
-    assert not _intersects(card.cover, card.preset_combo)
-    assert not _intersects(card.cover, card.resolution_combo)
+    assert card.cover.size().width() == 240 and card.cover.size().height() == 135
+    assert card.tabs.geometry().top() > card.cover.geometry().bottom()
+    assert not _intersects(card.cover, card.title_editor)
+
+
+@pytest.mark.parametrize("width", [1280, 1920])
+def test_the_result_card_never_needs_a_horizontal_scrollbar(qtbot, width):
+    from stuff_downloader.gui.theme import STYLE
+
+    page = DownloadsPage(settings.Settings())
+    qtbot.addWidget(page)
+    page.setStyleSheet(STYLE)
+    page._route = router.route(VIDEO_URL)
+    page.show_result(_media(title="An extremely long title that goes on and on " * 8))
+    page.resize(width - 220, 720 - 60)  # minus the sidebar and the window frame
+    page.show()
+    qtbot.wait(1)
+    assert page.page_scroll.horizontalScrollBar().maximum() == 0
+    for table in page.result_card.tables.values():
+        assert table.horizontalScrollBar().maximum() == 0
 
 
 def test_playlist_controls_are_below_a_six_row_table(qtbot):
@@ -100,12 +131,11 @@ def test_the_scrolling_page_keeps_the_dark_background(qtbot):
     assert image.pixelColor(700, 20).name() == QColor(BG).name()
 
 
-def test_playlist_name_editors_fit_their_rows(qtbot):
+def test_playlist_titles_are_edited_in_place_and_there_is_no_file_name_column(qtbot):
+    from PyQt6.QtCore import Qt
+
     card = PlaylistCard()
     qtbot.addWidget(card)
-    from stuff_downloader.gui.theme import STYLE
-
-    card.setStyleSheet(STYLE)
     card.set_entries(
         [
             playlist.PlaylistEntry(
@@ -113,23 +143,69 @@ def test_playlist_name_editors_fit_their_rows(qtbot):
             )
         ]
     )
-    card.show()
-    qtbot.wait(1)
-    editor = card.table.cellWidget(0, 6)
-    # The on-screen height, after the table's item padding: a squashed editor clips its text.
-    assert editor.height() >= editor.sizeHint().height()
+    headers = [card.table.horizontalHeaderItem(c).text() for c in range(card.table.columnCount())]
+    assert "File name" not in headers
+    title = card.table.item(0, card.TITLE_COLUMN)
+    assert title.flags() & Qt.ItemFlag.ItemIsEditable
+    assert not card.table.item(0, 3).flags() & Qt.ItemFlag.ItemIsEditable
+    assert card.output_name(0) is None
+    title.setText("My name")
+    assert card.output_name(0) == "My name"
 
 
-def test_the_preview_title_uses_the_width_beside_the_cover(qtbot):
-    # A hidden playlist row must not clamp the title column to a sliver.
-    card = PreviewCard()
+def test_the_pencil_sits_right_after_the_title_and_long_titles_are_elided(qtbot):
+    # A hidden playlist row must not clamp the title column to a sliver either.
+    card = ResultCard()
     qtbot.addWidget(card)
-    card.title_label.setText("A YouTube Music song defaults to the MP3 music preset")
+    card.title_editor.set_title("A YouTube Music song opens on its Audio tab")
     card.resize(1200, 400)
     card.show()
     qtbot.wait(1)
-    assert card.title_label.width() > 600
-    assert card.title_label.geometry().left() - card.cover.geometry().right() < 40
+    editor = card.title_editor
+    label = editor.label
+    assert label.text() == "A YouTube Music song opens on its Audio tab"  # nothing cut
+    assert 0 <= editor.pencil.geometry().left() - label.geometry().right() < 20
+    assert editor.geometry().left() - card.cover.geometry().right() < 40
+
+    long_title = "An extremely long title that keeps going " * 10
+    editor.set_title(long_title)
+    qtbot.wait(1)
+    assert label.text().endswith("…") and label.full_text() == long_title
+    assert long_title in label.toolTip()
+    assert editor.pencil.geometry().right() <= editor.width()
+
+
+def test_row_download_buttons_are_never_clipped(qtbot):
+    from stuff_downloader.gui.theme import STYLE
+
+    card = ResultCard()
+    qtbot.addWidget(card)
+    card.setStyleSheet(STYLE)
+    media = _media()
+    card.set_result(media, {t: media[f"{t}_rows"] for t in ("video", "audio", "image")})
+    card.resize(1200, 900)
+    card.show()
+    for tab in card.tab_names():
+        card.tabs.setCurrentWidget(card.pages[tab])
+        qtbot.wait(1)
+        for row in range(card.tables[tab].rowCount()):
+            button = card.download_button(tab, row)
+            assert button.height() >= button.sizeHint().height(), (tab, row)
+            assert button.width() >= button.sizeHint().width(), (tab, row)
+
+
+def test_the_result_tabs_follow_the_dark_theme(qtbot):
+    card = ResultCard()
+    qtbot.addWidget(card)
+    media = _media()
+    card.set_result(media, {t: media[f"{t}_rows"] for t in ("video", "audio", "image")})
+    card.show()
+    qtbot.wait(1)
+    bar = card.tabs.tabBar()
+    image = bar.grab().toImage()
+    rect = bar.tabRect(1)  # an unselected tab
+    # Beside the label text, inside the tab: the tab's own fill, not Fusion's light grey.
+    assert image.pixelColor(rect.left() + 6, rect.bottom() - 3).lightness() < 100
 
 
 def test_combos_and_checkboxes_follow_the_dark_theme(qtbot):
@@ -137,14 +213,21 @@ def test_combos_and_checkboxes_follow_the_dark_theme(qtbot):
 
     from stuff_downloader.gui.theme import STYLE
 
-    card = PreviewCard()
+    card = ResultCard()
     qtbot.addWidget(card)
     card.setStyleSheet(STYLE)
+    playlist_card = PlaylistCard()
+    qtbot.addWidget(playlist_card)
+    playlist_card.setStyleSheet(STYLE)
     card.show()
+    playlist_card.show()
     qtbot.wait(1)
-    check_text = card.compatible_check.palette().color(QPalette.ColorRole.WindowText)
+    check_text = playlist_card.archive_check.palette().color(QPalette.ColorRole.WindowText)
     assert check_text.lightness() > 150  # readable on the dark card
-    combo = card.preset_combo.grab().toImage()
+    card.tabs.addTab(card.pages["video"], "Video")
+    card.tabs.show()
+    qtbot.wait(1)
+    combo = card.container_combo.grab().toImage()
     middle = combo.pixelColor(combo.width() // 2, combo.height() // 2)
     assert middle.lightness() < 100  # not a white box on a dark page
 
@@ -152,12 +235,13 @@ def test_combos_and_checkboxes_follow_the_dark_theme(qtbot):
 def test_styled_combos_keep_an_arrow_and_unchecked_boxes_stay_visible(qtbot):
     from stuff_downloader.gui.theme import STYLE
 
-    card = PreviewCard()
+    card = ResultCard()
     qtbot.addWidget(card)
     card.setStyleSheet(STYLE)
+    card.tabs.addTab(card.pages["video"], "Video")
     card.show()
     qtbot.wait(1)
-    combo = card.preset_combo.grab().toImage()
+    combo = card.container_combo.grab().toImage()
     arrow_zone = [
         combo.pixelColor(x, y).lightness()
         for x in range(combo.width() - 22, combo.width())
@@ -165,7 +249,12 @@ def test_styled_combos_keep_an_arrow_and_unchecked_boxes_stay_visible(qtbot):
     ]
     assert max(arrow_zone) > 120  # something visible where the arrow belongs
 
-    box = card.compatible_check
+    playlist_card = PlaylistCard()
+    qtbot.addWidget(playlist_card)
+    playlist_card.setStyleSheet(STYLE)
+    playlist_card.show()
+    qtbot.wait(1)
+    box = playlist_card.archive_check
     box.setChecked(True)
     checked = box.grab().toImage()
     box.setChecked(False)

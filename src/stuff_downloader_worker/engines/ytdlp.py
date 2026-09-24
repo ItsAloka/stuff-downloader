@@ -216,14 +216,247 @@ def _site_name(info: dict[str, Any]) -> str | None:
     return name[:60] if isinstance(name, str) and name else None
 
 
+# ── the format catalog (plan §5.4) ─────────────────────────────────────────────────────────
+# Rows are built from the sanitized formats only, and their ids are ours: the worker maps them
+# back to selectors in presets.build_row_opts, so no site format id is ever sent back to it.
+DEFAULT_MAX_HEIGHT = 1080
+_CODEC_NAMES = (
+    ("avc", "H.264"),
+    ("h264", "H.264"),
+    ("hev", "H.265"),
+    ("hvc", "H.265"),
+    ("vp09", "VP9"),
+    ("vp9", "VP9"),
+    ("av01", "AV1"),
+    ("mp4a", "AAC"),
+    ("aac", "AAC"),
+    ("opus", "Opus"),
+    ("vorbis", "Vorbis"),
+    ("mp3", "MP3"),
+    ("flac", "FLAC"),
+)
+# WAV as yt-dlp writes it from a 48 kHz stereo source; FLAC is roughly half to two thirds.
+_WAV_BYTES_PER_SECOND = 48_000 * 2 * 2
+_FLAC_SHARE = 0.6
+
+
+def codec_name(codec: Any) -> str | None:
+    text = str(codec or "").lower()
+    if text in ("", "none"):
+        return None
+    for prefix, name in _CODEC_NAMES:
+        if text.startswith(prefix):
+            return name
+    return None
+
+
+def _number(value: Any) -> float | None:
+    if isinstance(value, int | float) and not isinstance(value, bool) and value > 0:
+        return float(value)
+    return None
+
+
+def _size(fmt: dict[str, Any] | None) -> tuple[int | None, bool]:
+    """(bytes, is_estimate) for one format: filesize, else filesize_approx marked "~"."""
+    if not fmt:
+        return None, False
+    exact = _number(fmt.get("filesize"))
+    if exact:
+        return int(exact), False
+    approx = _number(fmt.get("filesize_approx"))
+    return (int(approx), True) if approx else (None, False)
+
+
+def _audio_only(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        f
+        for f in formats
+        if f.get("vcodec") in (None, "none") and f.get("acodec") not in (None, "none")
+    ]
+
+
+def _best_audio(formats: list[dict[str, Any]], codec: str | None = None) -> dict | None:
+    pool = [
+        f for f in _audio_only(formats) if codec is None or codec_name(f.get("acodec")) == codec
+    ]
+    return max(
+        pool, key=lambda f: _number(f.get("abr")) or _number(f.get("tbr")) or 0, default=None
+    )
+
+
+def source_audio(formats: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """The best audio the site offers, for the honest "Source audio" line."""
+    best = _best_audio(formats)
+    if best is None:
+        return None
+    abr = _number(best.get("abr")) or _number(best.get("tbr"))
+    return {
+        "codec": codec_name(best.get("acodec")) or "unknown",
+        "abr_kbps": round(abr) if abr else None,
+    }
+
+
+def _video_rank(fmt: dict[str, Any]) -> tuple:
+    family = codec_name(fmt.get("vcodec"))
+    return (
+        fmt.get("ext") == "mp4" and family == "H.264",
+        fmt.get("ext") == "mp4",
+        _number(fmt.get("fps")) or 0,
+        _number(fmt.get("tbr")) or 0,
+    )
+
+
+def video_rows(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One row per height that exists, highest first. Each height names its best stream:
+    H.264 in MP4 first (plays everywhere), then other MP4, then WebM."""
+    by_height: dict[int, dict[str, Any]] = {}
+    for fmt in formats:
+        height = fmt.get("height")
+        if not _has_video(fmt) or not isinstance(height, int) or isinstance(height, bool):
+            continue
+        if not 0 < height <= presets.MAX_ROW_HEIGHT or fmt.get("ext") not in ("mp4", "webm"):
+            continue
+        if height not in by_height or _video_rank(fmt) > _video_rank(by_height[height]):
+            by_height[height] = fmt
+    # ★ is the highest H.264 height up to 1080p, as in Settings (plan §5.4).
+    default_height = max(
+        (
+            h
+            for h, f in by_height.items()
+            if h <= DEFAULT_MAX_HEIGHT and codec_name(f.get("vcodec")) == "H.264"
+        ),
+        default=None,
+    )
+    if default_height is None:
+        default_height = max((h for h in by_height if h <= DEFAULT_MAX_HEIGHT), default=None)
+    rows = []
+    for height in sorted(by_height, reverse=True):
+        fmt = by_height[height]
+        size, estimate = _size(fmt)
+        if fmt.get("acodec") in (None, "none"):  # video-only: add the audio it is merged with
+            audio = _best_audio(formats, "AAC" if fmt.get("ext") == "mp4" else "Opus")
+            audio_size, audio_estimate = _size(audio or _best_audio(formats))
+            size = size + audio_size if size and audio_size else None
+            estimate = estimate or audio_estimate
+        fps = _number(fmt.get("fps"))
+        rows.append(
+            {
+                "id": f"v:{height}:{fmt['ext']}",
+                "height": height,
+                "fps": round(fps) if fps else None,
+                "hdr": str(fmt.get("dynamic_range") or "SDR").upper() != "SDR",
+                "vcodec": codec_name(fmt.get("vcodec")),
+                "container": fmt["ext"],
+                "size": size,
+                "size_is_estimate": estimate,
+                "default": height == default_height,
+            }
+        )
+    return rows
+
+
+def audio_rows(formats: list[dict[str, Any]], duration: Any) -> list[dict[str, Any]]:
+    """MP3 at five bitrates, M4A, Opus when the source is Opus, FLAC and WAV (plan §5.4)."""
+    seconds = _number(duration)
+
+    def estimate(bytes_per_second: float) -> int | None:
+        return int(seconds * bytes_per_second) if seconds else None
+
+    rows: list[dict[str, Any]] = [
+        {
+            "id": f"a:mp3:{kbps}",
+            "label": "MP3",
+            "codec": "mp3",
+            "bitrate": kbps,
+            "size": estimate(kbps * 1000 / 8),
+            "size_is_estimate": True,
+            "default": kbps == 320,
+        }
+        for kbps in presets.MP3_BITRATES
+    ]
+    aac = _best_audio(formats, "AAC")
+    if aac is not None:
+        size, approx = _size(aac)
+        abr = _number(aac.get("abr"))
+        m4a = {"bitrate": round(abr) if abr else None, "copy": True}
+        m4a.update({"size": size, "size_is_estimate": approx})
+    else:
+        m4a = {"bitrate": 256, "copy": False}
+        m4a.update({"size": estimate(256 * 1000 / 8), "size_is_estimate": True})
+    rows.append({"id": "a:m4a", "label": "M4A", "codec": "aac", **m4a})
+    opus = _best_audio(formats, "Opus")
+    if opus is not None:
+        size, approx = _size(opus)
+        abr = _number(opus.get("abr"))
+        rows.append(
+            {
+                "id": "a:opus",
+                "label": "Opus",
+                "codec": "opus",
+                "bitrate": round(abr) if abr else None,
+                "copy": True,
+                "size": size,
+                "size_is_estimate": approx,
+            }
+        )
+    wav = estimate(_WAV_BYTES_PER_SECOND)
+    rows.append(
+        {
+            "id": "a:flac",
+            "label": "FLAC",
+            "codec": "flac",
+            "bitrate": None,
+            "size": int(wav * _FLAC_SHARE) if wav else None,
+            "size_is_estimate": True,
+            "lossless_note": "lossless container: same sound, bigger file",
+        }
+    )
+    rows.append(
+        {
+            "id": "a:wav",
+            "label": "WAV",
+            "codec": "wav",
+            "bitrate": None,
+            "size": wav,
+            "size_is_estimate": True,
+            "lossless_note": "uncompressed: same sound, much bigger · no embedded cover",
+            "no_cover": True,
+        }
+    )
+    return rows
+
+
+def image_rows(thumbnails: list[dict[str, int]], has_thumbnail: bool) -> list[dict[str, Any]]:
+    """The thumbnail sizes that exist, largest first; one "best" row when none has a size."""
+    rows: list[dict[str, Any]] = [
+        {"id": f"i:{t['width']}x{t['height']}", "width": t["width"], "height": t["height"]}
+        for t in thumbnails
+    ]
+    if not rows and has_thumbnail:
+        rows = [{"id": "i:best", "width": None, "height": None}]
+    if rows:
+        rows[0]["default"] = True
+    return rows
+
+
 def analyze_result(
-    summary: dict[str, Any], url: str, preview: dict[str, Any] | None
+    summary: dict[str, Any],
+    url: str,
+    preview: dict[str, Any] | None,
+    has_thumbnail: bool = True,
 ) -> dict[str, Any]:
-    """The sanitized page as a MediaResult, with the legacy fields the current UI reads."""
+    """The sanitized page as a MediaResult with its Video / Audio / Image rows."""
     kind, tabs = media_kind(summary, url)
     fields = {k: v for k, v in summary.items() if k != "title"}
     fields.setdefault("uploader", summary.get("channel"))
     fields["site"] = _site_name(summary)
+    formats = [f for f in summary.get("formats") or [] if isinstance(f, dict)]
+    fields["video_rows"] = video_rows(formats) if "video" in tabs else []
+    fields["audio_rows"] = audio_rows(formats, summary.get("duration"))
+    fields["image_rows"] = image_rows(summary.get("thumbnails") or [], has_thumbnail)
+    fields["source_audio"] = source_audio(formats)
+    # A tab with nothing in it is not offered (a page with no thumbnail has no Image tab).
+    tabs = [t for t in tabs if t == tabs[0] or fields.get(f"{t}_rows")]
     title = summary.get("title") or "Untitled"
     return media_result(kind, tabs, title, url, preview=preview, **fields)
 
@@ -389,6 +622,9 @@ class YtDlpEngine:
                         "skip_download": True,
                     }
                 )
+        elif presets.is_row_request(opts):
+            request = presets.parse_row_request(opts)
+            ydl_opts = presets.build_row_opts(request, job.output_dir)
         else:
             request = presets.parse_request(opts)
             ydl_opts = presets.build_ydl_opts(request, job.output_dir)
@@ -481,7 +717,19 @@ class YtDlpEngine:
                 if request is None:
                     preview = self._thumbnail_preview(ydl, info, emit)
                     emit("stage", {"stage": "completed"})
-                    return analyze_result(summary, job.url, preview)
+                    has_thumb = bool(info.get("thumbnails") or info.get("thumbnail"))
+                    return analyze_result(summary, job.url, preview, has_thumb)
+                size = getattr(request, "image_size", None)
+                if size:
+                    # The chosen thumbnail only; yt-dlp writes the last one in the list.
+                    chosen = [
+                        t
+                        for t in info.get("thumbnails") or []
+                        if isinstance(t, dict) and (t.get("width"), t.get("height")) == size
+                    ]
+                    if not chosen:
+                        raise EngineError("download_error", "that image size is not available")
+                    info["thumbnails"] = chosen[-1:]
                 return self._download(ydl, info, request, summary, files, stage, emit)
         except yt_dlp.utils.DownloadError as exc:
             raise EngineError(*describe_download_error(str(exc))) from exc
@@ -570,7 +818,7 @@ class YtDlpEngine:
     def _download(
         ydl: Any,
         info: dict[str, Any],
-        request: presets.DownloadRequest,
+        request: presets.DownloadRequest | presets.RowRequest,
         summary: dict[str, Any],
         files: list[str],
         stage: Any,

@@ -10,7 +10,7 @@ from PyQt6.QtCore import QItemSelectionModel
 from PyQt6.QtGui import QCloseEvent
 from test_main_window import FakeRun, _analyzed  # reuse the runner stand-in
 
-from stuff_downloader.core import history, settings, tools
+from stuff_downloader.core import history, protocol, settings, tools
 from stuff_downloader.core.protocol import Event
 from stuff_downloader.gui.main_window import MainWindow
 from stuff_downloader.gui.pages import DownloadsPage
@@ -34,13 +34,15 @@ def listing(count=4, unavailable_last=True):
     entries[0]["id"] = VID
     if unavailable_last:
         entries[-1]["unavailable"] = "Private video"
-    return {
-        "kind": "playlist",
-        "playlist_id": "PLabc123_-XYZ",
-        "title": "Chill Mix",
-        "uploader": "Someone",
-        "entries": entries,
-    }
+    return protocol.media_result(
+        "playlist",
+        ["tracks"],
+        "Chill Mix",
+        PLAYLIST_URL,
+        playlist_id="PLabc123_-XYZ",
+        uploader="Someone",
+        entries=entries,
+    )
 
 
 @pytest.fixture
@@ -83,7 +85,7 @@ def test_a_playlist_link_is_read_with_the_playlist_mode(window, runs):
 def test_the_table_lists_every_entry_and_unavailable_ones_cannot_be_selected(window, runs):
     page = expand(window, runs)
     card = page.playlist_card
-    assert not card.isHidden() and page.preview.isHidden()
+    assert not card.isHidden() and page.result_card.isHidden()
     assert card.title_label.text() == "Chill Mix"
     assert card.table.rowCount() == 4
     assert card.table.item(0, 2).text() == "Track 0"
@@ -119,7 +121,7 @@ def test_a_playlist_that_is_not_one_reports_the_engine_error(window, runs):
 
 def test_the_whole_playlist_button_reanalyzes_the_playlist(window, runs, qtbot):
     page = _analyzed(window, runs, qtbot, url=SONG_IN_PLAYLIST)
-    assert not page.preview.playlist_button.isHidden()
+    assert not page.result_card.playlist_button.isHidden()
     page.open_playlist()
     assert runs[-1].spec.url == PLAYLIST_URL
     assert runs[-1].spec.options == {"mode": "playlist"}
@@ -127,8 +129,8 @@ def test_the_whole_playlist_button_reanalyzes_the_playlist(window, runs, qtbot):
 
 def test_a_radio_mix_offers_no_playlist_button_and_says_why(window, runs, qtbot):
     page = _analyzed(window, runs, qtbot, url=f"https://www.youtube.com/watch?v={VID}&list=RDxyz")
-    assert page.preview.playlist_button.isHidden()
-    assert "radio" in page.preview.playlist_label.text().lower()
+    assert page.result_card.playlist_button.isHidden()
+    assert "radio" in page.result_card.playlist_label.text().lower()
 
 
 # ── batch enqueue ────────────────────────────────────────────────────────────────────────
