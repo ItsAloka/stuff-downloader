@@ -620,6 +620,34 @@ Ticks are fully visible at all sizes and DPIs. The queue has no horizontal scrol
 match check**, and the playlist cover in the header. The art stays after matching and follows into the queue. Certain matches start
 immediately. Uncertain ones are flagged, not blocked. The four-language sample passes.
 
+> **✅ Done (2026-09-24), approved by Codex.** Not committed yet (commit after the owner accepts the screenshots).
+> Tests: **1561 passed, 4 skipped, 23 deselected (network), ruff clean.** Live network tests: 6/6 passed.
+> - Listing (§7.1): the public embed page (`__NEXT_DATA__`), one request, about 1 s live, no credentials. The embed lists at most
+>   100 rows; only longer lists fall back to spotDL `get_metadata` (free client). That is the only place spotDL is still used.
+> - Covers (§7.2, P9, R5 carry-over): every Spotify picture is normalized to `https://i.scdn.co/image/<hash>`. Album rows use the
+>   album cover. Playlist rows look up their oEmbed `thumbnail_url` lazily, only for rows on screen. The header shows the cover.
+>   The art stays after matching and follows into the queue and History. A row never shows the YouTube match's picture.
+>   `gui/thumbs.py` allows only those two exact URL forms. Tagging uses the track embed's 640 px picture.
+> - Matching (§7.3): ytmusicapi directly. Album first when the album is known (±2 s), then songs (same artist, title and version
+>   markers, ±3 s), then videos (fallback, always uncertain). The uncertain rule is now: found only as a video, score under 70%, or
+>   length off by more than 3 s.
+> - Uncertain matches do not block (§7.4). Certain rows queue at once. Rows not checked yet are looked up first and join the batch
+>   when their match is certain. Uncertain rows wait with ⚠ and a "Review…" button. One "Download N uncertain anyway" button sends
+>   them all. Reviewing a waiting row downloads it.
+> - Change… dialog (§5.6a, R5 carry-over): Spotify's cover beside the selected result's YouTube picture, plus a "Found as" column.
+> - Tagging (§7.6, R5 carry-over): **Live:** a download with the edited title "Owner edit - Rick" produced `Owner edit - Rick.mp3`.
+>   mutagen read back Spotify's tags: TIT2 "Never Gonna Give You Up", TPE1 "Rick Astley", TALB "Whenever You Need Somebody" (from the
+>   YTM match), TDRC 1987-11-12, one APIC, ID3 v2.3. Album links also write TRCK = album position. Playlist rows write no TRCK.
+> - Four-language sample (§7.7), live: JP and EN matched as songs, under 1 s off. CN (the lyric video) is found only as a video, so
+>   it is **flagged**. SI is 0.4 s off and flagged (video).
+> - Accept timing, live (Today's Top Hits; no 7-song link was provided): listing about 1 s, art on every visible row about 2.5 s,
+>   before any match check. Screenshots are in `%TEMP%/stuff-downloader-screenshots/r6-*.png` (1280×720 and 1920×1080 at
+>   100/125/150%), outside git.
+> - §7.5 licensing: spotDL is now needed only for lists of more than 100 songs. Dropping it from the installer is R7 work.
+> - **Carried forward:** the R4 items not verified live (Instagram carousel, TikTok slideshow, X 4-photo post, Reddit gallery)
+>   still need the owner's links. The CJK header title rendered as boxes in offscreen screenshots only (the table cell renders it);
+>   check it on a real display.
+
 ### R7 — Other music sites and release 1.1.0
 SoundCloud / Bandcamp checked. Apple Music / Deezer link matching. Installer
 `StuffDownloader-Setup-1.1.0.exe` with self-test. Full manual matrix (§9) on the installed build.
