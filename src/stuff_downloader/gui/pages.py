@@ -60,7 +60,7 @@ from ..core.protocol import Event, JobSpec, ProtocolError, validate_media_result
 from ..core.runner import JobRun, WorkerRuntimeMissing
 from . import theme
 from .bridge import EventBridge
-from .thumbs import ThumbnailLoader, decode_image, youtube_thumb_url
+from .thumbs import PREVIEW_BOX, ThumbnailLoader, decode_image, youtube_thumb_url
 from .widgets import (
     Card,
     Chip,
@@ -1078,26 +1078,16 @@ class DownloadsPage(QWidget):
 
         self._thumb = None
         thumb = info.get("preview")
+        image = None
         if isinstance(thumb, dict) and isinstance(thumb.get("data"), str):
             try:
                 # Byte- and pixel-capped: a direct image link sends the image itself here.
-                image = decode_image(base64.b64decode(thumb["data"], validate=True))
+                image = decode_image(base64.b64decode(thumb["data"], validate=True), PREVIEW_BOX)
             except (binascii.Error, ValueError):
                 image = None
             if image is not None:
                 self._thumb = QPixmap.fromImage(image)
-        cover = card.cover
-        if self._thumb is None:
-            cover.setPixmap(QPixmap())
-            cover.setText("🎵" if info.get("kind") == "audio" else "🎞")
-        else:
-            cover.setPixmap(
-                self._thumb.scaled(
-                    cover.size(),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-            )
+        card.set_preview(image, info)
         card.set_result(info, {tab: result_rows(info, tab) for tab in ("video", "audio", "image")})
         self._fill_advanced(info)
         card.show()

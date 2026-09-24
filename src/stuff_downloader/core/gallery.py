@@ -83,7 +83,8 @@ def parse_item(raw: Any, seen: set[int]) -> GalleryItem | None:
         ext=ext if _EXT.fullmatch(ext) else "",
         width=_dim(raw.get("width")),
         height=_dim(raw.get("height")),
-        preview=_preview(raw.get("thumbnail")),
+        # MediaResult items carry "preview" (plan §5.2); "thumbnail" is the pre-R3 name.
+        preview=_preview(raw.get("preview") or raw.get("thumbnail")),
     )
 
 

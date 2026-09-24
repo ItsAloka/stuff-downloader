@@ -28,7 +28,7 @@ from ..protocol import JobSpec, media_result
 from .base import Emit, EngineError
 
 TOOLS_DIR_ENV_VAR = "STUFF_DOWNLOADER_TOOLS_DIR"
-_TOOL_EXES = {"deno": "deno.exe", "ffmpeg": "ffmpeg.exe"}
+_TOOL_EXES = {"deno": "deno.exe", "ffmpeg": "ffmpeg.exe", "ffprobe": "ffprobe.exe"}
 
 # Fields an analyze result may carry. Stream URLs, headers, cookies and fragments never leave.
 _FORMAT_FIELDS = (
@@ -47,7 +47,6 @@ _FORMAT_FIELDS = (
     "protocol",
     "format_note",
 )
-_THUMB_HOST_SUFFIXES = (".ytimg.com", ".ggpht.com", ".googleusercontent.com")
 MAX_THUMB_BYTES = 1_500_000
 
 # A playlist is a list of other people's videos, so every field below is attacker-influenced:
@@ -130,32 +129,42 @@ def trusted_tool(name: str) -> Path | None:
     return path if path.is_file() else None
 
 
-def _thumbnail_url(info: dict[str, Any]) -> str | None:
-    """The largest https thumbnail on a known image host, preferring square art."""
-    best: tuple[tuple[int, int], str] | None = None
-    for thumb in info.get("thumbnails") or []:
-        if not isinstance(thumb, dict) or not isinstance(thumb.get("url"), str):
+def _public_https(url: Any) -> bool:
+    """An https link on a public host name. Its addresses are checked again when fetched."""
+    from .http import is_public_name  # (import cycle)
+
+    if not isinstance(url, str):
+        return False
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return False
+    return (
+        parts.scheme == "https"
+        and not parts.username
+        and not parts.password
+        and is_public_name((parts.hostname or "").lower())
+    )
+
+
+def _thumbnail_url(info: dict[str, Any], music: bool = False) -> str | None:
+    """The largest https thumbnail on any public host; square art first for music."""
+    best: tuple[tuple[int, int, int], str] | None = None
+    for index, thumb in enumerate(info.get("thumbnails") or []):
+        if not isinstance(thumb, dict) or not _public_https(thumb.get("url")):
             continue
-        parts = urlsplit(thumb["url"])
-        host = (parts.hostname or "").lower()
-        if parts.scheme != "https" or not host.endswith(_THUMB_HOST_SUFFIXES):
-            continue
-        width, height = thumb.get("width") or 0, thumb.get("height") or 0
-        if not isinstance(width, int) or not isinstance(height, int):
+        width, height = thumb.get("width"), thumb.get("height")
+        if not (_is_dimension(width) and _is_dimension(height)):
             width = height = 0
-        key = (int(bool(width) and width == height), width * height)
+        square = int(music and bool(width) and width == height)
+        # yt-dlp lists thumbnails worst to best, so a later one wins a size tie.
+        key = (square, width * height, index)
         if best is None or key > best[0]:
             best = (key, thumb["url"])
     if best:
         return best[1]
     url = info.get("thumbnail")
-    if isinstance(url, str):
-        parts = urlsplit(url)
-        if parts.scheme == "https" and (parts.hostname or "").lower().endswith(
-            _THUMB_HOST_SUFFIXES
-        ):
-            return url
-    return None
+    return url if _public_https(url) else None
 
 
 def sanitize_info(info: dict[str, Any]) -> dict[str, Any]:
@@ -715,7 +724,8 @@ class YtDlpEngine:
                 summary = sanitize_info(info)
                 summary["engine_version"] = yt_dlp.version.__version__
                 if request is None:
-                    preview = self._thumbnail_preview(ydl, info, emit)
+                    music = media_kind(summary, job.url)[0] == "audio"
+                    preview = self._thumbnail_preview(info, job.url, music, emit)
                     emit("stage", {"stage": "completed"})
                     has_thumb = bool(info.get("thumbnails") or info.get("thumbnail"))
                     return analyze_result(summary, job.url, preview, has_thumb)
@@ -754,19 +764,23 @@ class YtDlpEngine:
         return ydl
 
     @staticmethod
-    def _thumbnail_preview(ydl: Any, info: dict[str, Any], emit: Emit) -> dict[str, Any] | None:
-        url = _thumbnail_url(info)
-        if not url:
-            return None
-        try:
-            with ydl.urlopen(url) as resp:
-                data = resp.read(MAX_THUMB_BYTES + 1)
-        except Exception as exc:  # a missing preview must not fail the analyze
-            emit("log", {"level": "warning", "message": f"thumbnail preview failed: {exc}"})
-            return None
-        if len(data) > MAX_THUMB_BYTES:
-            return None
-        return {"data": base64.b64encode(data).decode("ascii")}
+    def _thumbnail_preview(info: dict[str, Any], url: str, music: bool, emit: Emit) -> Any:
+        """The page's picture as a MediaResult preview, fetched behind the direct engine's
+        address checks (https only, every hop checked and pinned), or None."""
+        from .http import fetch_bytes, page_preview  # (import cycle)
+
+        thumb = _thumbnail_url(info, music)
+        data = None
+        if thumb:
+            try:
+                data = fetch_bytes(thumb, MAX_THUMB_BYTES, https_only=True, accept=("image/",))
+            except Exception as exc:  # a missing preview must not fail the analyze
+                name = type(exc).__name__
+                emit("log", {"level": "warning", "message": f"thumbnail preview failed: {name}"})
+        else:
+            # Nothing usable from yt-dlp: the page's own og:image / twitter:image / JSON-LD.
+            data = page_preview(url, emit)
+        return {"data": base64.b64encode(data).decode("ascii")} if data else None
 
     @staticmethod
     def _claim_name(ydl: Any, info: dict[str, Any]) -> tuple[str, Path] | None:

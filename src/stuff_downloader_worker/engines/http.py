@@ -2,8 +2,9 @@
 
 Stdlib only, so it runs in any engine env. Options: ``mode`` "analyze" (default) or
 "download"; download takes ``preset`` = "original_file", or a Result-card row request
-(``tab``, ``row_id`` = ``v:orig`` / ``a:orig`` / ``i:orig``, ``container``, ``edited_title``).
-Nothing else is accepted.
+(``tab``, ``row_id`` = ``v:orig`` / ``a:orig`` / ``i:orig``, ``container``, ``edited_title``),
+or from a direct video its audio (``a:mp3:<kbps>``, ``a:m4a``…) or one frame (``i:frame``),
+made by the runner's ffmpeg from the downloaded file. Nothing else is accepted.
 
 The URL comes from the owner, and every redirect from the site, so each hop is checked before
 it is fetched: http/https only, no credentials, a public host name, and every address that name
@@ -25,19 +26,23 @@ code and a fixed vocabulary, so a signed link cannot reach the log or history.
 from __future__ import annotations
 
 import base64
+import html
 import http.client
 import ipaddress
 import json
 import mimetypes
 import os
 import re
+import secrets
 import socket
 import ssl
 import subprocess
+import threading
 import time
 import unicodedata
 from dataclasses import dataclass, replace
 from email.message import Message
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urljoin, urlsplit
@@ -154,15 +159,18 @@ class Target:
     path: str  # path plus query, as sent on the request line
 
 
-def check_url(url: str) -> Target:
-    """Parse and vet one URL (the pasted one or a redirect). Raises EngineError when refused."""
+def check_url(url: str, https_only: bool = False) -> Target:
+    """Parse and vet one URL (the pasted one or a redirect). Raises EngineError when refused.
+
+    ``https_only`` is for pictures the page names (thumbnails, og:image): the site chose that
+    link, not the owner, so plain http is refused there, on every hop."""
     try:
         parts = urlsplit(url)
         port = parts.port
     except ValueError as exc:
         raise EngineError("unsupported", "that is not a valid link") from exc
     scheme = parts.scheme.lower()
-    if scheme not in ("http", "https"):
+    if scheme not in ("http", "https") or (https_only and scheme != "https"):
         raise EngineError("unsupported", "only http and https links are supported")
     if parts.username or parts.password:
         raise EngineError("unsupported", "links with credentials are not supported")
@@ -196,11 +204,14 @@ def _connect(target: Target) -> http.client.HTTPConnection:
 
 
 def open_url(
-    url: str, headers: dict[str, str] | None = None, method: str = "GET"
+    url: str,
+    headers: dict[str, str] | None = None,
+    method: str = "GET",
+    https_only: bool = False,
 ) -> tuple[http.client.HTTPConnection, http.client.HTTPResponse, str]:
     """Follow up to MAX_REDIRECTS, vetting every hop. Returns (conn, response, final url)."""
     for _ in range(MAX_REDIRECTS + 1):
-        target = check_url(url)
+        target = check_url(url, https_only)
         conn = _connect(target)
         sent = {"User-Agent": USER_AGENT, "Accept-Encoding": "identity", **(headers or {})}
         try:
@@ -382,32 +393,347 @@ def _range_start(resp: http.client.HTTPResponse) -> int | None:
 # ── engine ─────────────────────────────────────────────────────────────────────────────────
 
 
+def fetch_bytes(
+    url: str,
+    limit: int,
+    seconds: float = PREVIEW_SECONDS,
+    https_only: bool = False,
+    accept: tuple[str, ...] = (),
+) -> bytes | None:
+    """At most ``limit`` bytes of one checked URL within ``seconds``, or None.
+
+    Every hop is vetted and pinned by ``open_url``. ``accept`` lists the Content-Type prefixes
+    that may be read (empty: any). A body over the limit is refused, not truncated.
+    """
+    deadline = time.monotonic() + seconds
+    conn, resp, _ = open_url(url, https_only=https_only)
+    try:
+        if resp.status != 200:
+            return None
+        if accept and not _content_type(resp).startswith(accept):
+            return None
+        chunks, size = [], 0
+        while size <= limit:
+            if time.monotonic() > deadline:
+                return None
+            chunk = resp.read(64 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+    finally:
+        conn.close()
+    return b"".join(chunks) if 0 < size <= limit else None
+
+
 def _image_preview(url: str, emit: Emit) -> bytes | None:
     """The image itself for the analyze preview: same URL checks, ≤5 MB, ≤15 s, or nothing.
 
     The GUI decodes it with its own pixel cap; a failure here only costs the preview.
     """
-    deadline = time.monotonic() + PREVIEW_SECONDS
     try:
-        conn, resp, _ = open_url(url)
-        try:
-            if resp.status != 200:
-                return None
-            chunks, size = [], 0
-            while size <= MAX_PREVIEW_BYTES:
-                if time.monotonic() > deadline:
-                    return None
-                chunk = resp.read(64 * 1024)
-                if not chunk:
-                    break
-                chunks.append(chunk)
-                size += len(chunk)
-        finally:
-            conn.close()
+        return fetch_bytes(url, MAX_PREVIEW_BYTES)
     except (EngineError, OSError, http.client.HTTPException) as exc:
         emit("log", {"level": "warning", "message": f"image preview failed: {type(exc).__name__}"})
         return None
-    return b"".join(chunks) if 0 < size <= MAX_PREVIEW_BYTES else None
+
+
+# ── previews from a web page (plan §5.6) ───────────────────────────────────────────────────
+MAX_PAGE_BYTES = 2 * 1024 * 1024
+MAX_PAGE_IMAGE_BYTES = 3 * 1024 * 1024
+_META_TAG = re.compile(r"<meta\b[^>]*>", re.IGNORECASE)
+_ATTR = re.compile(r"""([a-zA-Z:_-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""")
+_JSON_LD = re.compile(
+    r"""<script\b[^>]*type\s*=\s*["']?application/ld\+json[^>]*>(.*?)</script>""",
+    re.IGNORECASE | re.DOTALL,
+)
+_META_KEYS = ("og:image:secure_url", "og:image", "twitter:image", "twitter:image:src")
+
+
+def _json_ld_thumbnail(node: Any, depth: int = 0) -> str | None:
+    if depth > 6:
+        return None
+    if isinstance(node, list):
+        for item in node[:50]:
+            found = _json_ld_thumbnail(item, depth + 1)
+            if found:
+                return found
+        return None
+    if not isinstance(node, dict):
+        return None
+    value = node.get("thumbnailUrl")
+    if isinstance(value, list):
+        value = next((v for v in value if isinstance(v, str)), None)
+    if isinstance(value, str):
+        return value
+    for key in ("@graph", "video", "mainEntity", "associatedMedia"):
+        found = _json_ld_thumbnail(node.get(key), depth + 1)
+        if found:
+            return found
+    return None
+
+
+def page_image_url(page: str, base: str) -> str | None:
+    """The picture a page names for itself: og:image, twitter:image, then JSON-LD thumbnailUrl.
+
+    Only an https URL is returned (made absolute against ``base``); the fetch re-checks it.
+    """
+    found: dict[str, str] = {}
+    for tag in _META_TAG.findall(page):
+        attrs = {m[0].lower(): m[1] or m[2] or m[3] for m in _ATTR.findall(tag)}
+        key = (attrs.get("property") or attrs.get("name") or "").lower()
+        if key in _META_KEYS and attrs.get("content") and key not in found:
+            found[key] = html.unescape(attrs["content"]).strip()
+    candidates = [found[k] for k in _META_KEYS if k in found]
+    for block in _JSON_LD.findall(page)[:20]:
+        try:
+            value = _json_ld_thumbnail(json.loads(block))
+        except ValueError:
+            continue
+        if value:
+            candidates.append(value.strip())
+    for candidate in candidates:
+        absolute = urljoin(base, candidate)
+        if urlsplit(absolute).scheme == "https":
+            return absolute
+    return None
+
+
+def page_preview(page_url: str, emit: Emit) -> bytes | None:
+    """The page's own picture when yt-dlp gave none: one GET for the page, one for the image."""
+    try:
+        page = fetch_bytes(page_url, MAX_PAGE_BYTES, accept=("text/html", "application/xhtml"))
+        if not page:
+            return None
+        image_url = page_image_url(page.decode("utf-8", "replace"), page_url)
+        if not image_url:
+            return None
+        return fetch_bytes(image_url, MAX_PAGE_IMAGE_BYTES, https_only=True, accept=("image/",))
+    except (EngineError, OSError, http.client.HTTPException, ValueError) as exc:
+        emit("log", {"level": "warning", "message": f"page preview failed: {type(exc).__name__}"})
+        return None
+
+
+# ── ffprobe / ffmpeg on a direct file (plan §5.6) ──────────────────────────────────────────
+# ffmpeg would resolve the host again and follow redirects on its own, outside every check
+# above. So it never sees the link: a loopback relay with a random path serves the file to it
+# through ``open_url`` (checked and pinned on every hop), and ffmpeg may speak only http/tcp.
+RELAY_BYTE_CAP = 64 * 1024 * 1024
+PROBE_TIMEOUT = 30
+RELAY_SECONDS = 2 * PROBE_TIMEOUT + 5  # the probe, then the frame or cover
+MAX_FRAME_BYTES = 2 * 1024 * 1024
+MAX_PROBE_JSON = 1024 * 1024
+_CODEC_LABELS = {"opus": "Opus", "vorbis": "Vorbis", "h264": "H.264", "hevc": "H.265"}
+_LOCAL_ONLY = ["-protocol_whitelist", "http,tcp"]
+
+
+class _RelayHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *_args: Any) -> None:  # nothing reaches stderr
+        pass
+
+    def do_GET(self) -> None:  # noqa: N802 - http.server's name
+        self.server.relay.serve(self)  # type: ignore[attr-defined]
+
+
+class Relay:
+    """``http://127.0.0.1:<port>/<token>`` → Range GETs of one checked URL, capped in total."""
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+        self.token = secrets.token_urlsafe(24)
+        self.served = 0
+        self.deadline = time.monotonic() + RELAY_SECONDS
+        self.lock = threading.Lock()
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _RelayHandler)
+        self.server.daemon_threads = True
+        self.server.relay = self  # type: ignore[attr-defined]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    @property
+    def local_url(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_address[1]}/{self.token}"
+
+    def __enter__(self) -> Relay:
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_exc: Any) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+    def serve(self, handler: BaseHTTPRequestHandler) -> None:
+        handler.close_connection = True
+        if handler.path != "/" + self.token or time.monotonic() > self.deadline:
+            handler.send_error(404)
+            return
+        headers = {}
+        match = re.fullmatch(r"bytes=(\d+)-(\d*)", handler.headers.get("Range") or "")
+        if match:
+            headers["Range"] = match.group(0)
+        try:
+            conn, resp, _ = open_url(self.url, headers)
+        except EngineError:
+            handler.send_error(502)
+            return
+        try:
+            if resp.status not in (200, 206):
+                handler.send_error(502)
+                return
+            status, skip, length = resp.status, 0, resp.getheader("Content-Length")
+            names = ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges"]
+            total = _total_from(resp, 0) if resp.status == 200 else None
+            emulated = bool(match) and total is not None
+            if emulated:
+                # The site ignored the range and sent the whole file: honour the range here,
+                # or ffmpeg reads the start of the file where it asked for the middle.
+                start = int(match.group(1))
+                end = min(int(match.group(2)) if match.group(2) else total - 1, total - 1)
+                if start > end:
+                    handler.send_error(416)
+                    return
+                status, skip, length = 206, start, str(end - start + 1)
+                names = ["Content-Type"]
+            handler.send_response(status)
+            for name in names:
+                value = resp.getheader(name)
+                if value:
+                    handler.send_header(name, value)
+            if emulated:
+                last = skip + int(length) - 1
+                handler.send_header("Content-Range", f"bytes {skip}-{last}/{total}")
+                handler.send_header("Content-Length", length)
+            handler.send_header("Connection", "close")
+            handler.end_headers()
+            remaining = int(length) if length and length.isdigit() else None
+            while time.monotonic() <= self.deadline and remaining != 0:
+                chunk = resp.read(CHUNK)
+                if not chunk:
+                    break
+                with self.lock:
+                    self.served += len(chunk)
+                    over = self.served > RELAY_BYTE_CAP
+                if over:
+                    break
+                if skip:
+                    dropped = min(skip, len(chunk))
+                    chunk, skip = chunk[dropped:], skip - dropped
+                if remaining is not None:
+                    chunk = chunk[:remaining]
+                    remaining -= len(chunk)
+                if chunk:
+                    handler.wfile.write(chunk)
+        except (OSError, http.client.HTTPException):
+            pass  # ffmpeg hung up once it had the bytes it needed, or the site did
+        finally:
+            conn.close()
+
+
+def _run_tool(args: list[str], limit: int) -> bytes | None:
+    """stdout of one trusted tool run, or None on failure, timeout or oversized output."""
+    try:
+        proc = subprocess.run(
+            args,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            timeout=PROBE_TIMEOUT,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if proc.returncode != 0 or not proc.stdout or len(proc.stdout) > limit:
+        return None
+    return proc.stdout
+
+
+def _positive(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if 0 < number < float("inf") else None
+
+
+def parse_probe(raw: bytes) -> dict[str, Any]:
+    """The facts a Result card shows, from ffprobe's JSON. Nothing else leaves."""
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    facts: dict[str, Any] = {}
+    fmt = data.get("format")
+    if isinstance(fmt, dict):
+        duration = _positive(fmt.get("duration"))
+        if duration and duration < 10 * 24 * 3600:
+            facts["duration"] = round(duration, 3)
+        bitrate = _positive(fmt.get("bit_rate"))
+        if bitrate:
+            facts["tbr"] = round(bitrate / 1000)
+    streams = data.get("streams")
+    for stream in streams if isinstance(streams, list) else []:
+        if not isinstance(stream, dict):
+            continue
+        codec = re.sub(r"[^A-Za-z0-9_.-]", "", str(stream.get("codec_name") or ""))[:20]
+        disposition = stream.get("disposition")
+        cover = isinstance(disposition, dict) and bool(disposition.get("attached_pic"))
+        if stream.get("codec_type") == "video" and cover:
+            facts["has_cover"] = True
+        elif stream.get("codec_type") == "video" and "vcodec" not in facts:
+            facts["vcodec"] = codec or "video"
+            for key in ("width", "height"):
+                value = stream.get(key)
+                if _is_size(value):
+                    facts[key] = value
+        elif stream.get("codec_type") == "audio" and "acodec" not in facts:
+            facts["acodec"] = codec or "audio"
+            abr = _positive(stream.get("bit_rate"))
+            if abr:
+                facts["abr"] = round(abr / 1000)
+    return facts
+
+
+def _is_size(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and 0 < value < 20000
+
+
+def probe_file(url: str, kind: str, emit: Emit) -> tuple[dict[str, Any], bytes | None]:
+    """(ffprobe facts, preview image bytes) for a direct video or audio file.
+
+    Video: a frame at about 10% of the duration. Audio: the embedded cover, if any. Without the
+    runner's ffprobe/ffmpeg, or on any failure, whatever was learned so far is returned.
+    """
+    from .ytdlp import trusted_tool  # (import cycle)
+
+    ffprobe, ffmpeg = trusted_tool("ffprobe"), trusted_tool("ffmpeg")
+    if ffprobe is None:
+        emit("log", {"level": "warning", "message": "ffprobe is missing: no file details"})
+        return {}, None
+    image = None
+    with Relay(url) as relay:
+        raw = _run_tool(
+            [str(ffprobe), "-v", "error", *_LOCAL_ONLY, "-print_format", "json",
+             "-show_format", "-show_streams", relay.local_url],
+            MAX_PROBE_JSON,
+        )  # fmt: skip
+        facts = parse_probe(raw) if raw else {}
+        base = [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-nostdin", *_LOCAL_ONLY]
+        out = ["-frames:v", "1", "-f", "image2pipe", "-c:v", "mjpeg", "pipe:1"]
+        if ffmpeg is not None and kind == "video" and facts.get("vcodec"):
+            seek = f"{(facts.get('duration') or 0) * 0.1:.3f}"
+            scale = ["-vf", "scale='min(960,iw)':-2"]
+            image = _run_tool(
+                [*base, "-ss", seek, "-i", relay.local_url, *scale, *out], MAX_FRAME_BYTES
+            )
+        elif ffmpeg is not None and kind == "audio" and facts.get("has_cover"):
+            image = _run_tool(
+                [*base, "-i", relay.local_url, "-map", "0:v:0", "-an", *out], MAX_FRAME_BYTES
+            )
+    if raw is None:
+        emit("log", {"level": "warning", "message": "ffprobe could not read the file"})
+    return facts, image
 
 
 class HttpEngine:
@@ -427,13 +753,19 @@ class HttpEngine:
         if presets.is_row_request(opts):
             opts = row_options(presets.parse_row_request(opts, original_only=True))
             job = replace(job, options=opts)
-        allowed = {"mode", "preset", "output_name", "video_container"} | IMAGE_OPTION_KEYS
+        allowed = {"mode", "preset", "output_name", "video_container", "extract",
+                   "frame_format"} | IMAGE_OPTION_KEYS
         if set(opts) - allowed or opts.get("preset") != PRESET_ID:
             raise EngineError("bad_options", "the direct engine takes only preset=original_file")
         if "output_name" in opts and not isinstance(opts["output_name"], str):
             raise EngineError("bad_options", "'output_name' must be a string")
         if opts.get("video_container", "original") not in VIDEO_CONTAINERS:
             raise EngineError("bad_options", "unknown video container")
+        extract = opts.get("extract")
+        if extract is not None and not (isinstance(extract, str) and _EXTRACT.fullmatch(extract)):
+            raise EngineError("bad_options", "unknown audio or frame choice")
+        if opts.get("frame_format", "original") not in FRAME_FORMATS:
+            raise EngineError("bad_options", "'frame_format' must be original, jpg, png or webp")
         parse_image_options(opts)  # refused before any request
         return self._download(job, emit)
 
@@ -470,9 +802,21 @@ class HttpEngine:
             data = _image_preview(url, emit)
             if data is not None:
                 preview = {"data": base64.b64encode(data).decode("ascii")}
+        elif kind in ("video", "audio"):
+            facts, image = probe_file(url, kind, emit)
+            facts.pop("has_cover", None)
+            info.update(facts)
+            if facts.get("acodec"):
+                codec = _CODEC_LABELS.get(facts["acodec"], facts["acodec"].upper())
+                info["source_audio"] = {"codec": codec, "abr_kbps": facts.get("abr")}
+            if image is not None:
+                preview = {"data": base64.b64encode(image).decode("ascii")}
         info.update(file_rows(kind, info["ext"], total))
-        # Extracting audio or a frame from a direct video needs ffprobe/ffmpeg on the link
-        # (plan §5.6, R3); until then a tab is offered only when it has a row.
+        if kind == "video":
+            if info.get("height"):
+                info["video_rows"][0]["height"] = info["height"]
+            info.update(extract_rows(info))
+        # A tab is offered only when it has a row (no ffmpeg: a video has no audio/frame rows).
         tabs = [t for t in tabs if info.get(f"{t}_rows")]
         return media_result(kind, tabs, stem or name, url, preview=preview, **info)
 
@@ -583,7 +927,11 @@ class HttpEngine:
         (final_name,), notes = finish_images([str(final)], fmt, background, emit)
         final = Path(final_name)  # the converted file when there was a conversion
         container = options.get("video_container", "original")
-        if container != "original" and final.suffix.lower() != "." + container:
+        if options.get("extract"):
+            emit("stage", {"stage": "converting"})
+            frame_format = options.get("frame_format", "original")
+            final = extract_media(final, options["extract"], frame_format)
+        elif container != "original" and final.suffix.lower() != "." + container:
             emit("stage", {"stage": "converting"})
             final = convert_video(final, container)
         emit("stage", {"stage": "completed"})
@@ -627,6 +975,12 @@ def row_options(request: presets.RowRequest) -> dict[str, Any]:
     opts: dict[str, Any] = {"mode": "download", "preset": PRESET_ID}
     if request.edited_title:
         opts["output_name"] = request.edited_title
+    extract = request.row_id.split(":", 1)[1]
+    if request.row_id not in presets.ORIGINAL_ROW_IDS.values():
+        opts["extract"] = extract  # audio from a video, or one frame of it
+        if request.tab == "image":
+            opts["frame_format"] = request.container or "original"
+        return opts
     if request.tab == "image" and request.container not in (None, "original"):
         opts["image_format"] = request.container
     if request.tab == "video" and request.container:
@@ -670,6 +1024,95 @@ def convert_video(source: Path, container: str) -> Path:
                 source.unlink(missing_ok=True)
                 return final
         raise EngineError("convert_error", f"could not save this video as {container.upper()}")
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+# ── a direct video's audio and frame rows (plan §5.3: Audio (extract), Image (frame)) ──────
+FRAME_FORMATS = {"original": "jpg", "jpg": "jpg", "png": "png", "webp": "webp"}
+_EXTRACT = re.compile(r"mp3:(320|256|192|128|64)|m4a|opus|flac|wav|frame")
+EXTRACT_TIMEOUT = 1800
+# (extension, ffmpeg attempts): copying the stream is tried first where the codec may allow it.
+_AUDIO_TARGETS = {
+    "m4a": ("m4a", [["-c:a", "copy"], ["-c:a", "aac", "-b:a", "256k"]]),
+    "opus": ("opus", [["-c:a", "copy"], ["-c:a", "libopus", "-b:a", "160k"]]),
+    "flac": ("flac", [["-c:a", "flac"]]),
+    "wav": ("wav", [["-c:a", "pcm_s16le"]]),
+}
+
+
+def extract_rows(facts: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """Audio rows (when the video has sound) and a frame row, for a probed direct video.
+
+    Offered only with the runner's ffmpeg, which does the work after the download."""
+    from .ytdlp import audio_rows, trusted_tool  # (import cycle)
+
+    if trusted_tool("ffmpeg") is None or not facts.get("vcodec"):
+        return {}
+    rows: dict[str, list[dict[str, Any]]] = {}
+    if facts.get("acodec"):
+        source = {"vcodec": "none", "acodec": facts["acodec"], "abr": facts.get("abr")}
+        rows["audio_rows"] = audio_rows([source], facts.get("duration"))
+    frame: dict[str, Any] = {"id": "i:frame", "frame": True, "ext": "jpg", "default": True}
+    frame.update({k: facts[k] for k in ("width", "height") if k in facts})
+    rows["image_rows"] = [frame]
+    return rows
+
+
+def extract_media(video: Path, what: str, image_format: str) -> Path:
+    """``what`` (a row's ``mp3:<kbps>``, ``m4a``, ``opus``, ``flac``, ``wav`` or ``frame``) from
+    the downloaded ``video``, saved next to it; the video is removed on success.
+
+    The runner's ffmpeg reads only this local file, with an argument list and a timeout."""
+    from .ytdlp import trusted_tool  # (import cycle)
+
+    ffmpeg = trusted_tool("ffmpeg")
+    if ffmpeg is None:
+        raise EngineError("convert_error", "FFmpeg is needed to take the audio or a frame")
+    if what == "frame":
+        ext = FRAME_FORMATS[image_format]
+        facts = {}
+        ffprobe = trusted_tool("ffprobe")
+        if ffprobe is not None:
+            raw = _run_tool(
+                [str(ffprobe), "-v", "error", "-print_format", "json", "-show_format",
+                 str(video)],
+                MAX_PROBE_JSON,
+            )  # fmt: skip
+            facts = parse_probe(raw) if raw else {}
+        seek = f"{(facts.get('duration') or 0) * 0.1:.3f}"
+        attempts = [["-ss", seek, "-i", str(video), "-frames:v", "1", "-update", "1"]]
+    elif what.startswith("mp3:"):
+        ext = "mp3"
+        kbps = what.split(":")[1]
+        attempts = [["-i", str(video), "-vn", "-c:a", "libmp3lame", "-b:a", f"{kbps}k"]]
+    else:
+        ext, codecs = _AUDIO_TARGETS[what]
+        attempts = [["-i", str(video), "-vn", *codec] for codec in codecs]
+    temp = video.with_name(f".{video.stem[:40]}.extracting.{ext}")
+    try:
+        for args in attempts:
+            cmd = [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-nostdin", "-y", *args]
+            if what != "frame":
+                cmd += ["-map_metadata", "0"]  # the file's own tags, if it has any
+            try:
+                proc = subprocess.run(
+                    [*cmd, str(temp)],
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    timeout=EXTRACT_TIMEOUT,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise EngineError("convert_error", "taking the audio or frame timed out") from exc
+            except OSError as exc:
+                raise EngineError("convert_error", "FFmpeg could not be started") from exc
+            if proc.returncode == 0 and temp.is_file() and temp.stat().st_size:
+                final = move_into_place(temp, video.parent, f"{video.stem}.{ext}")
+                video.unlink(missing_ok=True)
+                return final
+        target = "a frame" if what == "frame" else ext.upper()
+        raise EngineError("convert_error", f"could not take {target} from this video")
     finally:
         temp.unlink(missing_ok=True)
 

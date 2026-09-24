@@ -156,7 +156,7 @@ def single_item_fields(kind: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
     if kind == "video":
         row.update({"container": item.get("ext"), "fixed_container": True})
-    return {f"{kind}_rows": [row], "preview": item.get("thumbnail")}
+    return {f"{kind}_rows": [row], "preview": item.get("preview")}
 
 
 def rename_single(result: dict[str, Any], edited_title: str | None) -> dict[str, Any]:
@@ -414,7 +414,7 @@ class GalleryDlEngine:
                 emit("log", {"level": "warning", "message": "a gallery preview could not load"})
                 continue
             if data and len(data) <= MAX_PREVIEW_BYTES:
-                row["thumbnail"] = {"data": base64.b64encode(data).decode("ascii")}
+                row["preview"] = {"data": base64.b64encode(data).decode("ascii")}
 
     # ── download ───────────────────────────────────────────────────────────────────────────
     def _download(

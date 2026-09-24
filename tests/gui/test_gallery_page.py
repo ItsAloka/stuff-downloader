@@ -67,7 +67,7 @@ def gallery_result(n=4):
         {"index": i, "kind": "image" if i != 2 else "video", "ext": "jpg" if i != 2 else "mp4"}
         for i in range(1, n + 1)
     ]
-    items[0]["thumbnail"] = {"data": _png()}
+    items[0]["preview"] = {"data": _png()}
     return protocol.media_result(
         "gallery",
         ["gallery"],

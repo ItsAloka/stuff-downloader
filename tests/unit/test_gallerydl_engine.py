@@ -243,7 +243,7 @@ def test_analyze_returns_rebuilt_rows_and_never_an_item_url(fake_gdl):
     rows = result["items"]
     assert [r["index"] for r in rows] == [1, 2, 3, 4]
     assert rows[0] | {} == {**rows[0], "kind": "image", "ext": "jpg", "width": 1080, "height": 1350}
-    assert rows[1]["kind"] == "video" and "thumbnail" not in rows[1]
+    assert rows[1]["kind"] == "video" and "preview" not in rows[1]
     # The post's own durable link is the one URL allowed out; no item URL ever is.
     assert result["webpage"] == URL
     text = json.dumps({k: v for k, v in result.items() if k != "webpage"})
@@ -283,16 +283,16 @@ def test_a_post_with_one_clip_is_a_video(fake_gdl):
 def test_previews_only_from_https_public_hosts(fake_gdl):
     result, _ = _run({"mode": "analyze"})
     rows = result["items"]
-    assert base64.b64decode(rows[0]["thumbnail"]["data"]) == JPEG
-    assert "thumbnail" not in rows[2]  # plain http
-    assert "thumbnail" not in rows[3]  # an IP address
+    assert base64.b64decode(rows[0]["preview"]["data"]) == JPEG
+    assert "preview" not in rows[2]  # plain http
+    assert "preview" not in rows[3]  # an IP address
     assert fake_gdl["preview_urls"] == [fake_gdl["items"][0][0]]
 
 
 def test_oversized_previews_are_dropped(fake_gdl):
     fake_gdl["preview_bytes"] = b"x" * (gallerydl.MAX_PREVIEW_BYTES + 10)
     result, _ = _run({"mode": "analyze"})
-    assert "thumbnail" not in result["items"][0]
+    assert "preview" not in result["items"][0]
 
 
 def test_config_keeps_stdout_clean_and_cookies_file_untouched(fake_gdl):

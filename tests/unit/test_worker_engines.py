@@ -62,6 +62,7 @@ class FakeDownloadError(Exception):
 @pytest.fixture
 def fake_ytdlp(monkeypatch):
     """A stand-in yt_dlp module: returns raw info with URLs and runs the configured hooks."""
+    from stuff_downloader_worker.engines import http as http_engine
     from stuff_downloader_worker.engines import ytdlp
 
     state = {"opts": None, "raise": None, "write": None}
@@ -70,24 +71,26 @@ def fake_ytdlp(monkeypatch):
         fmt["url"] = f"https://rr1.googlevideo.com/videoplayback?sig=SECRET&itag={fmt['format_id']}"
         fmt["http_headers"] = {"Cookie": "SID=secret"}
     raw["thumbnails"] = [
-        {"url": "https://evil.example/huge.jpg", "width": 9999, "height": 9999},
+        {"url": "https://localhost/huge.jpg", "width": 9999, "height": 9999},
+        {"url": "https://192.168.1.4/huge.jpg", "width": 9000, "height": 9000},
+        {"url": "https://user:pw@cdn.example.com/huge.jpg", "width": 8000, "height": 8000},
         {"url": "https://i.ytimg.com/vi/x/hq.jpg", "width": 480, "height": 360},
         {"url": "http://i.ytimg.com/vi/x/sq.jpg", "width": 544, "height": 544},
     ]
     state["raw"] = raw
+    state["fetched"] = []
+    state["page_previews"] = []
 
-    class Resp:
-        def __init__(self, data):
-            self.data = data
+    def fake_fetch(url, limit, seconds=15.0, https_only=False, accept=()):
+        state["fetched"].append({"url": url, "https_only": https_only, "accept": accept})
+        return b"\xff\xd8jpegdata"
 
-        def __enter__(self):
-            return self
+    def fake_page_preview(url, emit):
+        state["page_previews"].append(url)
+        return state.get("page_image")
 
-        def __exit__(self, *exc):
-            return False
-
-        def read(self, n):
-            return self.data[:n]
+    monkeypatch.setattr(http_engine, "fetch_bytes", fake_fetch)
+    monkeypatch.setattr(http_engine, "page_preview", fake_page_preview)
 
     class FakeYDL:
         def __init__(self, opts):
@@ -104,10 +107,6 @@ def fake_ytdlp(monkeypatch):
             if state["raise"]:
                 raise FakeDownloadError(state["raise"])
             return json.loads(json.dumps(state["raw"]))
-
-        def urlopen(self, url):
-            state["thumb_url"] = url
-            return Resp(b"\xff\xd8jpegdata")
 
         def process_ie_result(self, info, download=True):
             opts = state["opts"]
@@ -153,10 +152,96 @@ def test_analyze_returns_sanitized_info_and_safe_thumbnail(fake_ytdlp):
     assert "googlevideo" not in text and "SECRET" not in text and "Cookie" not in text
     assert result["title"] and result["engine_version"] == "2026.08.19"
     assert all("url" not in f for f in result["formats"])
-    assert fake_ytdlp["thumb_url"] == "https://i.ytimg.com/vi/x/hq.jpg"  # https + known host only
+    # https + a public host name + no credentials: the biggest such thumbnail is the preview.
+    assert fake_ytdlp["fetched"] == [
+        {"url": "https://i.ytimg.com/vi/x/hq.jpg", "https_only": True, "accept": ("image/",)}
+    ]
+    assert fake_ytdlp["page_previews"] == []
     assert result["preview"]["data"]
     assert events[0] == ("stage", {"stage": "analyzing"})
     assert fake_ytdlp["opts"]["noplaylist"] is True
+
+
+# ── previews on any public host (plan §5.6, R3: P5) ──────────────────────────────────────
+def test_a_non_youtube_thumbnail_host_is_used_and_the_largest_wins(fake_ytdlp):
+    fake_ytdlp["raw"]["thumbnails"] = [
+        {"url": "https://i.vimeocdn.com/video/small.jpg", "width": 295, "height": 166},
+        {"url": "https://i.vimeocdn.com/video/big.jpg", "width": 1280, "height": 720},
+        {"url": "https://p16-sign.tiktokcdn.com/sq.jpg", "width": 720, "height": 720},
+    ]
+    result = _analyze_page("https://vimeo.com/76979871")
+    assert fake_ytdlp["fetched"][0]["url"] == "https://i.vimeocdn.com/video/big.jpg"
+    assert result["preview"]["data"]
+
+
+def test_music_prefers_square_art_over_a_bigger_wide_thumbnail(fake_ytdlp):
+    fake_ytdlp["raw"]["thumbnails"] = [
+        {"url": "https://i.ytimg.com/vi/x/maxres.jpg", "width": 1280, "height": 720},
+        {"url": "https://lh3.googleusercontent.com/sq=w544", "width": 544, "height": 544},
+    ]
+    _analyze_page("https://music.youtube.com/watch?v=dQw4w9WgXcQ")
+    assert fake_ytdlp["fetched"][0]["url"] == "https://lh3.googleusercontent.com/sq=w544"
+
+
+def test_a_video_does_not_prefer_square_art(fake_ytdlp):
+    fake_ytdlp["raw"]["thumbnails"] = [
+        {"url": "https://i.ytimg.com/vi/x/maxres.jpg", "width": 1280, "height": 720},
+        {"url": "https://i.ytimg.com/vi/x/sq.jpg", "width": 544, "height": 544},
+    ]
+    _analyze_page("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    assert fake_ytdlp["fetched"][0]["url"] == "https://i.ytimg.com/vi/x/maxres.jpg"
+
+
+@pytest.mark.parametrize(
+    "thumb",
+    [
+        "http://cdn.example.com/a.jpg",
+        "https://localhost/a.jpg",
+        "https://10.0.0.5/a.jpg",
+        "https://[::1]/a.jpg",
+        "https://printer.local/a.jpg",
+        "https://u:p@cdn.example.com/a.jpg",
+        "file:///C:/Windows/win.ini",
+    ],
+)
+def test_non_public_or_plain_http_thumbnails_are_never_fetched(fake_ytdlp, thumb):
+    fake_ytdlp["raw"]["thumbnails"] = [{"url": thumb, "width": 640, "height": 360}]
+    fake_ytdlp["raw"]["thumbnail"] = thumb
+    result = _analyze_page("https://www.example.com/watch/1")
+    assert fake_ytdlp["fetched"] == []
+    # No usable thumbnail: the page's own og:image is tried instead, and there is none here.
+    assert fake_ytdlp["page_previews"] == ["https://www.example.com/watch/1"]
+    assert result["preview"] is None
+
+
+def test_no_thumbnail_falls_back_to_the_page_image(fake_ytdlp):
+    fake_ytdlp["raw"]["thumbnails"] = []
+    fake_ytdlp["page_image"] = b"\xff\xd8og"
+    result = _analyze_page("https://www.example.com/news/story")
+    assert fake_ytdlp["page_previews"] == ["https://www.example.com/news/story"]
+    assert result["preview"]["data"]
+
+
+def test_a_failed_thumbnail_fetch_does_not_fail_the_analyze(fake_ytdlp, monkeypatch):
+    from stuff_downloader_worker.engines import http as http_engine
+
+    def boom(*_args, **_kwargs):
+        raise EngineError("unsupported", "that link points at a private network address")
+
+    monkeypatch.setattr(http_engine, "fetch_bytes", boom)
+    events, emit = _collect()
+    spec = JobSpec("j1", "ytdlp", "https://vimeo.com/1", ".", {"mode": "analyze"})
+    result = get_engine("ytdlp").download(spec, emit)
+    assert result["preview"] is None and result["title"]
+    assert any(k == "log" and "thumbnail preview failed" in d["message"] for k, d in events)
+
+
+def test_trusted_tool_knows_ffprobe(monkeypatch, tmp_path):
+    from stuff_downloader_worker.engines import ytdlp
+
+    (tmp_path / "ffprobe.exe").write_bytes(b"")
+    monkeypatch.setenv(ytdlp.TOOLS_DIR_ENV_VAR, str(tmp_path))
+    assert ytdlp.trusted_tool("ffprobe") == tmp_path / "ffprobe.exe"
 
 
 # ── media kind (plan §5.3, R1 acceptance) ────────────────────────────────────────────────
@@ -425,7 +510,9 @@ def test_audio_rows_cover_mp3_bitrates_m4a_opus_flac_and_wav(fake_ytdlp):
 
 def test_image_rows_are_the_thumbnail_sizes_that_exist(fake_ytdlp):
     result = _analyze_page("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-    assert [r["id"] for r in result["image_rows"]] == ["i:9999x9999", "i:544x544", "i:480x360"]
+    assert [r["id"] for r in result["image_rows"]] == [
+        "i:9999x9999", "i:9000x9000", "i:8000x8000", "i:544x544", "i:480x360"
+    ]
 
 
 def test_an_audio_only_page_has_no_video_rows_and_no_opus_row_without_opus(fake_ytdlp):

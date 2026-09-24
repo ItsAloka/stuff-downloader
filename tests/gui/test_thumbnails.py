@@ -220,3 +220,54 @@ def test_gallery_tiles_decode_capped_and_tooltips_are_plain_text(window):  # noq
     assert "&lt;B&gt;" in tip and "<B>" not in tip
     assert not card.grid.item(0).icon().isNull()
     assert card.grid.item(1).icon().isNull()  # refused, the kind glyph stays
+
+
+# ── the Result card preview (plan §5.6, R3) ──────────────────────────────────────────────
+def _card(qtbot):
+    from stuff_downloader.gui.widgets import ResultCard
+
+    card = ResultCard()
+    qtbot.addWidget(card)
+    return card
+
+
+def _image(width, height, color):
+    image = QImage(width, height, QImage.Format.Format_RGB32)
+    image.fill(QColor(color))
+    return image
+
+
+def test_a_video_preview_is_480x270_with_the_duration_in_its_corner(qtbot):
+    card = _card(qtbot)
+    card.set_preview(_image(1280, 720, "#00ff00"), {"kind": "video", "duration": 244})
+    pixmap = card.cover.pixmap()
+    assert (card.cover.width(), card.cover.height()) == (480, 270)
+    assert (pixmap.width(), pixmap.height()) == (480, 270) and card.cover.text() == ""
+    shown = pixmap.toImage()
+    assert shown.pixelColor(20, 20) == QColor("#00ff00")
+    # The duration badge is dark and sits in the bottom-right corner, over the picture.
+    badge = shown.pixelColor(470, 256)
+    assert badge.green() < 128
+
+
+def test_a_music_preview_is_300x300_and_letterboxes_a_wide_picture(qtbot):
+    card = _card(qtbot)
+    card.set_preview(_image(640, 360, "#ff0000"), {"kind": "audio", "duration": 61})
+    assert (card.cover.width(), card.cover.height()) == (300, 300)
+    shown = card.cover.pixmap().toImage()
+    assert shown.pixelColor(150, 150) == QColor("#ff0000")
+    assert shown.pixelColor(150, 5) != QColor("#ff0000")  # bars, never stretched
+
+
+def test_no_duration_means_no_badge(qtbot):
+    card = _card(qtbot)
+    card.set_preview(_image(480, 270, "#00ff00"), {"kind": "video"})
+    assert card.cover.pixmap().toImage().pixelColor(470, 256) == QColor("#00ff00")
+
+
+@pytest.mark.parametrize(("kind", "text"), [("audio", "🎵"), ("video", "🎞"), ("image", "🎞")])
+def test_the_placeholder_shows_only_without_a_picture(qtbot, kind, text):
+    card = _card(qtbot)
+    card.set_preview(_image(10, 10, "#00ff00"), {"kind": kind})
+    card.set_preview(None, {"kind": kind, "duration": 5})
+    assert card.cover.text() == text and card.cover.pixmap().isNull()

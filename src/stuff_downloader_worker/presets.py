@@ -268,6 +268,13 @@ _VIDEO_ROW = re.compile(r"v:([1-9][0-9]{0,3}):(mp4|webm)")
 _IMAGE_ROW = re.compile(r"i:(orig|best|([1-9][0-9]{0,4})x([1-9][0-9]{0,4}))")
 # The direct-file engine's single row per tab: the file as the site serves it.
 ORIGINAL_ROW_IDS = {"video": "v:orig", "audio": "a:orig", "image": "i:orig"}
+# A direct video's other rows (plan §5.3): its audio, extracted, and one still frame.
+FRAME_ROW_ID = "i:frame"
+DIRECT_FILE_ROW_IDS = {
+    "video": frozenset({"v:orig"}),
+    "audio": frozenset({"a:orig", *AUDIO_ROW_IDS}),
+    "image": frozenset({"i:orig", FRAME_ROW_ID}),
+}
 
 VIDEO_ROW_OUTTMPL = "%(title).150B.%(ext)s"
 # An AAC source is copied into M4A; anything else is encoded at this quality.
@@ -310,8 +317,9 @@ def is_row_request(options: dict[str, Any]) -> bool:
 
 
 def parse_row_request(options: dict[str, Any], *, original_only: bool = False) -> RowRequest:
-    """One Result-card row request, validated. ``original_only`` is the direct-file engine,
-    which has exactly one row per tab (``v:orig``, ``a:orig``, ``i:orig``)."""
+    """One Result-card row request, validated. ``original_only`` is the direct-file engine:
+    the file itself (``v:orig``, ``a:orig``, ``i:orig``), or from a video its audio as an
+    audio row, or ``i:frame``."""
     allowed = {"mode", "tab", "row_id", "container", "edited_title"}
     unknown = set(options) - allowed
     if unknown:
@@ -327,7 +335,7 @@ def parse_row_request(options: dict[str, Any], *, original_only: bool = False) -
         raise EngineError("bad_options", "'edited_title' must be a short string")
     fields: dict[str, Any] = {}
     if original_only:
-        if row_id != ORIGINAL_ROW_IDS[tab]:
+        if row_id not in DIRECT_FILE_ROW_IDS[tab]:
             raise EngineError("bad_options", f"unknown row {row_id!r}")
     elif tab == "video":
         match = _VIDEO_ROW.fullmatch(row_id)

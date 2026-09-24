@@ -184,6 +184,7 @@ def playlist_options() -> dict[str, Any]:
 # ── Result-card rows (plan §5.4, §8 R2) ─────────────────────────────────────────────────────
 # One row's download is {tab, row_id, container, edited_title}. Row ids are the worker's own
 # (v:1080:mp4, a:mp3:320, i:1280x720, v:orig…); this mirrors the worker's validation.
+# A direct video also offers audio rows (extracted) and ``i:frame``, a still from the video.
 ROW_TABS = ("video", "audio", "image")
 VIDEO_CONTAINERS = ("mp4", "mkv", "webm", "mov", "avi")
 REENCODE_CONTAINERS = frozenset({"mov", "avi"})
@@ -193,7 +194,7 @@ MAX_EDITED_TITLE = 300
 _ROW_ID = {
     "video": re.compile(r"v:(orig|[1-9][0-9]{0,3}:(mp4|webm))"),
     "audio": re.compile(r"a:(orig|mp3:(320|256|192|128|64)|m4a|opus|flac|wav)"),
-    "image": re.compile(r"i:(orig|best|[1-9][0-9]{0,4}x[1-9][0-9]{0,4})"),
+    "image": re.compile(r"i:(orig|best|frame|[1-9][0-9]{0,4}x[1-9][0-9]{0,4})"),
 }
 _AUDIO_NAMES = {"m4a": "M4A", "opus": "Opus", "flac": "FLAC", "wav": "WAV", "orig": "Original"}
 
@@ -248,5 +249,6 @@ def row_label(options: dict[str, Any]) -> str:
     if tab == "image":
         size = parts[1] if len(parts) > 1 and "x" in parts[1] else ""
         fmt = "Original" if container in ("", "original") else container.upper()
-        return "  ".join(p for p in (f"Image · {fmt}", size) if p)
+        frame = "Frame" if parts[1:2] == ["frame"] else ""
+        return "  ".join(p for p in (f"Image · {fmt}", frame, size) if p)
     return "Download"

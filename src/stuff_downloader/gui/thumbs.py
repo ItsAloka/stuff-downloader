@@ -24,7 +24,9 @@ MAX_SIDE = 8192
 MAX_PIXELS = 40_000_000
 TIMEOUT = 10.0
 CACHE_SIZE = 400
-DECODE_BOX = QSize(320, 320)  # the analyze preview; nothing is shown bigger than this
+DECODE_BOX = QSize(320, 320)  # gallery tiles and other small previews
+# The Result card preview (480×270 video, 300×300 music), with room for 2× display scaling.
+PREVIEW_BOX = QSize(960, 960)
 ROW_BOX = QSize(160, 160)  # rows and queue cards: keeps a full cache near 25 MB
 
 ALLOWED_HOSTS = frozenset({"i.ytimg.com"})

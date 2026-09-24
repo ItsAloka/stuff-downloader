@@ -244,3 +244,49 @@ def test_the_direct_engines_take_only_their_original_rows():
 def test_a_webm_row_does_not_ask_for_h264():
     selector = presets.row_video_format(2160, "webm", "webm")
     assert "avc1" not in selector and selector.startswith("bv*[height=2160][ext=webm]+ba[ext=webm]")
+
+
+@pytest.mark.parametrize(
+    ("tab", "row_id", "container"),
+    [
+        ("audio", "a:mp3:320", None),
+        ("audio", "a:mp3:64", None),
+        ("audio", "a:m4a", None),
+        ("audio", "a:opus", None),
+        ("audio", "a:flac", None),
+        ("audio", "a:wav", None),
+        ("audio", "a:orig", None),
+        ("image", "i:frame", "png"),
+        ("image", "i:frame", "original"),
+    ],
+)
+def test_a_direct_video_also_takes_its_audio_and_frame_rows(tab, row_id, container):
+    request = presets.parse_row_request(
+        {"tab": tab, "row_id": row_id, "container": container}, original_only=True
+    )
+    assert (request.tab, request.row_id, request.container) == (tab, row_id, container)
+
+
+@pytest.mark.parametrize(
+    ("tab", "row_id", "container"),
+    [
+        ("audio", "a:mp3:999", None),
+        ("audio", "a:mp3:320", "mp4"),  # an audio row takes no container
+        ("image", "i:1280x720", "png"),  # thumbnail sizes are yt-dlp rows, not file rows
+        ("image", "i:best", "png"),
+        ("image", "i:frame", "tiff"),
+        ("image", "i:frame:2", "png"),
+        ("video", "v:frame", "mp4"),
+        ("audio", "a:frame", None),
+    ],
+)
+def test_the_direct_engines_refuse_other_rows(tab, row_id, container):
+    with pytest.raises(EngineError):
+        presets.parse_row_request(
+            {"tab": tab, "row_id": row_id, "container": container}, original_only=True
+        )
+
+
+def test_the_frame_row_is_not_a_yt_dlp_row():
+    with pytest.raises(EngineError):
+        _row(tab="image", row_id="i:frame", container="png")

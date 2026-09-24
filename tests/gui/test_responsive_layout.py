@@ -55,7 +55,7 @@ def test_result_cover_and_tabs_keep_their_natural_geometry(qtbot):
     card.show()
     qtbot.wait(1)
 
-    assert card.cover.size().width() == 240 and card.cover.size().height() == 135
+    assert card.cover.size().width() == 480 and card.cover.size().height() == 270  # plan §5.6
     assert card.tabs.geometry().top() > card.cover.geometry().bottom()
     assert not _intersects(card.cover, card.title_editor)
 
@@ -158,7 +158,7 @@ def test_the_pencil_sits_right_after_the_title_and_long_titles_are_elided(qtbot)
     card = ResultCard()
     qtbot.addWidget(card)
     card.title_editor.set_title("A YouTube Music song opens on its Audio tab")
-    card.resize(1200, 400)
+    card.resize(1440, 400)  # beside the 480-wide preview
     card.show()
     qtbot.wait(1)
     editor = card.title_editor

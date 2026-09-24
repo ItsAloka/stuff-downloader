@@ -188,6 +188,24 @@ def test_parse_keeps_only_well_formed_rows():
     assert not hasattr(listing.items[2], "url")
 
 
+def test_an_item_preview_is_read_from_the_mediaresult_preview_key():
+    new = base64.b64encode(b"\xff\xd8new").decode()
+    old = base64.b64encode(b"\xff\xd8old").decode()
+    listing = gallery.parse(
+        {
+            "items": [
+                {"index": 1, "kind": "image", "preview": {"data": new}},
+                {"index": 2, "kind": "image", "thumbnail": {"data": old}},  # pre-R3 name
+                {"index": 3, "kind": "image", "preview": {"data": new}, "thumbnail": {"data": old}},
+                {"index": 4, "kind": "image", "preview": "junk"},
+            ]
+        }
+    )
+    assert [i.preview for i in listing.items] == [
+        b"\xff\xd8new", b"\xff\xd8old", b"\xff\xd8new", b""
+    ]
+
+
 def test_parse_tolerates_junk():
     listing = gallery.parse({"items": "nope"})
     assert listing.items == () and listing.title == "Gallery"

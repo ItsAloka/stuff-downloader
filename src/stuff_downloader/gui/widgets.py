@@ -5,7 +5,7 @@ from __future__ import annotations
 import html
 
 from PyQt6.QtCore import QMimeData, QSize, Qt, pyqtSignal
-from PyQt6.QtGui import QColor, QDrag, QIcon, QImage, QPixmap
+from PyQt6.QtGui import QColor, QDrag, QFont, QIcon, QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -538,6 +538,39 @@ def image_row_cells(row: dict, fmt: str) -> tuple[str, str]:
     return ("Original" if fmt == "original" else fmt.upper()), quality
 
 
+PREVIEW_VIDEO = QSize(480, 270)
+PREVIEW_MUSIC = QSize(300, 300)
+
+
+def preview_pixmap(image: QImage, box: QSize, corner: str = "") -> QPixmap:
+    """``image`` fitted inside ``box`` (letterboxed, never stretched) with ``corner`` text,
+    such as the duration, drawn on a dark badge in the bottom-right corner (plan §5.6)."""
+    canvas = QPixmap(box)
+    canvas.fill(QColor("#133247"))
+    scaled = image.scaled(
+        box, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
+    )
+    painter = QPainter(canvas)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.drawImage((box.width() - scaled.width()) // 2, (box.height() - scaled.height()) // 2,
+                      scaled)  # fmt: skip
+    if corner:
+        font = QFont(painter.font())
+        font.setPointSize(10)
+        font.setBold(True)
+        painter.setFont(font)
+        text = painter.fontMetrics().boundingRect(corner)
+        width, height = text.width() + 12, text.height() + 6
+        x, y = box.width() - width - 8, box.height() - height - 8
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(0, 0, 0, 190))
+        painter.drawRoundedRect(x, y, width, height, 4, 4)
+        painter.setPen(QColor("#ffffff"))
+        painter.drawText(x, y, width, height, Qt.AlignmentFlag.AlignCenter, corner)
+    painter.end()
+    return canvas
+
+
 class ResultCard(Card):
     """One analyzed link (plan §5.8): preview, editable title, and Video / Audio / Image tabs
     of rows, each with its own Download button. Drawn only from the MediaResult."""
@@ -551,7 +584,7 @@ class ResultCard(Card):
         top = QHBoxLayout()
         top.setSpacing(14)
         self.cover = QLabel("🎞")
-        self.cover.setFixedSize(240, 135)
+        self.cover.setFixedSize(PREVIEW_VIDEO)
         self.cover.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.cover.setStyleSheet("background:#133247; color:#4cc2ff; border-radius:8px;")
         text_col = QVBoxLayout()
@@ -658,6 +691,19 @@ class ResultCard(Card):
         self.image_format_combo.currentIndexChanged.connect(lambda _: self._fill("image"))
 
     # ── filling ───────────────────────────────────────────────────────────────────────────
+    def set_preview(self, image: QImage | None, result: dict) -> None:
+        """The MediaResult's picture: about 480×270 for video, 300×300 for music, with the
+        duration over its corner. The placeholder shows only when there is no picture."""
+        music = result.get("kind") == "audio"
+        box = PREVIEW_MUSIC if music else PREVIEW_VIDEO
+        self.cover.setFixedSize(box)
+        if image is None or image.isNull():
+            self.cover.setPixmap(QPixmap())
+            self.cover.setText("🎵" if music else "🎞")
+            return
+        self.cover.setText("")
+        self.cover.setPixmap(preview_pixmap(image, box, format_duration(result.get("duration"))))
+
     def set_result(self, result: dict, rows: dict[str, list[dict]]) -> None:
         """Show ``result``'s tabs, in its order, with the rows the page already checked."""
         self._result = result

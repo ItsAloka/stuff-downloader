@@ -523,11 +523,11 @@ def test_a_failed_preview_still_analyzes_the_image(server, monkeypatch):
     calls = []
     real = http_engine.open_url
 
-    def second_call_fails(url, headers=None, method="GET"):
+    def second_call_fails(url, headers=None, method="GET", https_only=False):
         calls.append(url)
         if len(calls) > 1:
             raise OSError("connection reset")
-        return real(url, headers, method)
+        return real(url, headers, method, https_only)
 
     monkeypatch.setattr(http_engine, "open_url", second_call_fails)
     info, events = _analyze(server, "/p/photo.png")
@@ -661,3 +661,421 @@ def test_bad_image_options_are_refused_before_any_request(server, tmp_path, extr
     with pytest.raises(EngineError) as info:
         _download(server, "/p/photo.png", tmp_path, preset="original_file", **extra)
     assert info.value.code == "bad_options" and Handler.seen == []
+
+
+# ── previews for direct video and audio (plan §5.6, R3: P6) ──────────────────────────────
+TOOLS = Path(__file__).resolve().parents[2] / "tools"
+HAS_TOOLS = (TOOLS / "ffmpeg.exe").is_file() and (TOOLS / "ffprobe.exe").is_file()
+needs_tools = pytest.mark.skipif(not HAS_TOOLS, reason="the bundled ffmpeg/ffprobe are not here")
+
+
+def _make_media(tmp_path, name, *args):
+    import subprocess
+
+    out = tmp_path / name
+    cmd = [str(TOOLS / "ffmpeg.exe"), "-hide_banner", "-loglevel", "error", "-y", *args, str(out)]
+    subprocess.run(cmd, check=True, capture_output=True, timeout=60)
+    return out.read_bytes()
+
+
+@needs_tools
+def test_a_direct_video_gets_its_details_and_a_frame(server, tmp_path, monkeypatch):
+    monkeypatch.setenv("STUFF_DOWNLOADER_TOOLS_DIR", str(TOOLS))
+    body = _make_media(
+        tmp_path, "clip.mp4",
+        "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=4",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=4",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest",
+    )  # fmt: skip
+    Handler.routes["/d/clip.mp4"] = serve_file(body=body, ctype="video/mp4")
+    info, _ = _analyze(server, "/d/clip.mp4")
+    assert (info["width"], info["height"], info["vcodec"]) == (320, 240, "h264")
+    assert 3.5 < info["duration"] < 4.5 and info["acodec"] == "aac"
+    assert info["source_audio"]["codec"] == "AAC"
+    assert info["video_rows"][0]["height"] == 240
+    assert base64.b64decode(info["preview"]["data"])[:2] == b"\xff\xd8"  # a JPEG frame
+    protocol_check(info)
+
+
+@needs_tools
+def test_a_direct_mp3_gets_duration_bitrate_and_its_embedded_cover(server, tmp_path, monkeypatch):
+    monkeypatch.setenv("STUFF_DOWNLOADER_TOOLS_DIR", str(TOOLS))
+    cover = tmp_path / "cover.png"
+    cover.write_bytes(_png())
+    body = _make_media(
+        tmp_path, "song.mp3",
+        "-f", "lavfi", "-i", "sine=frequency=440:duration=3", "-i", str(cover),
+        "-map", "0:a", "-map", "1:v", "-c:a", "libmp3lame", "-b:a", "192k",
+        "-c:v", "png", "-disposition:v", "attached_pic", "-id3v2_version", "3",
+    )  # fmt: skip
+    Handler.routes["/d/song.mp3"] = serve_file(body=body, ctype="audio/mpeg")
+    info, _ = _analyze(server, "/d/song.mp3")
+    assert info["kind"] == "audio" and 2.5 < info["duration"] < 3.5
+    assert info["source_audio"] == {"codec": "MP3", "abr_kbps": 192}
+    assert "vcodec" not in info and "has_cover" not in info  # the cover is not a video
+    assert base64.b64decode(info["preview"]["data"])[:2] == b"\xff\xd8"
+    protocol_check(info)
+
+
+@needs_tools
+def test_a_direct_mp3_without_a_cover_has_details_and_no_preview(server, tmp_path, monkeypatch):
+    monkeypatch.setenv("STUFF_DOWNLOADER_TOOLS_DIR", str(TOOLS))
+    body = _make_media(
+        tmp_path, "plain.mp3", "-f", "lavfi", "-i", "sine=duration=2", "-b:a", "128k"
+    )
+    Handler.routes["/d/plain.mp3"] = serve_file(body=body, ctype="audio/mpeg")
+    info, _ = _analyze(server, "/d/plain.mp3")
+    assert info["source_audio"]["abr_kbps"] == 128 and info["preview"] is None
+
+
+def test_without_ffprobe_a_direct_video_still_analyzes(server, monkeypatch):
+    monkeypatch.delenv("STUFF_DOWNLOADER_TOOLS_DIR", raising=False)
+    Handler.routes["/d/clip.mp4"] = serve_file()
+    info, events = _analyze(server, "/d/clip.mp4")
+    assert info["kind"] == "video" and info["preview"] is None and "duration" not in info
+    assert any(k == "log" and "ffprobe is missing" in d["message"] for k, d in events)
+
+
+def _fake_tools(tmp_path, monkeypatch):
+    for exe in ("ffmpeg.exe", "ffprobe.exe"):
+        (tmp_path / exe).write_bytes(b"")
+    monkeypatch.setenv("STUFF_DOWNLOADER_TOOLS_DIR", str(tmp_path))
+
+
+def test_the_tools_never_see_the_remote_link(server, tmp_path, monkeypatch):
+    _fake_tools(tmp_path, monkeypatch)
+    calls = []
+    probe = {
+        "format": {"duration": "100.0", "bit_rate": "900000"},
+        "streams": [{"codec_type": "video", "codec_name": "h264", "width": 640, "height": 360}],
+    }
+
+    def fake_run(args, limit):
+        calls.append(args)
+        return json.dumps(probe).encode() if "-show_format" in args else b"\xff\xd8frame"
+
+    monkeypatch.setattr(http_engine, "_run_tool", fake_run)
+    Handler.routes["/d/clip.mp4"] = serve_file()
+    info, _ = _analyze(server, "/d/clip.mp4?sig=SECRET")
+    assert len(calls) == 2
+    for args in calls:
+        joined = " ".join(args)
+        assert "files.example.com" not in joined and "SECRET" not in joined
+        assert args[args.index("-protocol_whitelist") + 1] == "http,tcp"
+        local = [a for a in args if a.startswith("http://")]
+        assert len(local) == 1 and local[0].startswith("http://127.0.0.1:")
+    frame = calls[1]
+    assert frame[frame.index("-ss") + 1] == "10.000"  # 10% of 100 s
+    assert frame[frame.index("-frames:v") + 1] == "1"
+    assert info["preview"] is not None and info["tbr"] == 900
+
+
+def test_a_failing_tool_costs_only_the_preview(server, tmp_path, monkeypatch):
+    _fake_tools(tmp_path, monkeypatch)
+    monkeypatch.setattr(http_engine, "_run_tool", lambda args, limit: None)
+    Handler.routes["/d/clip.mp4"] = serve_file()
+    info, events = _analyze(server, "/d/clip.mp4")
+    assert info["kind"] == "video" and info["preview"] is None
+    assert any(k == "log" and "ffprobe could not read" in d["message"] for k, d in events)
+
+
+def _relay_get(relay_url, headers=None):
+    import urllib.error
+    import urllib.request
+
+    req = urllib.request.Request(relay_url, headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status, resp.read()
+    except urllib.error.HTTPError as exc:
+        return exc.code, b""
+
+
+def test_the_relay_serves_ranges_of_the_checked_link_only(server):
+    Handler.routes["/d/clip.mp4"] = serve_file()
+    with http_engine.Relay(server + "/d/clip.mp4") as relay:
+        status, body = _relay_get(relay.local_url, {"Range": "bytes=10-19"})
+        assert (status, body) == (206, BODY[10:20])
+        assert _relay_get(relay.local_url.rsplit("/", 1)[0] + "/guess")[0] == 404
+
+
+@pytest.mark.parametrize(
+    "target", ["http://localhost/x.mp4", "http://10.0.0.7/x.mp4", "file:///C:/x.mp4"]
+)
+def test_the_relay_refuses_a_redirect_to_a_private_target(server, target):
+    Handler.routes["/d/clip.mp4"] = redirect(target)
+    with http_engine.Relay(server + "/d/clip.mp4") as relay:
+        assert _relay_get(relay.local_url)[0] == 502
+
+
+def test_the_relay_stops_at_its_byte_cap(server, monkeypatch):
+    monkeypatch.setattr(http_engine, "RELAY_BYTE_CAP", 1000)
+    Handler.routes["/d/clip.mp4"] = serve_file()
+    with http_engine.Relay(server + "/d/clip.mp4") as relay:
+        try:
+            _, body = _relay_get(relay.local_url)
+        except Exception:  # a short body is a broken response to urllib, which is the point
+            body = b""
+        assert len(body) < len(BODY)
+
+
+@pytest.mark.parametrize(
+    ("raw", "facts"),
+    [
+        (b"not json", {}),
+        (b"[]", {}),
+        (
+            json.dumps({"format": {"duration": "nan", "bit_rate": "-5"}, "streams": "x"}).encode(),
+            {},
+        ),
+        (
+            json.dumps({"streams": [
+                {"codec_type": "audio", "codec_name": "mp3<script>", "bit_rate": "320000"},
+                {"codec_type": "video", "codec_name": "mjpeg", "disposition": {"attached_pic": 1}},
+            ]}).encode(),
+            {"acodec": "mp3script", "abr": 320, "has_cover": True},
+        ),
+        (
+            json.dumps({"streams": [
+                {"codec_type": "video", "codec_name": "vp9", "width": True, "height": 99999},
+            ]}).encode(),
+            {"vcodec": "vp9"},
+        ),
+    ],
+    ids=["garbage", "list", "bad-numbers", "audio-cover", "bad-sizes"],
+)  # fmt: skip
+def test_probe_output_is_sanitized(raw, facts):
+    assert http_engine.parse_probe(raw) == facts
+
+
+# ── page images when yt-dlp has none (plan §5.6) ─────────────────────────────────────────
+@pytest.mark.parametrize(
+    ("page", "found"),
+    [
+        ('<meta property="og:image" content="https://cdn.example.com/og.jpg">',
+         "https://cdn.example.com/og.jpg"),
+        ("<meta content='/img/tw.jpg' name='twitter:image'>",
+         "https://news.example.com/img/tw.jpg"),
+        ('<meta property="og:image" content="https://a.example.com/x.jpg?a=1&amp;b=2">',
+         "https://a.example.com/x.jpg?a=1&b=2"),
+        ('<script type="application/ld+json">{"@graph":[{"@type":"VideoObject",'
+         '"thumbnailUrl":["https://cdn.example.com/ld.jpg"]}]}</script>',
+         "https://cdn.example.com/ld.jpg"),
+        ('<meta property="og:image" content="http://cdn.example.com/plain.jpg">', None),
+        ('<meta property="og:image" content="javascript:alert(1)">', None),
+        ('<script type="application/ld+json">{broken</script>', None),
+        ("<html>nothing</html>", None),
+    ],
+    ids=["og", "twitter-relative", "entities", "json-ld", "plain-http", "js", "bad-json", "none"],
+)  # fmt: skip
+def test_page_image_url(page, found):
+    assert http_engine.page_image_url(page, "https://news.example.com/story/1") == found
+
+
+def test_page_preview_fetches_the_page_then_its_image(server, monkeypatch):
+    Handler.routes["/story"] = serve_file(
+        body=b'<meta property="og:image" content="https://img.example.com/og.png">',
+        ctype="text/html; charset=utf-8",
+    )
+    fetched = []
+    real = http_engine.fetch_bytes
+
+    def spy(url, limit, seconds=15.0, https_only=False, accept=()):
+        fetched.append((url, https_only))
+        if url.startswith("https://img.example.com"):
+            return PNG
+        return real(url, limit, seconds, https_only, accept)
+
+    monkeypatch.setattr(http_engine, "fetch_bytes", spy)
+    assert http_engine.page_preview(server + "/story", lambda *_: None) == PNG
+    assert fetched == [(server + "/story", False), ("https://img.example.com/og.png", True)]
+
+
+def test_an_https_only_fetch_refuses_plain_http(server):
+    with pytest.raises(EngineError, match="only http and https"):
+        http_engine.fetch_bytes(server + "/x.png", 1000, https_only=True)
+
+
+def test_page_preview_ignores_a_page_that_is_not_html(server):
+    Handler.routes["/d/clip.mp4"] = serve_file()
+    assert http_engine.page_preview(server + "/d/clip.mp4", lambda *_: None) is None
+
+
+# ── a direct video's audio and frame rows (plan §5.3, R3) ────────────────────────────────
+def _clip(tmp_path, audio=True):
+    sound = ["-f", "lavfi", "-i", "sine=frequency=440:duration=4", "-c:a", "aac", "-b:a", "128k",
+             "-shortest"] if audio else []  # fmt: skip
+    return _make_media(
+        tmp_path, "src.mp4",
+        "-f", "lavfi", "-i", "testsrc=size=320x240:rate=25:duration=4", *sound,
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+    )  # fmt: skip
+
+
+def _probe(path):
+    import subprocess
+
+    out = subprocess.run(
+        [str(TOOLS / "ffprobe.exe"), "-v", "error", "-print_format", "json", "-show_format",
+         "-show_streams", str(path)],
+        check=True, capture_output=True, timeout=30,
+    ).stdout  # fmt: skip
+    return json.loads(out)
+
+
+def _row_download(server, path, out, tab, row_id, container=None, **extra):
+    options = {"tab": tab, "row_id": row_id, **extra}
+    if container is not None:
+        options["container"] = container
+    return _download(server, path, out, **options)
+
+
+@needs_tools
+def test_a_direct_video_offers_its_audio_and_a_frame(server, tmp_path, monkeypatch):
+    monkeypatch.setenv("STUFF_DOWNLOADER_TOOLS_DIR", str(TOOLS))
+    Handler.routes["/d/clip.mp4"] = serve_file(body=_clip(tmp_path), ctype="video/mp4")
+    info, _ = _analyze(server, "/d/clip.mp4")
+    assert info["tabs"] == ["video", "audio", "image"]
+    ids = [r["id"] for r in info["audio_rows"]]
+    assert ids[:5] == ["a:mp3:320", "a:mp3:256", "a:mp3:192", "a:mp3:128", "a:mp3:64"]
+    assert {"a:m4a", "a:flac", "a:wav"} <= set(ids) and "a:opus" not in ids  # AAC source
+    m4a = next(r for r in info["audio_rows"] if r["id"] == "a:m4a")
+    assert m4a["copy"] is True  # the AAC stream is copied, not re-encoded
+    assert info["image_rows"] == [
+        {"id": "i:frame", "frame": True, "ext": "jpg", "default": True, "width": 320,
+         "height": 240}
+    ]
+    protocol_check(info)
+
+
+@needs_tools
+def test_a_silent_direct_video_offers_only_a_frame(server, tmp_path, monkeypatch):
+    monkeypatch.setenv("STUFF_DOWNLOADER_TOOLS_DIR", str(TOOLS))
+    Handler.routes["/d/clip.mp4"] = serve_file(body=_clip(tmp_path, audio=False))
+    info, _ = _analyze(server, "/d/clip.mp4")
+    assert info["tabs"] == ["video", "image"] and info["audio_rows"] == []
+
+
+def test_without_ffmpeg_a_direct_video_has_only_its_video_row(server, monkeypatch):
+    monkeypatch.delenv("STUFF_DOWNLOADER_TOOLS_DIR", raising=False)
+    Handler.routes["/d/clip.mp4"] = serve_file()
+    info, _ = _analyze(server, "/d/clip.mp4")
+    assert info["tabs"] == ["video"] and info["image_rows"] == []
+
+
+@needs_tools
+@pytest.mark.parametrize(
+    ("row_id", "ext", "codec"),
+    [
+        ("a:mp3:192", "mp3", "mp3"),
+        ("a:m4a", "m4a", "aac"),
+        ("a:flac", "flac", "flac"),
+        ("a:wav", "wav", "pcm_s16le"),
+        ("a:opus", "opus", "opus"),  # not the source codec: encoded
+    ],
+)
+def test_a_direct_video_row_saves_only_its_audio(
+    server, tmp_path, monkeypatch, row_id, ext, codec
+):
+    monkeypatch.setenv("STUFF_DOWNLOADER_TOOLS_DIR", str(TOOLS))
+    src = tmp_path / "src"
+    src.mkdir()
+    Handler.routes["/d/clip.mp4"] = serve_file(body=_clip(src), ctype="video/mp4")
+    out = tmp_path / "out"
+    out.mkdir()
+    result, events = _row_download(server, "/d/clip.mp4", out, "audio", row_id,
+                                   edited_title="My clip")  # fmt: skip
+    saved = Path(result["files"][0])
+    assert saved == out / f"My clip.{ext}"
+    assert sorted(p.name for p in out.iterdir()) == [saved.name]  # no video, no temp files
+    streams = _probe(saved)["streams"]
+    assert [s["codec_type"] for s in streams] == ["audio"] and streams[0]["codec_name"] == codec
+    if row_id == "a:mp3:192":
+        assert 180_000 <= int(_probe(saved)["format"]["bit_rate"]) <= 200_000
+    assert "converting" in [d["stage"] for k, d in events if k == "stage"]
+
+
+@needs_tools
+@pytest.mark.parametrize(
+    ("container", "ext", "magic"),
+    [("original", "jpg", b"\xff\xd8"), ("png", "png", b"\x89PNG"), ("webp", "webp", b"RIFF")],
+)
+def test_a_direct_video_frame_row_saves_one_image(
+    server, tmp_path, monkeypatch, container, ext, magic
+):
+    monkeypatch.setenv("STUFF_DOWNLOADER_TOOLS_DIR", str(TOOLS))
+    src = tmp_path / "src"
+    src.mkdir()
+    Handler.routes["/d/clip.mp4"] = serve_file(body=_clip(src), ctype="video/mp4")
+    out = tmp_path / "out"
+    out.mkdir()
+    result, _ = _row_download(server, "/d/clip.mp4", out, "image", "i:frame", container)
+    saved = Path(result["files"][0])
+    assert saved == out / f"clip.{ext}" and saved.read_bytes().startswith(magic)
+    assert sorted(p.name for p in out.iterdir()) == [saved.name]
+
+
+def test_a_frame_row_without_ffmpeg_fails_plainly(server, tmp_path, monkeypatch):
+    monkeypatch.delenv("STUFF_DOWNLOADER_TOOLS_DIR", raising=False)
+    Handler.routes["/d/clip.mp4"] = serve_file()
+    with pytest.raises(EngineError) as info:
+        _row_download(server, "/d/clip.mp4", tmp_path, "image", "i:frame", "png")
+    assert info.value.code == "convert_error" and "FFmpeg is needed" in str(info.value)
+
+
+def test_a_broken_ffmpeg_is_reported_and_leaves_no_temp(server, tmp_path, monkeypatch):
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    _fake_tools(tools, monkeypatch)  # empty files: starting ffmpeg fails
+    out = tmp_path / "out"
+    out.mkdir()
+    Handler.routes["/d/clip.mp4"] = serve_file()  # not a real video: ffmpeg fails on it
+    with pytest.raises(EngineError) as info:
+        _row_download(server, "/d/clip.mp4", out, "audio", "a:mp3:320")
+    assert info.value.code == "convert_error"
+    assert not any(p.name.startswith(".") for p in out.iterdir())
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"extract": "mp3:999"},
+        {"extract": "frame; rm"},
+        {"extract": ["mp3:320"]},
+        {"frame_format": "tiff"},
+    ],
+)
+def test_bad_extract_options_are_refused_before_any_request(server, tmp_path, extra):
+    Handler.seen.clear()
+    with pytest.raises(EngineError) as info:
+        _download(server, "/d/clip.mp4", tmp_path, preset="original_file", **extra)
+    assert info.value.code == "bad_options" and Handler.seen == []
+
+
+def test_row_requests_map_to_extract_options():
+    parse = http_engine.presets.parse_row_request
+
+    def opts(tab, row_id, container=None, title=None):
+        options = {"tab": tab, "row_id": row_id, "container": container, "edited_title": title}
+        return http_engine.row_options(parse(options, original_only=True))
+
+    assert opts("audio", "a:mp3:256")["extract"] == "mp3:256"
+    assert opts("audio", "a:wav", title="X") == {
+        "mode": "download", "preset": "original_file", "output_name": "X", "extract": "wav"
+    }
+    frame = opts("image", "i:frame", "png")
+    assert (frame["extract"], frame["frame_format"]) == ("frame", "png")
+    assert "image_format" not in frame
+    assert "extract" not in opts("video", "v:orig", "mkv")
+    assert "extract" not in opts("audio", "a:orig")
+
+
+def test_the_relay_honours_a_range_the_site_ignores(server):
+    Handler.routes["/d/clip.mp4"] = serve_file(ranges=False)  # always 200, whole file
+    with http_engine.Relay(server + "/d/clip.mp4") as relay:
+        status, body = _relay_get(relay.local_url, {"Range": "bytes=100-"})
+        assert (status, body) == (206, BODY[100:])
+        status, body = _relay_get(relay.local_url, {"Range": "bytes=10-19"})
+        assert (status, body) == (206, BODY[10:20])
+        assert _relay_get(relay.local_url, {"Range": f"bytes={len(BODY)}-"})[0] == 416
+        assert _relay_get(relay.local_url) == (200, BODY)

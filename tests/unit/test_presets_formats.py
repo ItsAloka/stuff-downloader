@@ -162,3 +162,12 @@ def test_row_labels_name_what_is_saved():
         == "Image · PNG  1280x720"
     )
     assert presets.row_kind({"tab": "image"}) == "thumbnail"
+
+
+def test_a_direct_video_frame_row_is_an_image_row():
+    options = presets.row_download_options("image", "i:frame", "png")
+    assert options == {"mode": "download", "tab": "image", "row_id": "i:frame", "container": "png"}
+    assert presets.row_label(options) == "Image · PNG  Frame"
+    assert presets.row_kind(options) == "thumbnail"
+    with pytest.raises(ValueError):
+        presets.row_download_options("image", "i:frames")

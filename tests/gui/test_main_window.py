@@ -1482,3 +1482,59 @@ def test_a_real_failure_does_not_move_down_the_chain(window, runs):
     page.analyze()
     runs[0].emit("error", code="download_error", message="HTTP Error 500: Server Error")
     assert len(runs) == 1 and page.result_card.isHidden()
+
+
+# ── the analyzed preview (plan §5.6, R3) ─────────────────────────────────────────────────
+def test_a_video_result_draws_a_sharp_480x270_preview_with_its_duration(window, runs, qtbot):
+    page = _analyzed(window, runs, qtbot, preview={"data": _png_b64(1280, 720)}, duration=244)
+    cover = page.result_card.cover
+    assert (cover.width(), cover.height()) == (480, 270) and cover.text() == ""
+    # Decoded above the 480 px it is shown at, so it is never upscaled.
+    assert page._thumb.width() >= 480
+    shown = cover.pixmap().toImage()
+    assert shown.pixelColor(20, 20).name() == "#336699"
+    assert shown.pixelColor(470, 256).name() != "#336699"  # the duration badge
+
+
+def test_a_song_result_draws_a_300x300_preview(window, runs, qtbot):
+    page = _analyzed(
+        window, runs, qtbot, url="https://music.youtube.com/watch?v=dQw4w9WgXcQ",
+        preview={"data": _png_b64(544, 544)}, duration=61,
+    )  # fmt: skip
+    cover = page.result_card.cover
+    assert (cover.width(), cover.height()) == (300, 300) and cover.text() == ""
+
+
+def test_no_preview_shows_the_placeholder(window, runs, qtbot):
+    page = _analyzed(window, runs, qtbot, preview=None)
+    assert page.result_card.cover.text() == "🎞" and page.result_card.cover.pixmap().isNull()
+
+
+def test_a_direct_video_offers_audio_and_frame_rows_that_queue_correctly(window, runs, qtbot):
+    from stuff_downloader_worker.engines import http as worker_http
+
+    page = window.downloads_page
+    page.url_edit.setText("https://cdn.example.com/v/clip.mp4")
+    page.analyze()
+    audio = worker_ytdlp.audio_rows([{"vcodec": "none", "acodec": "aac", "abr": 128}], 60)
+    payload = protocol.media_result(
+        "video", ["video", "audio", "image"], "clip", "https://cdn.example.com/v/clip.mp4",
+        site="Direct file", ext="mp4", duration=60, formats=[],
+        video_rows=worker_http.file_rows("video", "mp4", 1000)["video_rows"],
+        audio_rows=audio,
+        image_rows=[{"id": "i:frame", "frame": True, "ext": "jpg", "default": True,
+                     "width": 320, "height": 240}],
+    )  # fmt: skip
+    runs[-1].on_event(Event("result", runs[-1].spec.job_id, payload))
+    qtbot.waitUntil(lambda: not page.result_card.isHidden())
+    card = page.result_card
+    assert card.tab_names() == ["video", "audio", "image"]
+    assert card.tables["image"].item(0, 1).text() == "320×240 · JPG ★"
+    card.image_format_combo.setCurrentIndex(card.image_format_combo.findData("png"))
+    card.download_button("image", 0).click()
+    assert runs[-1].spec.engine == "http"
+    assert runs[-1].spec.options == {
+        "mode": "download", "tab": "image", "row_id": "i:frame", "container": "png"
+    }
+    card.download_button("audio", 0).click()
+    assert runs[-1].spec.options == {"mode": "download", "tab": "audio", "row_id": "a:mp3:320"}
