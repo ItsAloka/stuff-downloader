@@ -131,6 +131,21 @@ def test_forget_removes_the_row_but_never_the_file(store, tmp_path):
     assert downloaded.is_file()
 
 
+def test_forget_many_removes_only_named_records_and_keeps_files(store, tmp_path):
+    paths = [tmp_path / f"song-{index}.mp3" for index in range(3)]
+    for index, path in enumerate(paths):
+        path.write_bytes(bytes([index]))
+        add(store, f"j{index}")
+        store.set_state(f"j{index}", "completed", files=[str(path)])
+
+    store.forget_many(["j0", "j2", "j0", "missing"])
+
+    assert store.get("j0") is None and store.get("j2") is None
+    assert store.get("j1").files == [str(paths[1])]
+    assert {record.job_id for record in store.search()} == {"j1"}
+    assert all(path.read_bytes() == bytes([index]) for index, path in enumerate(paths))
+
+
 def test_writes_from_several_threads_do_not_corrupt_the_database(store):
     errors: list[Exception] = []
 

@@ -11,3 +11,7 @@ tools/
 # Local team tooling (not part of the app)
 .devteam/
 knowledge/
+
+# Local test media and screenshots (repo is public)
+.devteam-smoke/
+problmes/

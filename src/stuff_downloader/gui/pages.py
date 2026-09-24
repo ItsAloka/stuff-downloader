@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from PyQt6.QtCore import Qt, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QItemSelectionModel, Qt, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QColor, QDesktopServices, QGuiApplication, QImage, QPixmap
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -2220,6 +2220,7 @@ class HistoryPage(QWidget):
         self.table.setHorizontalHeaderLabels(list(self.COLUMNS))
         self.table.verticalHeader().setVisible(False)
         self.table.setSelectionBehavior(self.table.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(self.table.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(self.table.EditTrigger.NoEditTriggers)
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
@@ -2254,6 +2255,7 @@ class HistoryPage(QWidget):
         self.refresh()
 
     def refresh(self) -> None:
+        selected_ids = {record.job_id for record in self.selected_records()}
         records = self.store.search(self.search_edit.text())
         selected_type = self.type_filter.currentData()
         selected_site = self.site_filter.currentData()
@@ -2276,6 +2278,15 @@ class HistoryPage(QWidget):
             )
             for column, text in enumerate(cells):
                 self.table.setItem(row, column, QTableWidgetItem(text))
+        self.table.clearSelection()
+        select_row = (
+            QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows
+        )
+        for row, record in enumerate(self._records):
+            if record.job_id in selected_ids:
+                self.table.selectionModel().select(
+                    self.table.model().index(row, 0), select_row
+                )
         self.empty_label.setVisible(not self._records)
 
     @staticmethod
@@ -2288,9 +2299,17 @@ class HistoryPage(QWidget):
 
     def selected_record(self) -> history.JobRecord | None:
         row = self.table.currentRow()
-        if 0 <= row < len(self._records):
+        if 0 <= row < len(self._records) and self.table.selectionModel().isRowSelected(row):
             return self._records[row]
         return None
+
+    def selected_records(self) -> list[history.JobRecord]:
+        """Only rows still visible under the active filters are actionable."""
+        return [
+            self._records[index.row()]
+            for index in self.table.selectionModel().selectedRows()
+            if 0 <= index.row() < len(self._records)
+        ]
 
     def selected_file(self) -> Path | None:
         """A file the record actually produced, inside the folder it was downloaded to."""
@@ -2318,11 +2337,11 @@ class HistoryPage(QWidget):
         return QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.parent)))
 
     def forget_selected(self) -> bool:
-        """Remove the row. The downloaded file stays where it is."""
-        record = self.selected_record()
-        if record is None:
+        """Remove selected history rows. Downloaded files stay where they are."""
+        records = self.selected_records()
+        if not records:
             return False
-        self.store.forget(record.job_id)
+        self.store.forget_many(record.job_id for record in records)
         self.refresh()
         return True
 
