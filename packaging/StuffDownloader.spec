@@ -59,6 +59,13 @@ for name in ("LICENSE", "THIRD_PARTY_LICENSES.txt"):
     APP_DATAS.append((str(ROOT / name), "."))
 # dist-info, so the About dialog reads the release version from metadata rather than a fallback.
 APP_DATAS += copy_metadata("stuff-downloader")
+# The engine .in files name the libraries the update check tracks (core/updates.py, R8).
+REQ_INS = sorted((ROOT / "packaging" / "engine-requirements").glob("*.in"))
+if not REQ_INS:
+    raise SystemExit("packaging/engine-requirements/*.in is missing: the update check needs it")
+APP_DATAS += [(str(path), "engine-requirements") for path in REQ_INS]
+# Library updates run the runtime's own transactional installer (core/engine_update.py, R8).
+APP_DATAS.append((str(ROOT / "packaging" / "build_runtime.py"), "runtime-tools"))
 
 ENGINE_EXCLUDES = [
     "stuff_downloader_worker",

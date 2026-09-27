@@ -58,9 +58,11 @@ from ..core import (
     playlist,
     presets,
     router,
+    runner,
     settings,
     spotify,
     tools,
+    updates,
 )
 from ..core import (
     scheduler as scheduling,
@@ -517,6 +519,38 @@ def source_audio_text(source: Any) -> str:
     return f"Source audio: {codec}"
 
 
+ENGINE_LABELS = {
+    "ytdlp": "yt-dlp engine",
+    "gallerydl": "gallery-dl engine",
+    "music": "music engine",
+    "spotdl": "spotDL engine",
+}
+
+
+def _run_env(engine: str) -> tuple[str, str | None]:
+    """The env a job on ``engine`` starts in now, and that env's active id (None if none)."""
+    try:
+        env = runner.env_for(engine)
+        return env, runner._active_env(runner.runtime_root(), env)
+    except Exception:  # noqa: BLE001 - a bad runtime folder must never stop a download
+        return "", None
+
+
+def library_versions() -> dict[str, dict[str, str]]:
+    """engine -> {library: installed version} for the tracked libraries of each installed env."""
+    found: dict[str, dict[str, str]] = {}
+    try:
+        for engine, names in updates.tracked_packages().items():
+            site = updates.env_site_packages(engine)
+            if site is None:
+                continue
+            installed = updates.installed_versions(site)
+            found[engine] = {n: installed[n] for n in names if n in installed}
+    except Exception:  # noqa: BLE001 - Settings must open even with a broken runtime folder
+        return {}
+    return found
+
+
 def _page_layout(widget: QWidget) -> QVBoxLayout:
     """Create a responsive page whose natural contents scroll instead of being compressed."""
     widget.setObjectName("page")
@@ -570,6 +604,15 @@ class QueuedJob:
     state: str = "active"
     files: list[Path] = field(default_factory=list)
     group_id: str = ""
+    # The engine env and env id this run started on, and whether its engine start was reported
+    # to the update watchdog yet (plan §2.2 item 6). Set by DownloadsPage._launch.
+    env: str = ""
+    env_id: str | None = None
+    start_reported: bool = True
+
+
+# Errors that mean the engine itself did not start, as opposed to a site or download problem.
+ENGINE_START_FAILURES = frozenset({"engine_missing", "engine_crashed", "worker_exited"})
 
 
 @dataclass
@@ -609,6 +652,8 @@ class DownloadsPage(QWidget):
     # (title, message, state) for whoever owns a tray icon. The page never reaches for one
     # itself: it is constructed standalone in tests and must work without a window.
     notification_requested = pyqtSignal(str, str, str)
+    # (env, env id or None, engine started) once per launched download, for the update watchdog.
+    engine_start = pyqtSignal(str, object, bool)
 
     def __init__(
         self, app_settings: settings.Settings, store: history.Store | None = None
@@ -2058,10 +2103,13 @@ class DownloadsPage(QWidget):
         card.retry_button.hide()
         card.open_button.hide()
         card.folder_button.hide()
+        job.env, job.env_id = _run_env(job.spec.engine)
+        job.start_reported = False
         try:
             job.run = self._new_run(job.spec)
         except WorkerRuntimeMissing as exc:
             self.scheduler.finished(job.spec.job_id)
+            self._report_engine_start(job, False)
             self._finish_job(job, "failed", f"Cannot start the downloader: {exc}")
             return
         job.state = "active"
@@ -2073,6 +2121,11 @@ class DownloadsPage(QWidget):
         self.store.set_state(job.spec.job_id, "active")
         self._update_summary()
         job.run.start()
+
+    def _report_engine_start(self, job: QueuedJob, started: bool) -> None:
+        job.start_reported = True
+        if job.env:
+            self.engine_start.emit(job.env, job.env_id, started)
 
     def cancel_job(self, job_id: str) -> None:
         job = self.jobs.get(job_id)
@@ -2360,6 +2413,12 @@ class DownloadsPage(QWidget):
         job = self.jobs.get(event.job_id)
         if job is None or job.state != "active":
             return
+        if not job.start_reported:
+            if event.type != "error":
+                self._report_engine_start(job, True)
+            elif event.data.get("code") != "cancelled":
+                code = event.data.get("code")
+                self._report_engine_start(job, code not in ENGINE_START_FAILURES)
         card = job.card
         if event.type == "stage":
             stage = str(event.data.get("stage", ""))
@@ -2686,6 +2745,7 @@ TOOL_LABELS = {"ffmpeg": "FFmpeg", "ffprobe": "ffprobe", "deno": "Deno"}
 
 class ToolsPage(QWidget):
     statuses_changed = pyqtSignal(list)
+    check_updates_requested = pyqtSignal()
 
     def __init__(self, app_settings: settings.Settings) -> None:
         super().__init__()
@@ -2704,6 +2764,9 @@ class ToolsPage(QWidget):
         refresh = QPushButton("↻  Re-check")
         refresh.clicked.connect(self.refresh)
         summary_row.addWidget(refresh)
+        self.check_updates_button = QPushButton("Check for updates")
+        self.check_updates_button.clicked.connect(self.check_updates_requested)
+        summary_row.addWidget(self.check_updates_button)
         layout.addLayout(summary_row)
 
         self.table = QTableWidget(0, 4)
@@ -2758,6 +2821,8 @@ class SettingsPage(QWidget):
     folder_changed = pyqtSignal(str)
     concurrency_changed = pyqtSignal(int)
     notifications_changed = pyqtSignal(bool)
+    check_updates_requested = pyqtSignal()
+    undo_update_requested = pyqtSignal()
 
     def __init__(self, app_settings: settings.Settings) -> None:
         super().__init__()
@@ -2805,12 +2870,84 @@ class SettingsPage(QWidget):
         self.notifications_check.setChecked(app_settings.notifications)
         notify_card.body.addWidget(self.notifications_check)
         layout.addWidget(notify_card)
+
+        updates_card = Card()
+        updates_card.body.addWidget(section_title("Library updates"))
+        self.library_labels = QVBoxLayout()
+        self.library_labels.setSpacing(2)
+        updates_card.body.addLayout(self.library_labels)
+        self._library_widgets: list[QLabel] = []
+        self.update_on_start_check = QCheckBox("On app start: check for updates")
+        self.update_on_start_check.setChecked(app_settings.update_check_on_start)
+        updates_card.body.addWidget(self.update_on_start_check)
+        update_row = QHBoxLayout()
+        self.check_updates_button = QPushButton("Check for updates")
+        self.undo_update_button = QPushButton("Undo last update")
+        update_row.addWidget(self.check_updates_button)
+        update_row.addWidget(self.undo_update_button)
+        update_row.addStretch(1)
+        updates_card.body.addLayout(update_row)
+        self.update_status = QLabel("")
+        self.update_status.setObjectName("muted")
+        self.update_status.setWordWrap(True)
+        self.update_status.setTextFormat(Qt.TextFormat.PlainText)
+        updates_card.body.addWidget(self.update_status)
+        layout.addWidget(updates_card)
         layout.addStretch(1)
+        self.set_library_versions(library_versions())
+        self.set_undo_available(False)
 
         change.clicked.connect(self._choose_folder)
         reset.clicked.connect(lambda: self.set_folder(""))
         self.concurrency_spin.valueChanged.connect(self.set_max_concurrent)
         self.notifications_check.toggled.connect(self.set_notifications)
+        self.update_on_start_check.toggled.connect(self.set_update_on_start)
+        self.check_updates_button.clicked.connect(self.check_updates_requested)
+        self.undo_update_button.clicked.connect(self.undo_update_requested)
+
+    # ── library updates (plan §2) ────────────────────────────────────────────────────────
+    def set_library_versions(self, versions: dict[str, dict[str, str]]) -> None:
+        """One muted line per installed engine env: its libraries and their versions."""
+        for label in self._library_widgets:
+            self.library_labels.removeWidget(label)
+            label.deleteLater()
+        self._library_widgets = []
+        lines = [
+            f"{ENGINE_LABELS.get(engine, engine)}:  "
+            + ",  ".join(f"{name} {version}" for name, version in libs.items())
+            for engine, libs in versions.items()
+            if libs
+        ] or ["No engine libraries found. They arrive with the installer."]
+        for line in lines:
+            label = QLabel(line)
+            label.setObjectName("muted")
+            label.setWordWrap(True)
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            self.library_labels.addWidget(label)
+            self._library_widgets.append(label)
+
+    def set_update_status(self, text: str) -> None:
+        self.update_status.setText(text)
+
+    def set_undo_available(self, available: bool) -> None:
+        self.undo_update_button.setEnabled(available)
+        self.undo_update_button.setToolTip(
+            "" if available else "There is no recent update to undo"
+        )
+
+    def set_updates_busy(self, busy: bool) -> None:
+        self.check_updates_button.setEnabled(not busy)
+        if busy:
+            self.undo_update_button.setEnabled(False)
+
+    def set_update_on_start(self, enabled: bool) -> bool:
+        self._settings.update_check_on_start = bool(enabled)
+        try:
+            settings.save(self._settings)
+        except OSError as exc:
+            QMessageBox.warning(self, "Could not save settings", str(exc))
+            return False
+        return True
 
     def set_max_concurrent(self, value: int) -> bool:
         """How many downloads run at once. Lowering it never stops a job already running."""

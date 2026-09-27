@@ -71,6 +71,7 @@ def test_settings_corrupt_or_invalid_values(tmp_path):
     path.write_text(json.dumps({"max_concurrent": True}))
     assert settings.load(path).max_concurrent == 3
 
+
 # ── the notifications setting ────────────────────────────────────
 # Merged from test_settings.py, which existed only because the notifications field was
 # added under a write lease that covered that one path.
@@ -151,3 +152,50 @@ def test_from_source_the_tools_dir_is_the_repo_folder(monkeypatch):
     monkeypatch.delattr(sys, "frozen", raising=False)
     assert tools.app_tools_dir().name == "tools"
     assert (tools.app_tools_dir().parent / "pyproject.toml").is_file()
+
+
+# ── library update settings (R8) ─────────────────────────────────
+def test_update_settings_default_and_round_trip(tmp_path):
+    s = settings.Settings()
+    assert s.update_check_on_start is True
+    assert s.update_last_check == 0.0 and s.update_skips == {}
+    path = tmp_path / "settings.json"
+    s = settings.Settings(
+        download_dir=str(tmp_path),
+        update_check_on_start=False,
+        update_last_check=1_700_000_000.5,
+        update_skips={"ytmusicapi": ["1.9.0"]},
+    )
+    settings.save(s, path)
+    assert settings.load(path) == s
+
+
+def test_update_settings_invalid_values_fall_back(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(
+        json.dumps(
+            {
+                "max_concurrent": 2,
+                "update_check_on_start": "no",
+                "update_last_check": float("nan"),
+                "update_skips": {"yt-dlp": ["2026.9.1", 5], "bad": "x", "mutagen": ["1.49.0"]},
+            }
+        )
+    )
+    s = settings.load(path)
+    assert s.max_concurrent == 2  # other settings survive bad update fields
+    assert s.update_check_on_start is True and s.update_last_check == 0.0
+    assert s.update_skips == {"yt-dlp": ["2026.9.1"], "mutagen": ["1.49.0"]}
+    for bad in (True, -5, "1"):
+        path.write_text(json.dumps({"update_last_check": bad}))
+        assert settings.load(path).update_last_check == 0.0
+    path.write_text(json.dumps({"update_skips": [1, 2]}))
+    assert settings.load(path).update_skips == {}
+
+
+def test_old_settings_file_gets_update_defaults(tmp_path):
+    path = tmp_path / "settings.json"
+    path.write_text(json.dumps({"download_dir": str(tmp_path), "notifications": False}))
+    s = settings.load(path)
+    assert s.notifications is False and s.download_dir == str(tmp_path)
+    assert s.update_check_on_start is True

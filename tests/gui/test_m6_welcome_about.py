@@ -170,8 +170,9 @@ def test_welcome_recheck_refreshes_tools_and_engines(config, qtbot, monkeypatch,
     )
     dialog.recheck_button.click()
     texts = [label.text() for label in dialog.check_labels]
-    assert len(texts) == 4
+    assert len(texts) == 5  # FFmpeg and the four engines, the music engine included (R8)
     assert "✔  yt-dlp engine — env e1" in texts
+    assert "✖  music engine — not installed" in texts
     assert "Welcome" in w.welcome_button.text() and w.about_button.text() == "About"
 
 
@@ -186,3 +187,4 @@ def test_engine_statuses_flag_a_pointer_without_its_interpreter(config, tmp_path
     assert statuses["spotdl"] == (False, "env gone is missing its interpreter")
     assert statuses["gallerydl"] == (False, "not installed")
     assert statuses["ytdlp"] == (False, "not installed")
+    assert statuses["music"] == (False, "not installed")

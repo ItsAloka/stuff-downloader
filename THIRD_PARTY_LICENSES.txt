@@ -40,6 +40,7 @@ Conclusions:
 ------------------------------------------------------------------------
 
 [requirements.lock]
+packaging==26.3            Apache-2.0 OR BSD-2-Clause
 psutil==7.2.2              BSD-3-Clause
 pyqt6==6.11.0              GPL-3.0-only (Riverbank Computing; commercial licence also offered)
 pyqt6-qt6==6.11.2          LGPL-3.0 (Qt 6 libraries, dynamically linked DLLs in the onedir build)
@@ -61,6 +62,13 @@ Also frozen into the onedir build:
 -----------------
 
 Base interpreter: CPython 3.11.16 (app-managed runtime\python)   PSF-2.0
+
+Library updates (R8, 1.2.0): after install the app can update the engine libraries listed in
+packaging/engine-requirements/*.in to newer PyPI releases, in a new env beside the shipped one
+(core/engine_update.py). The pins below are what the installer ships; an updated env may hold
+newer versions of these packages and of their dependencies, under the licences those releases
+declare. An update adds no new kind of program and does not change the boundary in section 1.
+Build scope: since 1.2.0 the installer is published on GitHub Releases for free, non-commercial use (see PUBLICATION below).
 
 [packaging/engine-requirements/ytdlp.txt]
 brotli==1.2.0              MIT
@@ -240,7 +248,7 @@ F2  RESOLVED - the spotDL dependencies spotapi and spotipyfree do ship licences.
     under GPLv3: ship its licence text and its corresponding source (or a written offer). The
     MIT notice for spotipyfree must ship with it (F6). Both LICENSE files are staged by the
     payload builder into licences\spotapi-1.2.8 and licences\spotipyfree-1.9.14.
-    Current build scope: personal use on the owner's machine only; the installer is not shared.
+    Build scope: published on GitHub Releases since 1.2.0; see PUBLICATION below.
     Since R7 (1.1.0) the spotDL environment is an optional installer task (ticked by default);
     its wheels are still in the payload, so this obligation still applies to the installer.
 
@@ -276,3 +284,17 @@ F6  OBLIGATION - notices for every other component.
 
 The boundary claim in plan 8.3 holds. PyQt6 and gallery-dl never share a process. It was
 checked against the build output above and is guarded by test_third_party_licenses.py.
+
+PUBLICATION (2026-09-27, release 1.2.0)
+    The owner publishes StuffDownloader-Setup-1.2.0.exe on GitHub Releases, free of charge and
+    non-commercially. How the obligations above are met:
+    F3, F5, F2  Licence texts ship in the installer's licences\ folder. The complete corresponding
+                source of every GPL component is offered from public servers at the exact
+                versions pinned here (GPLv3 s.6(d) / GPLv2 s.3(c)): FFmpeg 9.0.1
+                (ffmpeg.org/releases/ffmpeg-9.0.1.tar.xz; gyan.dev build 9.0.1), gallery-dl
+                1.32.13, spotapi 1.2.8, pykakasi, mutagen and unidecode (PyPI sdists). The
+                links are listed in README.md "Licenses and third-party source" and in the
+                release notes. If a link breaks, the owner provides the source on request.
+    F4          Accepted: gallery-dl + requests is upstream's own combination, and upstream
+                itself distributes it (gallery-dl.exe bundles requests). Revisit if challenged.
+    F6          Notices ship in licences\.

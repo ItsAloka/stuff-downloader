@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -23,6 +24,13 @@ class Settings:
     tool_paths: dict[str, str] = field(default_factory=dict)
     # Advanced, empty by default (plan §6.4): site -> {"source": ...}. Choices only, never cookies.
     site_logins: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Library updates (plan §2, R8): startup check switch, last successful check (epoch seconds)
+    # and skipped versions per normalized library name.
+    update_check_on_start: bool = True
+    update_last_check: float = 0.0
+    update_skips: dict[str, list[str]] = field(default_factory=dict)
+    # Engines changed by the last update, so Settings → Undo last update knows what to undo.
+    update_last_engines: list[str] = field(default_factory=list)
     schema_version: int = SCHEMA_VERSION
 
     def effective_download_dir(self) -> Path:
@@ -59,6 +67,23 @@ def load(path: Path | None = None) -> Settings:
     tools = raw.get("tool_paths")
     if isinstance(tools, dict):
         settings.tool_paths = {k: v for k, v in tools.items() if isinstance(v, str)}
+    check_on_start = raw.get("update_check_on_start")
+    if isinstance(check_on_start, bool):
+        settings.update_check_on_start = check_on_start
+    last_check = raw.get("update_last_check")
+    if isinstance(last_check, (int, float)) and not isinstance(last_check, bool):
+        if math.isfinite(last_check) and last_check >= 0:
+            settings.update_last_check = float(last_check)
+    skips = raw.get("update_skips")
+    if isinstance(skips, dict):
+        settings.update_skips = {
+            name: [v for v in versions if isinstance(v, str)]
+            for name, versions in skips.items()
+            if isinstance(name, str) and isinstance(versions, list)
+        }
+    last_engines = raw.get("update_last_engines")
+    if isinstance(last_engines, list):
+        settings.update_last_engines = [e for e in last_engines if isinstance(e, str)]
     settings.site_logins = cookies.dump_all(cookies.load_all(raw.get("site_logins")))
     return settings
 

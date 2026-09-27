@@ -163,4 +163,4 @@ def test_iscc_failure_is_reported_by_main(bi, monkeypatch, capsys):
 
 
 def test_release_version_is_1_1_0(bi):
-    assert bi._release_version() == "1.1.0"
+    assert bi._release_version() == "1.2.0"
