@@ -77,7 +77,7 @@ These are real screenshots taken while downloading Blender's open movie *Big Buc
 ### Windows 10 / 11 (64-bit)
 
 1. Go to the [**latest release**](https://github.com/AlokaWarnakula/stuff-downloader/releases/latest).
-2. Download `StuffDownloader-Setup-1.2.0.exe`.
+2. Download `StuffDownloader-Setup-1.3.0.exe`.
 3. Run it. The installer isn't code-signed, so Windows SmartScreen may show a warning. Click
    **More info → Run anyway**.
 4. Choose whether to install the optional **spotDL** engine (it's ticked by default).
@@ -211,6 +211,7 @@ tests/         unit/, gui/ (pytest-qt + screenshots), convert/, network/ (opt-in
 - [x] Galleries (Instagram, X, Reddit…) via gallery-dl
 - [x] Spotify, Apple Music and Deezer links with no account needed
 - [x] In-app engine updates with self-test and rollback (**1.2.0**)
+- [x] Self-repairing history database; errors logged instead of closing the app (**1.3.0**)
 - [ ] macOS build
 - [ ] Faster failure on sites that block the connection (e.g. Reddit timeouts)
 

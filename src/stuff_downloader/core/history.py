@@ -8,6 +8,10 @@ thread, so one connection is shared with ``check_same_thread=False`` behind a lo
 statement goes through that lock.
 
 Nothing here ever deletes a downloaded file. ``forget`` removes the row only.
+
+A damaged database must never take the app down: it is checked and rebuilt when opened, and a
+write that still fails is rebuilt and retried once, then logged and dropped. Losing one history
+row is better than a crash that loses the whole queue.
 """
 
 from __future__ import annotations
@@ -17,7 +21,7 @@ import logging
 import sqlite3
 import threading
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -31,6 +35,28 @@ UNFINISHED_STATES = ("queued", "active", "paused")
 TERMINAL_STATES = ("completed", "failed", "cancelled", "skipped")
 
 log = logging.getLogger(__name__)
+
+
+def _guarded(default: Any = None) -> Callable:
+    """Run a write; on a database error rebuild the database and retry once, else ``default``."""
+
+    def wrap(method: Callable) -> Callable:
+        def guarded(self: Store, *args: Any, **kwargs: Any) -> Any:
+            for attempt in (1, 2):
+                try:
+                    return method(self, *args, **kwargs)
+                except sqlite3.DatabaseError as exc:
+                    log.warning("history: %s failed (%s)", method.__name__, exc)
+                    if attempt == 2 or not self._repair():
+                        return default
+            return default
+
+        guarded.__name__ = method.__name__
+        guarded.__doc__ = method.__doc__
+        return guarded
+
+    return wrap
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS groups (
@@ -113,12 +139,15 @@ class Store:
         if str(self.path) != ":memory:":
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
         with self._lock:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
+            try:
+                self._connect()
+                usable = self._healthy() or self._repair()
+            except sqlite3.DatabaseError as exc:  # e.g. "file is not a database"
+                log.warning("history: cannot open %s (%s)", self.path, exc)
+                usable = False
+            if not usable:
+                self._start_over()
             self._migrate()
 
     # ── lifecycle ────────────────────────────────────────────────────────────────────────
@@ -179,6 +208,46 @@ class Store:
             )
             log.info("history: redacted %d stored source URLs", len(rewrites))
 
+    def _healthy(self) -> bool:
+        try:
+            return [tuple(r) for r in self._conn.execute("PRAGMA quick_check")] == [("ok",)]
+        except sqlite3.DatabaseError as exc:
+            log.warning("history: quick_check failed (%s)", exc)
+            return False
+
+    def _repair(self) -> bool:
+        """Rebuild a damaged database in place (VACUUM keeps every readable row)."""
+        with self._lock:
+            try:
+                self._conn.rollback()
+                if self._healthy():
+                    return True
+                log.warning("history: database is damaged; rebuilding it")
+                self._conn.execute("VACUUM")
+            except sqlite3.DatabaseError as exc:
+                log.warning("history: rebuild failed (%s)", exc)
+                return False
+            return self._healthy()
+
+    def _connect(self) -> None:
+        self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
+
+    def _start_over(self) -> None:
+        """Set an unrepairable database aside, never deleting it, and open a fresh one."""
+        if getattr(self, "_conn", None) is not None:
+            self._conn.close()
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        for suffix in ("", "-wal", "-shm"):
+            old = Path(f"{self.path}{suffix}")
+            if old.exists():
+                old.replace(old.with_name(f"{old.name}.damaged-{stamp}"))
+        log.warning("history: could not repair %s; kept it as *.damaged-%s", self.path, stamp)
+        self._connect()
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()
@@ -190,6 +259,7 @@ class Store:
         self.close()
 
     # ── writes ───────────────────────────────────────────────────────────────────────────
+    @_guarded(None)
     def add_group(self, group_id: str, title: str, source_url: str, count: int) -> None:
         with self._lock:
             self._conn.execute(
@@ -199,6 +269,7 @@ class Store:
             )
             self._conn.commit()
 
+    @_guarded()
     def add_job(
         self,
         job_id: str,
@@ -246,6 +317,7 @@ class Store:
                 )
             self._conn.commit()
 
+    @_guarded(None)
     def set_state(
         self,
         job_id: str,
@@ -278,6 +350,7 @@ class Store:
                 )
             self._conn.commit()
 
+    @_guarded(0)
     def restore_unfinished(self) -> int:
         """Mark everything that was still running as paused. Nothing is restarted here."""
         with self._lock:
@@ -290,6 +363,7 @@ class Store:
             self._conn.commit()
             return cursor.rowcount
 
+    @_guarded(0)
     def set_queue_order(self, job_ids: Sequence[str]) -> int:
         """Persist a hand-set queue order.
 
@@ -317,6 +391,7 @@ class Store:
         """Remove the history row. The downloaded file is never touched."""
         self.forget_many([job_id])
 
+    @_guarded(None)
     def forget_many(self, job_ids: Iterable[str]) -> None:
         """Remove records and their file references, never the downloaded files."""
         ids = list(dict.fromkeys(job_ids))
