@@ -280,7 +280,8 @@ MP3_BITRATES = (320, 256, 192, 128, 64)
 AUDIO_ROW_IDS = (*(f"a:mp3:{b}" for b in MP3_BITRATES), "a:m4a", "a:opus", "a:flac", "a:wav")
 MAX_ROW_HEIGHT = 8640
 MAX_EDITED_TITLE = 300
-_VIDEO_ROW = re.compile(r"v:([1-9][0-9]{0,3}):(mp4|webm)")
+# "best" is the one row of a page whose formats state no height (Facebook, Flickr, Imgur…).
+_VIDEO_ROW = re.compile(r"v:(best|[1-9][0-9]{0,3}):(mp4|webm)")
 _IMAGE_ROW = re.compile(r"i:(orig|best|([1-9][0-9]{0,4})x([1-9][0-9]{0,4}))")
 # The direct-file engine's single row per tab: the file as the site serves it.
 ORIGINAL_ROW_IDS = {"video": "v:orig", "audio": "a:orig", "image": "i:orig"}
@@ -359,9 +360,10 @@ def parse_row_request(options: dict[str, Any], *, original_only: bool = False) -
             raise EngineError("bad_options", f"unknown row {row_id!r}")
     elif tab == "video":
         match = _VIDEO_ROW.fullmatch(row_id)
-        if not match or int(match.group(1)) > MAX_ROW_HEIGHT:
+        best = bool(match) and match.group(1) == "best"
+        if not match or (not best and int(match.group(1)) > MAX_ROW_HEIGHT):
             raise EngineError("bad_options", f"unknown row {row_id!r}")
-        fields = {"height": int(match.group(1)), "source_ext": match.group(2)}
+        fields = {"height": None if best else int(match.group(1)), "source_ext": match.group(2)}
     elif tab == "audio":
         if row_id not in AUDIO_ROW_IDS:
             raise EngineError("bad_options", f"unknown row {row_id!r}")
@@ -400,11 +402,14 @@ def parse_row_request(options: dict[str, Any], *, original_only: bool = False) -
     )
 
 
-def row_video_format(height: int, source_ext: str, container: str) -> str:
+def row_video_format(height: int | None, source_ext: str, container: str) -> str:
     """The row's height in its source container first, then that height in anything, then
     the best below it. A WebM file prefers WebM audio so it stays a remux. An MP4 row asks for
     H.264 first: that is the stream the catalog shows for the height when one exists, and
-    yt-dlp's own "best" MP4 would otherwise be AV1."""
+    yt-dlp's own "best" MP4 would otherwise be AV1. With no height ("Best available"), the
+    best in the source container, then simply the best."""
+    if height is None:
+        return f"bv*[ext={source_ext}]+ba/b[ext={source_ext}]/bv*+ba/b"
     h = f"[height={height}]"
     audio = "ba[ext=webm]" if container == "webm" else "ba[ext=m4a]"
     avc = [f"bv*{h}[ext=mp4][vcodec^=avc1]+{audio}"] if source_ext == "mp4" else []
@@ -457,7 +462,7 @@ def build_row_opts(request: RowRequest, output_dir: str) -> dict[str, Any]:
         opts.update(
             {
                 "format": row_video_format(
-                    request.height or 1080, request.source_ext or "mp4", container
+                    request.height, request.source_ext or "mp4", container
                 ),
                 "merge_output_format": merge,
                 "outtmpl": named or VIDEO_ROW_OUTTMPL,

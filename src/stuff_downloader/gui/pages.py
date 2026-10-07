@@ -33,6 +33,7 @@ from PyQt6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QHeaderView,
+    QInputDialog,
     QLabel,
     QLayout,
     QLineEdit,
@@ -333,6 +334,9 @@ AUTO_HEIGHT = None
 # never gets one: a plain file link has no business needing a session. The social extractor never
 # uses one; it only steps aside when one is set, so the engines that can use it read the post.
 LOGIN_ENGINES = frozenset({"ytdlp", "gallerydl", "social"})
+LOGIN_SKIPPED_NOTE = (
+    "Your saved site login could not be read (a browser may be locking it). Trying without it…"
+)
 
 # The Advanced view (plan §M3): what the site actually offers, read from the metadata the worker
 # already sanitized. Every cell is rebuilt here from a known field, never passed through, and the
@@ -524,6 +528,8 @@ ENGINE_LABELS = {
     "gallerydl": "gallery-dl engine",
     "music": "music engine",
     "spotdl": "spotDL engine",
+    # The sign-in window's browser (plan §6.4): an engine env so the updater keeps it current.
+    "signin": "sign-in browser",
 }
 
 
@@ -592,6 +598,37 @@ TERMINAL_STATES = frozenset({"completed", "failed", "cancelled", "skipped"})
 _TRANSIENT_FILE = re.compile(
     r"(\.part|\.ytdl|\.part-Frag\d+|\.temp\.\w+|\.f[\w-]+\.\w+)$", re.IGNORECASE
 )
+
+
+def save_site_login(
+    parent: QWidget,
+    app_settings: settings.Settings,
+    site: str,
+    choice: cookies.SiteLogin | None,
+) -> bool:
+    """Save (or with None, remove) the login for one site, for both pages that manage them.
+
+    Only the choice reaches settings. A sign-in file it replaces is deleted once the new
+    choice is saved, so signing out really removes the cookies from this PC.
+    """
+    site = cookies.site_key(site)
+    if not site:
+        return False
+    choices = cookies.load_all(app_settings.site_logins)
+    old = choices.pop(site, None)
+    if choice is not None:
+        choices[site] = choice
+    previous = app_settings.site_logins
+    app_settings.site_logins = cookies.dump_all(choices)
+    try:
+        settings.save(app_settings)
+    except OSError as exc:
+        app_settings.site_logins = previous
+        QMessageBox.warning(parent, "Could not save settings", str(exc))
+        return False
+    if old is not None and old != choice:
+        cookies.forget(old)
+    return True
 
 
 @dataclass
@@ -723,16 +760,21 @@ class DownloadsPage(QWidget):
         self.message_label.setWordWrap(True)
         self.message_label.hide()
         paste_card.body.addWidget(self.message_label)
-        # Advanced and hidden (plan §6.4): shown only after a failure a site login could fix.
-        self.login_button = QPushButton("Advanced: use a site login…")
+        # Hidden (plan §6.4): shown only after a failure that signing in could fix.
+        self.login_button = QPushButton("Sign in…")
+        self.login_button.setObjectName("primary")
         self.login_button.setToolTip(
-            "Only for media the site shows to signed-in viewers. Public links never need this."
+            "Only for posts the site shows to signed-in people. Public links never need this."
         )
         self.login_button.hide()
         self._login_site = ""
         # Set when the offer came from a failed queue row: saving a login retries that job
         # instead of re-analyzing whatever is in the link box.
         self._login_retry_job_id = ""
+        # Saved logins that could not be read this session (a locked Chrome, a deleted
+        # cookies.txt), by site. Jobs for them run without it: public links never need one.
+        # Keyed to the login itself, so signing in again is used straight away.
+        self._broken_logins: dict[str, cookies.SiteLogin] = {}
         # Engines still to try when the one a link was routed to says "unsupported" (plan §5.3
         # steps 3-5): a page yt-dlp cannot read may be a gallery, or the media file itself.
         self._fallbacks: list[router.Route] = []
@@ -960,17 +1002,36 @@ class DownloadsPage(QWidget):
         """
         if spec.engine not in LOGIN_ENGINES:
             return spec
-        choice = cookies.choice_for(spec.url, cookies.load_all(self._settings.site_logins))
-        if choice is None:
+        choices = cookies.load_all(self._settings.site_logins)
+        site = cookies.site_for(spec.url, choices)
+        if not site or self._broken_logins.get(site) == choices[site]:
             return spec
-        return replace(spec, options={**spec.options, "site_login": choice.to_dict()})
+        return replace(spec, options={**spec.options, "site_login": choices[site].to_dict()})
 
-    # ── advanced: site login (plan §6.4) ─────────────────────────────────────────────────
+    def _drop_broken_login(self, url: str) -> bool:
+        """The saved login for ``url`` could not be read: stop using it for this session.
+
+        True when there was one to drop, so the caller can retry the job without it. A second
+        cookie failure for the same site returns False, so this never loops.
+        """
+        choices = cookies.load_all(self._settings.site_logins)
+        site = cookies.site_for(url, choices)
+        if not site or self._broken_logins.get(site) == choices[site]:
+            return False
+        self._broken_logins[site] = choices[site]
+        return True
+
+    # ── site login (plan §6.4) ───────────────────────────────────────────────────────────
     def _login_dialog(self, site: str, current: cookies.SiteLogin | None) -> Any:
         return SiteLoginDialog(site, current, self)
 
+    def _show_login_button(self, site: str) -> None:
+        self._login_site = site
+        self.login_button.setText(f"Sign in to {site}…")
+        self.login_button.setVisible(bool(site))
+
     def offer_site_login(self) -> bool:
-        """Ask for a login for the site that just refused us; retry the analyze if one is set."""
+        """Sign in to the site that just refused us; retry the analyze or download if signed in."""
         site = self._login_site
         if not site:
             return False
@@ -978,9 +1039,12 @@ class DownloadsPage(QWidget):
         dialog = self._login_dialog(site, current)
         if not dialog.exec():
             return False
-        if not self.set_site_login(site, dialog.choice()):
+        choice = dialog.choice()
+        if not self.set_site_login(site, choice):
             return False
         self.login_button.hide()
+        if choice is None:
+            return True  # signed out: nothing new to try
         retry_id, self._login_retry_job_id = self._login_retry_job_id, ""
         job = self.jobs.get(retry_id)
         if job is not None and job.state == "failed":
@@ -1002,34 +1066,17 @@ class DownloadsPage(QWidget):
         site = cookies.site_key(job.spec.url)
         if not site:
             return
-        self._login_site = site
         self._login_retry_job_id = job.spec.job_id
         self._show_message(
             f"{safe_error_message(errors.friendly_message(code, message))}"
-            f" A site login may help ({site}).",
+            f" Signing in to {site} may help.",
             error=True,
         )
-        self.login_button.show()
+        self._show_login_button(site)
 
     def set_site_login(self, site: str, choice: cookies.SiteLogin | None) -> bool:
-        """Save (or with None, remove) the choice for one site. Stores the choice only."""
-        site = cookies.site_key(site)
-        if not site:
-            return False
-        choices = cookies.load_all(self._settings.site_logins)
-        if choice is None:
-            choices.pop(site, None)
-        else:
-            choices[site] = choice
-        previous = self._settings.site_logins
-        self._settings.site_logins = cookies.dump_all(choices)
-        try:
-            settings.save(self._settings)
-        except OSError as exc:
-            self._settings.site_logins = previous
-            QMessageBox.warning(self, "Could not save settings", str(exc))
-            return False
-        return True
+        """Save (or with None, remove) the login for one site."""
+        return save_site_login(self, self._settings, site, choice)
 
     def _reset_route_preset(self, combo: QComboBox, *, playlist_mode: bool = False) -> None:
         """Choose a fresh default for this analyzed route; never inherit the previous link's UI."""
@@ -1126,6 +1173,12 @@ class DownloadsPage(QWidget):
                 self._show_message("")
                 return
             route = self._route
+            if code == "cookies_unavailable" and route is not None:
+                if self._drop_broken_login(route.url):
+                    # Analyze again with no login; the note stays up while it runs.
+                    self._start_analyze(route)
+                    self._show_message(LOGIN_SKIPPED_NOTE)
+                    return
             if router.should_fall_back(code) and route is not None and self._fallbacks:
                 # The chain is core's (router.analyze_fallbacks); this only walks it.
                 self._route = self._fallbacks.pop(0)
@@ -1139,8 +1192,7 @@ class DownloadsPage(QWidget):
                 and not route.is_catalog  # public share links only; no music-service login
                 and errors.needs_site_login(code, message)
             ):
-                self._login_site = cookies.site_key(route.url)
-                self.login_button.setVisible(bool(self._login_site))
+                self._show_login_button(cookies.site_key(route.url))
             return
         try:
             result = validate_media_result(event.data)
@@ -2481,6 +2533,10 @@ class DownloadsPage(QWidget):
                     errors.friendly_message(code, event.data.get("message"))
                 )
                 raw = event.data.get("message")
+                if code == "cookies_unavailable" and self._drop_broken_login(job.spec.url):
+                    # Relaunched through _new_run, which now leaves the login off.
+                    if self._start_backoff(job, "Site login could not be read", str(code)):
+                        return
                 if not is_retryable(raw) or not self._start_backoff(
                     job, message, str(code or "")
                 ):
@@ -2871,6 +2927,24 @@ class SettingsPage(QWidget):
         notify_card.body.addWidget(self.notifications_check)
         layout.addWidget(notify_card)
 
+        login_card = Card()
+        login_card.body.addWidget(section_title("Site logins"))
+        login_note = QLabel(
+            "Only for posts a site shows to signed-in people (private accounts, age-restricted"
+            " videos). Public links never need one. You sign in on the site's own page; your"
+            " password is never given to Stuff Downloader."
+        )
+        login_note.setObjectName("muted")
+        login_note.setWordWrap(True)
+        login_card.body.addWidget(login_note)
+        self.login_rows = QVBoxLayout()
+        self.login_rows.setSpacing(4)
+        login_card.body.addLayout(self.login_rows)
+        self._login_widgets: list[QWidget] = []
+        self.signin_button = QPushButton("Sign in to a site…")
+        login_card.body.addWidget(self.signin_button, 0, Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(login_card)
+
         updates_card = Card()
         updates_card.body.addWidget(section_title("Library updates"))
         self.library_labels = QVBoxLayout()
@@ -2896,14 +2970,94 @@ class SettingsPage(QWidget):
         layout.addStretch(1)
         self.set_library_versions(library_versions())
         self.set_undo_available(False)
+        self.refresh_logins()
 
         change.clicked.connect(self._choose_folder)
         reset.clicked.connect(lambda: self.set_folder(""))
         self.concurrency_spin.valueChanged.connect(self.set_max_concurrent)
         self.notifications_check.toggled.connect(self.set_notifications)
         self.update_on_start_check.toggled.connect(self.set_update_on_start)
+        self.signin_button.clicked.connect(self.choose_site_to_sign_in)
         self.check_updates_button.clicked.connect(self.check_updates_requested)
         self.undo_update_button.clicked.connect(self.undo_update_requested)
+
+    # ── site logins (plan §6.4) ──────────────────────────────────────────────────────────
+    def showEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        # The Downloads page may have saved one since this page was last drawn.
+        self.refresh_logins()
+        super().showEvent(event)
+
+    def refresh_logins(self) -> None:
+        """One row per saved login, each with a Remove button; a muted line when none."""
+        for widget in self._login_widgets:
+            self.login_rows.removeWidget(widget)
+            widget.hide()  # deleteLater waits for the event loop; until then it would still show
+            widget.deleteLater()
+        self._login_widgets = []
+        choices = cookies.load_all(self._settings.site_logins)
+        if not choices:
+            empty = QLabel("None saved.")
+            empty.setObjectName("muted")
+            self.login_rows.addWidget(empty)
+            self._login_widgets.append(empty)
+            return
+        for site, choice in sorted(choices.items()):
+            row = QWidget()
+            line = QHBoxLayout(row)
+            line.setContentsMargins(0, 0, 0, 0)
+            text = f"{site}  ·  {choice.describe()}"
+            if choice.source == "browser" and choice.browser != "firefox":
+                text += "  (can't be read on Windows: sign in again)"
+            label = QLabel(text)
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            again = QPushButton("Sign in again")
+            again.clicked.connect(lambda _=False, s=site: self.sign_in(s))
+            remove = QPushButton("Sign out" if cookies.is_signin(choice) else "Remove")
+            remove.clicked.connect(lambda _=False, s=site: self.remove_login(s))
+            line.addWidget(label, 1)
+            line.addWidget(again)
+            line.addWidget(remove)
+            self.login_rows.addWidget(row)
+            self._login_widgets.append(row)
+
+    def _ask_site(self) -> str:
+        """Which site to sign in to: a common one from the list, or any the owner types."""
+        text, ok = QInputDialog.getItem(
+            self,
+            "Sign in to a site",
+            "Site (pick one, or type its address, like instagram.com):",
+            list(cookies.COMMON_SITES),
+            0,
+            True,
+        )
+        return cookies.site_key(text) if ok else ""
+
+    def _sign_in_window(self, site: str) -> cookies.SiteLogin | None:
+        from .signin import sign_in
+
+        return sign_in(site, self)
+
+    def choose_site_to_sign_in(self) -> bool:
+        site = self._ask_site()
+        if not site:
+            return False
+        return self.sign_in(site)
+
+    def sign_in(self, site: str) -> bool:
+        login = self._sign_in_window(site)
+        if login is None or not save_site_login(self, self._settings, site, login):
+            return False
+        self.refresh_logins()
+        return True
+
+    def remove_login(self, site: str) -> bool:
+        """Sign out of one site: forget its login, and delete a sign-in's cookies file."""
+        if site not in cookies.load_all(self._settings.site_logins):
+            return False
+        if not save_site_login(self, self._settings, site, None):
+            return False
+        self.refresh_logins()
+        return True
 
     # ── library updates (plan §2) ────────────────────────────────────────────────────────
     def set_library_versions(self, versions: dict[str, dict[str, str]]) -> None:

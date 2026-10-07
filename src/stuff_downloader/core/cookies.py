@@ -1,23 +1,28 @@
-"""Per-site login choices for restricted media (plan §6.4). No Qt imports, no engine imports.
+"""Per-site logins for restricted media (plan §6.4). No Qt imports, no engine imports.
 
-Advanced and off by default. The app works with no entry here, and the GUI only offers one
-after a download fails because the site shows the media to signed-in viewers only.
+Off by default: the app works with no entry here, and public links never need one.
 
-What is stored is the *choice* — a browser name and profile, or the path of a cookies.txt the
-owner picked — never cookie contents. The choice is attached to a job at launch time and never
-written into the job's options, so it does not reach the queue database or history either.
+The usual way in is the sign-in window (the worker's ``signin`` engine): the owner signs in to
+the site there, and the site's cookies are written to a cookies.txt under the app's local data
+folder. That file is the only place cookie contents are kept. Settings store just the *choice* —
+that file's path, a cookies.txt the owner picked, or a browser name — and the choice is attached
+to a job at launch time, never written into the job's options, the queue database or history.
 """
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-# Browsers yt-dlp can read. Firefox first: it is the one that works reliably on Windows,
-# because Chromium browsers lock their cookie database and use app-bound encryption.
+from . import paths
+
+# Browsers yt-dlp can read. Kept so older settings still load, but the dialog offers Firefox
+# only: on Windows, Chrome, Edge and Brave lock their cookie database and use app-bound
+# encryption, so reading them fails for nearly everyone.
 BROWSERS = ("firefox", "chrome", "edge", "brave", "chromium", "opera", "vivaldi")
 # A profile is a name, never a path: a path here would let a settings file point the engine at
 # any directory on disk.
@@ -25,14 +30,31 @@ _PROFILE = re.compile(r"[A-Za-z0-9 ._-]{0,64}")
 MAX_COOKIE_FILE_BYTES = 5_000_000
 _STRIP_PREFIXES = ("www.", "m.", "mobile.")
 
+# Offered first when signing in from Settings; the owner can type any other site.
+COMMON_SITES = (
+    "instagram.com",
+    "tiktok.com",
+    "x.com",
+    "facebook.com",
+    "youtube.com",
+    "reddit.com",
+    "pinterest.com",
+    "vimeo.com",
+)
+SIGNIN_HELP = (
+    "Some posts are only shown to people who are signed in. Sign in once here and Stuff"
+    " Downloader uses it for this site's links.\n\n"
+    "You sign in on the site's own page, inside Stuff Downloader. Your password goes only to"
+    ' the site; Stuff Downloader never sees or saves it. It keeps the site\'s "signed in"'
+    " cookie on this PC, and Sign out deletes it."
+)
+
 GUIDANCE = (
-    "Only for media the site shows to signed-in viewers. Public links never need this.\n\n"
-    "• Firefox works best: sign in to the site in Firefox, then choose Firefox here.\n"
-    "• Chrome, Edge and Brave lock and encrypt their cookies on Windows, so reading them often"
-    " fails. Close the browser first, or use a cookies.txt file instead.\n"
-    "• A cookies.txt file (Netscape format) exported for just this site also works.\n\n"
-    "A cookies file is a secret: anyone who has it can act as you on that site. Stuff"
-    " Downloader stores only which browser or file you picked, never the cookies themselves."
+    "For people who already use these:\n"
+    "• Firefox: sign in to the site in Firefox, then choose it here.\n"
+    "• A cookies.txt file (Netscape format) exported for just this site.\n\n"
+    "Chrome, Edge and Brave are not offered: on Windows they lock and encrypt their cookies,"
+    " so no other app can read them. Use Sign in above instead."
 )
 
 
@@ -52,6 +74,8 @@ class SiteLogin:
         if self.source == "browser":
             name = self.browser.capitalize()
             return f"{name} ({self.profile})" if self.profile else name
+        if is_signin(self):
+            return "Signed in"
         return f"cookies file {Path(self.path).name}"
 
 
@@ -110,16 +134,22 @@ def dump_all(choices: dict[str, SiteLogin]) -> dict[str, dict[str, str]]:
     return {site: choice.to_dict() for site, choice in choices.items()}
 
 
-def choice_for(url: str, choices: dict[str, SiteLogin]) -> SiteLogin | None:
-    """The owner's choice for ``url``'s site, matching subdomains of a stored site too."""
+def site_for(url: str, choices: dict[str, SiteLogin]) -> str:
+    """The stored site whose choice applies to ``url`` (subdomains included), or ""."""
     try:
         host = (urlsplit(url).hostname or "").lower().rstrip(".")
     except ValueError:
-        return None
-    for site, choice in choices.items():
+        return ""
+    for site in choices:
         if host == site or host.endswith("." + site):
-            return choice
-    return None
+            return site
+    return ""
+
+
+def choice_for(url: str, choices: dict[str, SiteLogin]) -> SiteLogin | None:
+    """The owner's choice for ``url``'s site, matching subdomains of a stored site too."""
+    site = site_for(url, choices)
+    return choices[site] if site else None
 
 
 def check_file(path: str) -> str:
@@ -136,3 +166,30 @@ def check_file(path: str) -> str:
     if size > MAX_COOKIE_FILE_BYTES:
         return "That file is too large to be a cookies.txt export."
     return ""
+
+
+# ── the sign-in window's files ─────────────────────────────────────────────────────────────
+# The window is the worker's ``signin`` engine; it writes ``<site>.txt`` into this folder.
+def signin_dir() -> Path:
+    return paths.data_dir() / "signins"
+
+
+def signin_path(site: str) -> Path:
+    return signin_dir() / f"{site}.txt"
+
+
+def is_signin(choice: SiteLogin) -> bool:
+    """Whether ``choice`` is a file the sign-in window wrote (and so one the app may delete)."""
+    if choice.source != "file":
+        return False
+    parent = os.path.normcase(os.path.abspath(Path(choice.path).parent))
+    return parent == os.path.normcase(os.path.abspath(signin_dir()))
+
+
+def forget(choice: SiteLogin | None) -> None:
+    """Delete the cookies file behind a sign-in. A file the owner picked is never touched."""
+    if choice is not None and is_signin(choice):
+        try:
+            Path(choice.path).unlink(missing_ok=True)
+        except OSError:
+            pass

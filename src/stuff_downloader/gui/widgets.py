@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import html
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from PyQt6.QtCore import QBuffer, QByteArray, QIODevice, QMimeData, QSize, Qt, pyqtSignal
@@ -540,7 +541,7 @@ def video_row_cells(row: dict, container: str) -> tuple[str, str]:
         return fmt or "Original", quality
     height = _whole(row.get("height"))
     fps = _whole(row.get("fps"))
-    parts = [f"{height}p{fps if fps and fps > 30 else ''}" if height else "Video"]
+    parts = [f"{height}p{fps if fps and fps > 30 else ''}" if height else "Best available"]
     if row.get("hdr") is True:
         parts.append("HDR")
     codec = _row_text(row.get("vcodec"))
@@ -1494,77 +1495,135 @@ class MatchDialog(QDialog):
 
 
 class SiteLoginDialog(QDialog):
-    """The advanced site-login choice for one site (plan §6.4). Offered only after a failure.
+    """Sign in to one site, sign out of it, or (tucked away) use Firefox or a cookies.txt.
 
-    The dialog returns a choice; it never reads, copies or shows a cookie. ``choice()`` is
-    ``None`` for "No login", which removes any saved choice for the site.
+    ``exec()`` is accepted only when something changed; ``choice()`` is then the new login,
+    or ``None`` for "signed out", which removes the saved one. ``signin`` opens the sign-in
+    window and returns its login; tests pass a stand-in so no web page is ever loaded.
     """
 
-    def __init__(self, site: str, current: cookies.SiteLogin | None = None, parent=None) -> None:
+    def __init__(
+        self,
+        site: str,
+        current: cookies.SiteLogin | None = None,
+        parent=None,
+        signin: Callable[[str, QWidget], cookies.SiteLogin | None] | None = None,
+    ) -> None:
         super().__init__(parent)
         self.site = site
-        self.setWindowTitle("Advanced: site login")
+        self._signin = signin
+        self._choice: cookies.SiteLogin | None = current
+        self.setWindowTitle(f"Sign in to {site}")
+        self.setMinimumWidth(460)
         layout = QVBoxLayout(self)
-        heading = QLabel(f"Use a login for {site}?")
+        heading = QLabel(f"Sign in to {site}")
         heading.setTextFormat(Qt.TextFormat.PlainText)
-        heading.setStyleSheet("font-weight:600; font-size:11pt;")
-        guidance = QLabel(cookies.GUIDANCE)
-        guidance.setTextFormat(Qt.TextFormat.PlainText)
-        guidance.setWordWrap(True)
-        guidance.setObjectName("muted")
+        heading.setStyleSheet("font-weight:600; font-size:12pt;")
+        help_label = QLabel(cookies.SIGNIN_HELP)
+        help_label.setTextFormat(Qt.TextFormat.PlainText)
+        help_label.setWordWrap(True)
+        help_label.setObjectName("muted")
+        self.status_label = QLabel(
+            f"Now: {current.describe()}" if current is not None else "Now: not signed in"
+        )
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(heading)
-        layout.addWidget(guidance)
+        layout.addWidget(help_label)
+        layout.addWidget(self.status_label)
 
-        self.none_radio = QRadioButton("No login (default)")
-        self.browser_radio = QRadioButton("Use a browser session")
-        self.file_radio = QRadioButton("Use a cookies.txt file")
-        self.group = QButtonGroup(self)
-        for radio in (self.none_radio, self.browser_radio, self.file_radio):
-            self.group.addButton(radio)
-        self.browser_combo = QComboBox()
-        for browser in cookies.BROWSERS:
-            self.browser_combo.addItem(browser.capitalize(), browser)
-        self.profile_edit = QLineEdit()
-        self.profile_edit.setPlaceholderText("Profile name (optional)")
-        self.file_edit = QLineEdit()
-        self.file_edit.setPlaceholderText(r"C:\path\to\cookies.txt")
-        self.file_button = QPushButton("Browse…")
+        row = QHBoxLayout()
+        self.signin_button = QPushButton("Sign in again…" if current else "Sign in…")
+        self.signin_button.setObjectName("primary")
+        self.signout_button = QPushButton("Sign out")
+        self.signout_button.setVisible(current is not None)
+        row.addWidget(self.signin_button)
+        row.addWidget(self.signout_button)
+        row.addStretch(1)
+        layout.addLayout(row)
+
         self.error_label = QLabel("")
         self.error_label.setObjectName("muted")
         self.error_label.setWordWrap(True)
         self.error_label.hide()
+        layout.addWidget(self.error_label)
 
+        # Other ways, closed by default: for owners who already use Firefox or cookies.txt.
+        self.advanced_button = QPushButton("▸  Other ways (Firefox, cookies.txt)")
+        self.advanced_button.setCheckable(True)
+        layout.addWidget(self.advanced_button, 0, Qt.AlignmentFlag.AlignLeft)
+        self.advanced_box = QWidget()
+        box = QVBoxLayout(self.advanced_box)
+        box.setContentsMargins(0, 0, 0, 0)
+        guidance = QLabel(cookies.GUIDANCE)
+        guidance.setTextFormat(Qt.TextFormat.PlainText)
+        guidance.setWordWrap(True)
+        guidance.setObjectName("muted")
+        box.addWidget(guidance)
+        self.browser_radio = QRadioButton("Use my Firefox sign-in")
+        self.file_radio = QRadioButton("Use a cookies.txt file")
+        self.group = QButtonGroup(self)
+        self.group.addButton(self.browser_radio)
+        self.group.addButton(self.file_radio)
+        self.profile_edit = QLineEdit()
+        self.profile_edit.setPlaceholderText("Firefox profile name (optional)")
+        self.file_edit = QLineEdit()
+        self.file_edit.setPlaceholderText(r"C:\path	o\cookies.txt")
+        self.file_button = QPushButton("Browse…")
         browser_row = QHBoxLayout()
         browser_row.setContentsMargins(24, 0, 0, 0)
-        browser_row.addWidget(self.browser_combo)
         browser_row.addWidget(self.profile_edit, 1)
         file_row = QHBoxLayout()
         file_row.setContentsMargins(24, 0, 0, 0)
         file_row.addWidget(self.file_edit, 1)
         file_row.addWidget(self.file_button)
-        layout.addWidget(self.none_radio)
-        layout.addWidget(self.browser_radio)
-        layout.addLayout(browser_row)
-        layout.addWidget(self.file_radio)
-        layout.addLayout(file_row)
-        layout.addWidget(self.error_label)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.accepted.connect(self._accept)
+        self.use_button = QPushButton("Use this")
+        box.addWidget(self.browser_radio)
+        box.addLayout(browser_row)
+        box.addWidget(self.file_radio)
+        box.addLayout(file_row)
+        box.addWidget(self.use_button, 0, Qt.AlignmentFlag.AlignLeft)
+        self.advanced_box.hide()
+        layout.addWidget(self.advanced_box)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
         if current is not None and current.source == "browser":
             self.browser_radio.setChecked(True)
-            self.browser_combo.setCurrentIndex(self.browser_combo.findData(current.browser))
             self.profile_edit.setText(current.profile)
-        elif current is not None:
+        elif current is not None and not cookies.is_signin(current):
             self.file_radio.setChecked(True)
             self.file_edit.setText(current.path)
         else:
-            self.none_radio.setChecked(True)
+            self.browser_radio.setChecked(True)
+        self.signin_button.clicked.connect(self.sign_in)
+        self.signout_button.clicked.connect(self.sign_out)
+        self.advanced_button.toggled.connect(self._toggle_advanced)
         self.file_button.clicked.connect(self._browse)
+        self.use_button.clicked.connect(self._use_other_way)
+
+    def _toggle_advanced(self, shown: bool) -> None:
+        self.advanced_box.setVisible(shown)
+        arrow = "▾" if shown else "▸"
+        self.advanced_button.setText(f"{arrow}  Other ways (Firefox, cookies.txt)")
+        self.adjustSize()
+
+    def sign_in(self) -> bool:
+        if self._signin is None:
+            from .signin import sign_in
+
+            self._signin = sign_in
+        login = self._signin(self.site, self)
+        if login is None:
+            return False
+        self._choice = login
+        self.accept()
+        return True
+
+    def sign_out(self) -> None:
+        self._choice = None
+        self.accept()
 
     def _browse(self) -> None:
         chosen, _ = QFileDialog.getOpenFileName(
@@ -1574,16 +1633,10 @@ class SiteLoginDialog(QDialog):
             self.file_edit.setText(chosen)
             self.file_radio.setChecked(True)
 
-    def choice(self) -> cookies.SiteLogin | None:
-        """The selected choice, or None for No login. Raises ValueError when it is invalid."""
-        if self.none_radio.isChecked():
-            return None
+    def other_way(self) -> cookies.SiteLogin:
+        """The Firefox or cookies.txt choice as filled in. Raises ValueError when invalid."""
         if self.browser_radio.isChecked():
-            raw = {
-                "source": "browser",
-                "browser": self.browser_combo.currentData(),
-                "profile": self.profile_edit.text(),
-            }
+            raw = {"source": "browser", "browser": "firefox", "profile": self.profile_edit.text()}
             parsed = cookies.parse(raw)
             if parsed is None:
                 raise ValueError("A profile is a name only: letters, digits, spaces, . _ -")
@@ -1595,14 +1648,18 @@ class SiteLoginDialog(QDialog):
             raise ValueError(problem or "Pick a cookies.txt file by its full path.")
         return parsed
 
-    def _accept(self) -> None:
+    def _use_other_way(self) -> None:
         try:
-            self.choice()
+            self._choice = self.other_way()
         except ValueError as exc:
             self.error_label.setText(str(exc))
             self.error_label.show()
             return
         self.accept()
+
+    def choice(self) -> cookies.SiteLogin | None:
+        """The login to save after an accepted ``exec()``; ``None`` means signed out."""
+        return self._choice
 
 
 GALLERY_ICON = QSize(128, 128)

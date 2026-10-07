@@ -35,7 +35,7 @@ from .settings import Settings
 
 log = logging.getLogger(__name__)
 
-ENGINES = ("ytdlp", "gallerydl", "music", "spotdl")
+ENGINES = ("ytdlp", "gallerydl", "music", "spotdl", "signin")
 # Always offered at their newest release: keeping them current is what keeps downloads working.
 ALWAYS_LATEST = frozenset({"yt-dlp", "gallery-dl"})
 CHECK_INTERVAL = 24 * 60 * 60

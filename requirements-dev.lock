@@ -11,7 +11,9 @@ iniconfig==2.3.0 \
 packaging==26.3 \
     --hash=sha256:94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79 \
     --hash=sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c
-    # via pytest
+    # via
+    #   stuff-downloader (pyproject.toml)
+    #   pytest
 pluggy==1.6.0 \
     --hash=sha256:7dcc130b76258d33b90f61b658791dede3486c3e6bfb003ee5c9bfb396dd22f3 \
     --hash=sha256:e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746
@@ -52,7 +54,9 @@ pyqt6==6.11.0 \
     --hash=sha256:b6324e3501b19b4292c7a55b1f22e82d3e80e519e383ce4fe79b4a754c6f0288 \
     --hash=sha256:bd11b459c54dca068e988a42cf838303334f0d441b9d16d92ae6719fcb5ac6ba \
     --hash=sha256:f7100bc7f72b12581ec479a733f4ad11b8002668e6786e8a445ab6f4d1c743d4
-    # via stuff-downloader (pyproject.toml)
+    # via
+    #   stuff-downloader (pyproject.toml)
+    #   pyqt6-webengine
 pyqt6-qt6==6.11.2 \
     --hash=sha256:2c38ee8b797c0d7f327afef4cfbb97c73676954ef2d1d503779d62c982bf5a66 \
     --hash=sha256:4b424ed1babbef07133eb2a4174c56c848d518767bca8e759aca2c8c9c313636 \
@@ -87,7 +91,25 @@ pyqt6-sip==13.12.0 \
     --hash=sha256:d09f10eee29c75dc255797096d29e576a9bf15813ece4c9376bc26dbef1b18a8 \
     --hash=sha256:df6b797f34ea7c5d58976ddf88d5d2c72e2826f793f47e009472a2b691afa008 \
     --hash=sha256:fc40cda618f13e291e35271f29250b55b9b362755f6e22357d244fcbacd18e6c
-    # via pyqt6
+    # via
+    #   pyqt6
+    #   pyqt6-webengine
+pyqt6-webengine==6.11.0 \
+    --hash=sha256:06c309fa956dd4f197636d949aa5d125cd905f386178eb8884e231c04c5b577c \
+    --hash=sha256:15cf49efbbbd4c6bc87653b2c4ae80d6049f800e31620b336734ae2e37cbedae \
+    --hash=sha256:5596ea8f7fd94a6b443c47f3c12dac619bedf5fabb646d2b8b4de1d73ec531cb \
+    --hash=sha256:a115d14205b037bf2e8aa52176fc30260c112cf3a252047e69999e5d52f7b868 \
+    --hash=sha256:a9c07d18ab6aa4be95dea5bdbced2690cf0659637634e960bd5cf90c9aa5bc1b \
+    --hash=sha256:dfd6efc1760a8f0a82a41366f44dd1949380be5b7e62ca79165ef67ae6f26456
+    # via stuff-downloader (pyproject.toml)
+pyqt6-webengine-qt6==6.11.2 \
+    --hash=sha256:17796086d6a6fd4aa58d4cd50ba9410d6ab5f1f9597b6e04443a7ee960c341bb \
+    --hash=sha256:6ac04c21a299356b4ccb1d03db8a531993eb2aece5389660bc21be746b59eb89 \
+    --hash=sha256:6ad83c047b6757bfafc5d44d9c9e448fe9a38f7998748265da0ef9094f4f8d2a \
+    --hash=sha256:764891ae20e81828ed8ba0dc153daffca10f8060c9a9b0303a7d407e3e72ce9b \
+    --hash=sha256:a5893038cb53ffba2bffcbfa8635464969538e72cbcc3963488eece630f9a4b8 \
+    --hash=sha256:af13f13e6620de6d904b268343d901caeb7a39b15ead92f5dde8cdd69dac179b
+    # via pyqt6-webengine
 pytest==8.4.2 \
     --hash=sha256:86c0d0b93306b961d58d62a4db4879f27fe25513d4b969df351abdddb3c30e01 \
     --hash=sha256:872f880de3fc3a5bdc88a11b39c9710c3497a547cfa9320bc3c5e62fbf272e79

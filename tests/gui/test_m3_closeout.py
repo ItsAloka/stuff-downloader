@@ -164,7 +164,78 @@ def test_a_failed_login_does_not_offer_another(page, runs):
     _analyze(page, "https://www.instagram.com/reel/abc/")
     runs[-1].emit("error", code="cookies_unavailable", message="the site login could not be read")
     assert page.login_button.isHidden()
-    assert "could not be read" in page.message_label.text()
+    assert "could not be used" in page.message_label.text()
+
+
+COOKIES_FAILED = "the site login could not be read"
+
+
+def _signed_in(site):
+    """A login as the sign-in engine leaves it: a cookies.txt in the sign-ins folder."""
+    path = cookies.signin_path(site)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"# Netscape HTTP Cookie File\n.{site}\tTRUE\t/\tTRUE\t0\tsid\tv\n")
+    return cookies.SiteLogin("file", path=str(path))
+
+
+def test_the_offer_names_the_site_to_sign_in_to(page, runs):
+    _analyze(page, "https://www.instagram.com/reel/abc/")
+    runs[-1].emit("error", code="download_error", message=PRIVATE)
+    assert page.login_button.text() == "Sign in to instagram.com…"
+
+
+def test_an_unreadable_saved_login_is_skipped_and_analyze_retries_without_it(page, runs):
+    chrome = cookies.SiteLogin("browser", browser="chrome")
+    page.set_site_login("youtube.com", chrome)
+    _analyze(page, "https://music.youtube.com/playlist?list=PLRp25R3Hvv1A")
+    assert runs[-1].spec.options["site_login"] == chrome.to_dict()
+    runs[-1].emit("error", code="cookies_unavailable", message=COOKIES_FAILED)
+    retry = runs[-1]
+    assert "site_login" not in retry.spec.options
+    assert "Trying without it" in page.message_label.text()
+    # The saved choice stays; it is only skipped for this session, for the whole site.
+    assert settings.load().site_logins == {"youtube.com": chrome.to_dict()}
+    retry.emit("error", code="download_error", message="HTTP Error 404")
+    count = len(runs)
+    _analyze(page, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    assert len(runs) == count + 1 and "site_login" not in runs[-1].spec.options
+
+
+def test_signing_in_again_replaces_a_skipped_login_straight_away(page, runs):
+    page.set_site_login("youtube.com", cookies.SiteLogin("browser", browser="chrome"))
+    _analyze(page, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    runs[-1].emit("error", code="cookies_unavailable", message=COOKIES_FAILED)
+    runs[-1].emit("error", code="download_error", message="HTTP Error 404")  # the retry ends
+    signed = _signed_in("youtube.com")
+    page.set_site_login("youtube.com", signed)
+    _analyze(page, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    assert runs[-1].spec.options["site_login"] == signed.to_dict()
+
+
+def test_a_skipped_login_is_retried_only_once(page, runs):
+    page.set_site_login("youtube.com", cookies.SiteLogin("browser", browser="chrome"))
+    _analyze(page, "https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+    runs[-1].emit("error", code="cookies_unavailable", message=COOKIES_FAILED)
+    count = len(runs)
+    runs[-1].emit("error", code="cookies_unavailable", message=COOKIES_FAILED)
+    assert len(runs) == count
+    assert "could not be used" in page.message_label.text()
+
+
+def test_a_download_with_an_unreadable_login_retries_without_it(page, runs, qtbot):
+    url = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+    _analyze(page, url)
+    runs[-1].emit("result", **page_info(url))
+    qtbot.waitUntil(lambda: not page.result_card.isHidden())
+    page.set_site_login("youtube.com", cookies.SiteLogin("browser", browser="chrome"))
+    job = page.start_download()
+    qtbot.waitUntil(lambda: runs[-1].spec.job_id == job.spec.job_id)
+    assert "site_login" in runs[-1].spec.options
+    runs[-1].emit("error", code="cookies_unavailable", message=COOKIES_FAILED)
+    assert job.state == "retrying"
+    page._release_retry(job.spec.job_id)
+    qtbot.waitUntil(lambda: runs[-1].spec.job_id == job.spec.job_id and runs[-1].started)
+    assert "site_login" not in runs[-1].spec.options
 
 
 class StubDialog:
@@ -207,6 +278,21 @@ def test_choosing_a_login_saves_the_choice_and_retries_with_it(page, runs, monke
     assert "firefox" not in db_text and "work" not in db_text
 
 
+def test_signing_out_from_the_offer_deletes_the_sign_in_and_retries_nothing(
+    page, runs, monkeypatch
+):
+    signed = _signed_in("instagram.com")
+    page.set_site_login("instagram.com", signed)
+    monkeypatch.setattr(page, "_login_dialog", lambda site, current: StubDialog(True, None))
+    _analyze(page, "https://www.instagram.com/reel/abc/")
+    runs[-1].emit("error", code="download_error", message=PRIVATE)
+    count = len(runs)
+    assert page.offer_site_login()
+    assert len(runs) == count
+    assert settings.load().site_logins == {}
+    assert not Path(signed.path).exists()
+
+
 def test_cancelling_the_dialog_changes_nothing(page, runs, monkeypatch):
     monkeypatch.setattr(page, "_login_dialog", lambda site, current: StubDialog(False, None))
     _analyze(page, "https://www.instagram.com/reel/abc/")
@@ -234,34 +320,132 @@ def test_logins_apply_only_to_their_site_and_never_to_the_http_engine(page):
     assert page._with_site_login(direct) is direct
 
 
-def test_dialog_validates_before_returning_a_choice(qtbot, tmp_path):
+def test_dialog_signs_in_through_the_sign_in_window(qtbot):
+    signed = cookies.SiteLogin("file", path=str(cookies.signin_path("instagram.com")))
+    seen = []
+
+    def window(site, parent):
+        seen.append(site)
+        return signed
+
+    dialog = SiteLoginDialog("instagram.com", signin=window)
+    qtbot.addWidget(dialog)
+    assert "not signed in" in dialog.status_label.text()
+    assert dialog.signout_button.isHidden() and dialog.advanced_box.isHidden()
+    assert dialog.sign_in()
+    assert seen == ["instagram.com"] and dialog.choice() == signed
+    assert dialog.result() == SiteLoginDialog.DialogCode.Accepted
+
+
+def test_a_cancelled_sign_in_keeps_the_dialog_open(qtbot):
+    dialog = SiteLoginDialog("instagram.com", signin=lambda site, parent: None)
+    qtbot.addWidget(dialog)
+    assert not dialog.sign_in()
+    assert dialog.result() != SiteLoginDialog.DialogCode.Accepted
+
+
+def test_dialog_signs_out(qtbot):
+    current = cookies.SiteLogin("file", path=str(cookies.signin_path("x.com")))
+    dialog = SiteLoginDialog("x.com", current)
+    qtbot.addWidget(dialog)
+    assert "Signed in" in dialog.status_label.text()
+    assert not dialog.signout_button.isHidden()
+    dialog.sign_out()
+    assert dialog.choice() is None
+    assert dialog.result() == SiteLoginDialog.DialogCode.Accepted
+
+
+def test_other_ways_offer_firefox_or_a_file_and_validate_them(qtbot, tmp_path):
     dialog = SiteLoginDialog("instagram.com")
     qtbot.addWidget(dialog)
-    assert dialog.none_radio.isChecked() and dialog.choice() is None
     dialog.browser_radio.setChecked(True)
     dialog.profile_edit.setText("..\\..\\Windows")
     with pytest.raises(ValueError):
-        dialog.choice()
+        dialog.other_way()
     dialog.profile_edit.setText("default-release")
-    assert dialog.choice() == cookies.SiteLogin(
+    assert dialog.other_way() == cookies.SiteLogin(
         "browser", browser="firefox", profile="default-release"
     )
     dialog.file_radio.setChecked(True)
     dialog.file_edit.setText(str(tmp_path / "missing.txt"))
     with pytest.raises(ValueError):
-        dialog.choice()
+        dialog.other_way()
+    dialog._use_other_way()
+    assert not dialog.error_label.isHidden()
     good = tmp_path / "cookies.txt"
     good.write_text("# Netscape HTTP Cookie File\n")
     dialog.file_edit.setText(str(good))
+    dialog._use_other_way()
     assert dialog.choice() == cookies.SiteLogin("file", path=str(good))
-    assert "Firefox" in cookies.GUIDANCE and "secret" in cookies.GUIDANCE
+    # Chrome, Edge and Brave are not offered: they cannot be read on Windows.
+    assert "Chrome" in cookies.GUIDANCE and "Sign in above" in cookies.GUIDANCE
 
 
-def test_dialog_shows_the_current_choice(qtbot):
+def test_dialog_shows_an_older_browser_choice(qtbot):
     dialog = SiteLoginDialog("x.com", cookies.SiteLogin("browser", browser="edge", profile="p"))
     qtbot.addWidget(dialog)
-    assert dialog.browser_radio.isChecked()
-    assert dialog.browser_combo.currentData() == "edge" and dialog.profile_edit.text() == "p"
+    assert "Edge" in dialog.status_label.text()
+    assert dialog.browser_radio.isChecked() and dialog.profile_edit.text() == "p"
+
+
+# ── Settings: site logins ────────────────────────────────────────────────────────────────
+def _settings_page(qtbot, app_settings):
+    page = pages.SettingsPage(app_settings)
+    qtbot.addWidget(page)
+    return page
+
+
+def _login_texts(page):
+    out = []
+    for row in page._login_widgets:
+        if isinstance(row, pages.QLabel):
+            out.append(row.text())
+        for widget in row.findChildren(pages.QLabel) + row.findChildren(pages.QPushButton):
+            out.append(widget.text())
+    return out
+
+
+def test_settings_list_saved_logins_and_sign_out_deletes_the_file(qtbot):
+    app_settings = settings.Settings()
+    page = _settings_page(qtbot, app_settings)
+    assert _login_texts(page) == ["None saved."]
+    signed = _signed_in("instagram.com")
+    pages.save_site_login(page, app_settings, "instagram.com", signed)
+    pages.save_site_login(
+        page, app_settings, "youtube.com", cookies.SiteLogin("browser", browser="chrome")
+    )
+    page.refresh_logins()
+    texts = _login_texts(page)
+    assert "instagram.com  ·  Signed in" in texts and "Sign out" in texts
+    assert "youtube.com  ·  Chrome  (can't be read on Windows: sign in again)" in texts
+    assert "Remove" in texts
+    assert page.remove_login("instagram.com")
+    assert not Path(signed.path).exists()
+    assert settings.load().site_logins == {
+        "youtube.com": {"source": "browser", "browser": "chrome", "profile": ""}
+    }
+    assert not page.remove_login("instagram.com")
+
+
+def test_settings_sign_in_to_a_typed_site(qtbot, monkeypatch):
+    app_settings = settings.Settings()
+    page = _settings_page(qtbot, app_settings)
+    monkeypatch.setattr(page, "_ask_site", lambda: "tiktok.com")
+    signed = _signed_in("tiktok.com")
+    monkeypatch.setattr(page, "_sign_in_window", lambda site: signed)
+    assert page.choose_site_to_sign_in()
+    assert settings.load().site_logins == {"tiktok.com": signed.to_dict()}
+    assert "tiktok.com  ·  Signed in" in _login_texts(page)
+
+
+def test_a_file_the_owner_picked_is_never_deleted(qtbot, tmp_path):
+    app_settings = settings.Settings()
+    page = _settings_page(qtbot, app_settings)
+    own = tmp_path / "mine.txt"
+    own.write_text("# Netscape HTTP Cookie File\n")
+    pages.save_site_login(page, app_settings, "x.com", cookies.SiteLogin("file", path=str(own)))
+    assert page.remove_login("x.com")
+    assert own.exists()
 
 
 def test_stored_error_text_loses_auth_values():

@@ -61,6 +61,8 @@ ENGINES: dict[str, dict[str, object]] = {
     "spotdl": {"imports": ["spotdl"], "dist": "spotdl"},
     # GPLv2-only (plan §8.3): lives only in its own env, run as a separate worker process.
     "gallerydl": {"imports": ["gallery_dl", "requests"], "dist": "gallery-dl"},
+    # The sign-in window's browser (plan §6.4). Its own env, so the updater keeps it current.
+    "signin": {"imports": ["PyQt6.QtWebEngineWidgets"], "dist": "pyqt6-webengine"},
 }
 
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -314,7 +316,8 @@ def check_env(root: Path, engine: str, env_dir: Path) -> dict[str, str]:
         "for m in mods: importlib.import_module(m)\n"
         "names = {'yt_dlp': 'yt-dlp', 'curl_cffi': 'curl_cffi', 'yt_dlp_ejs': 'yt-dlp-ejs',"
         " 'spotdl': 'spotdl', 'gallery_dl': 'gallery-dl', 'requests': 'requests',"
-        " 'ytmusicapi': 'ytmusicapi', 'mutagen': 'mutagen'}\n"
+        " 'ytmusicapi': 'ytmusicapi', 'mutagen': 'mutagen',"
+        " 'PyQt6.QtWebEngineWidgets': 'PyQt6-WebEngine'}\n"
         "found = {m: metadata.version(names[m]) for m in mods}\n"
         "print(json.dumps(found | {'prefix': sys.prefix}))\n"
     )

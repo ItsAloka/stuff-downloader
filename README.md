@@ -30,6 +30,7 @@
 - [Download and install](#download-and-install)
 - [How to use it](#how-to-use-it)
 - [Supported links](#supported-links)
+- [Signing in (optional)](#signing-in-optional)
 - [Architecture](#architecture)
 - [Security and reliability](#security-and-reliability)
 - [Build from source](#build-from-source)
@@ -57,9 +58,9 @@
   follow live speed and progress, and use *Open* / *Show in folder* when a download finishes.
 - **History.** A searchable list of everything you've downloaded, with multi-select removal.
 - **Self-updating engines.** When the app starts, it checks PyPI for newer `yt-dlp`, `gallery-dl`,
-  `ytmusicapi` and so on, and offers them in an *Updates available* dialog, a bit like
-  `apt list --upgradable`. Each update is installed into a new environment and self-tested
-  before it goes live, and you can roll it back with one click.
+  `ytmusicapi`, the sign-in browser (`PyQt6-WebEngine`) and so on, and offers them in an
+  *Updates available* dialog, a bit like `apt list --upgradable`. Each update is installed into
+  a new environment and self-tested before it goes live, and you can roll it back with one click.
 - **Dark, responsive UI.** The layout works at small, medium and maximized window sizes.
 
 ## Screenshots
@@ -77,7 +78,7 @@ These are real screenshots taken while downloading Blender's open movie *Big Buc
 ### Windows 10 / 11 (64-bit)
 
 1. Go to the [**latest release**](https://github.com/AlokaWarnakula/stuff-downloader/releases/latest).
-2. Download `StuffDownloader-Setup-1.3.0.exe`.
+2. Download `StuffDownloader-Setup-1.4.0.exe`.
 3. Run it. The installer isn't code-signed, so Windows SmartScreen may show a warning. Click
    **More info → Run anyway**.
 4. Choose whether to install the optional **spotDL** engine (it's ticked by default).
@@ -106,25 +107,45 @@ The **Tools** dialog shows the health of each bundled engine and has a **Check f
 | YouTube / YouTube Music: videos, Shorts, playlists | Video (best / 1080p / 720p), MP3, original audio, thumbnail | yt-dlp |
 | Spotify: track, album, playlist (share link) | Tagged MP3 with cover art | ytmusicapi + yt-dlp, optional spotDL |
 | Apple Music, Deezer: track, album, playlist | Tagged MP3 with cover art | ytmusicapi + yt-dlp |
-| Instagram, TikTok, X/Twitter, Facebook, Reddit | Videos, photos, carousels | yt-dlp / gallery-dl |
+| Instagram, TikTok, X/Twitter, Facebook, Reddit | Videos, photos, carousels, TikTok slideshows | yt-dlp / gallery-dl / built-in |
+| Vimeo, Dailymotion, SoundCloud, Bandcamp, Twitch, Pinterest, Imgur, Flickr, Archive.org | Video or audio, best quality available | yt-dlp |
 | Other public video pages | Whatever yt-dlp supports for that site | yt-dlp |
 | Direct file links | The file itself | built-in |
 
-Only **public** content is supported. The app never asks for your passwords.
+Public links work with no account. A few posts are only shown to signed-in people; for those,
+see **Signing in** below. The app never asks for, sees or stores your passwords.
+
+## Signing in (optional)
+
+Private accounts, age-restricted videos and some sites only show posts to people who are
+signed in. When a download fails for that reason, the app shows a **Sign in to *site*…**
+button. You can also sign in ahead of time from **Settings → Site logins**.
+
+1. Click **Sign in…**. The site's own sign-in page opens inside Stuff Downloader.
+2. Sign in the way you normally would.
+3. When you can see you are signed in, click **Done**.
+
+Your password goes only to the site. Stuff Downloader keeps the site's "signed in" cookie in
+`%LOCALAPPDATA%\StuffDownloader\signins\` and uses it only for that site's links.
+**Settings → Site logins → Sign out** deletes it.
+
+You don't need Chrome, Edge or Brave for this. On Windows they lock and encrypt their cookies,
+so no other app can read them. If you already use Firefox or a `cookies.txt` export, the sign-in
+dialog has these under **Other ways**.
 
 ## Architecture
 
 ```text
 ┌───────────────────────────── StuffDownloader.exe (PyQt6) ─────────────────────────────┐
-│  gui/        pages, queue widgets, theme            ← the only code that imports Qt     │
+│  gui/        pages, queue widgets, theme            ← the only app code that imports Qt │
 │  core/       router · presets · scheduler · runner · history · settings · updates      │
 └──────────────┬──────────────────────────────────────────────────────────────────────────┘
                │ spawns one worker process per job, JSON-lines protocol over stdio
                ▼
-   ┌─────────────────────┐  ┌──────────────────────┐  ┌───────────────────────────┐
-   │ yt-dlp env           │  │ gallery-dl env        │  │ music env / spotDL env     │
-   │ (video + audio)      │  │ (galleries)           │  │ (catalog matching, tags)   │
-   └─────────────────────┘  └──────────────────────┘  └───────────────────────────┘
+   ┌─────────────────┐  ┌──────────────────┐  ┌───────────────────────┐  ┌──────────────────┐
+   │ yt-dlp env       │  │ gallery-dl env    │  │ music env / spotDL env │  │ sign-in env       │
+   │ (video + audio)  │  │ (galleries)       │  │ (catalog matching)     │  │ (PyQt6-WebEngine) │
+   └─────────────────┘  └──────────────────┘  └───────────────────────┘  └──────────────────┘
           each engine runs in its own versioned, hash-pinned Python environment
 ```
 
@@ -138,6 +159,9 @@ A few design decisions:
 - **Safe engine updates.** An update builds a *new* environment, runs the worker self-test in it,
   and only then switches `active.json`. The previous environment is kept for rollback, and the app
   switches back automatically if the first jobs after an update all fail to start.
+- **The sign-in browser is an engine too.** The **Sign in** window runs as its own process, from
+  its own environment (`PyQt6-WebEngine`), so it gets the same update offers, self-test and undo
+  as the download engines, and it never shares a process with gallery-dl.
 - **`core/` has no Qt imports.** The download logic can be tested without a GUI and reused by
   another front end (such as the macOS port).
 - **Every URL is validated** (HTTPS only for network fetches, host allow-lists per site) before
@@ -150,7 +174,7 @@ A few design decisions:
 - The bundled FFmpeg and Deno binaries are **pinned by SHA-256** in `packaging/fetch_tools.py`.
 - Engine updates only come from PyPI over HTTPS, and yanked and pre-release versions are ignored.
   Updates to non-yt-dlp libraries stay within the same major version.
-- **1757 automated tests**: unit tests, GUI tests with `pytest-qt` (including screenshot tests of
+- **1800+ automated tests**: unit tests, GUI tests with `pytest-qt` (including screenshot tests of
   the layout at three window sizes), and opt-in network tests. The code is linted with `ruff`.
 
 ## Build from source
@@ -212,6 +236,9 @@ tests/         unit/, gui/ (pytest-qt + screenshots), convert/, network/ (opt-in
 - [x] Spotify, Apple Music and Deezer links with no account needed
 - [x] In-app engine updates with self-test and rollback (**1.2.0**)
 - [x] Self-repairing history database; errors logged instead of closing the app (**1.3.0**)
+- [x] Built-in **Sign in** window for posts that need an account, updated like the engines;
+      Vimeo, TikTok slideshows and heightless video files (Facebook, Flickr, Imgur) work again
+      (**1.4.0**)
 - [ ] macOS build
 - [ ] Faster failure on sites that block the connection (e.g. Reddit timeouts)
 

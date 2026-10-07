@@ -32,16 +32,24 @@ _MESSAGE_RULES: tuple[tuple[str, str], ...] = (
     ("account is private", "That account is private, so its posts cannot be downloaded."),
     ("members-only", "This video is for channel members only."),
     ("join this channel", "This video is for channel members only."),
+    # Before "sign in to": YouTube's bot check says "Sign in to confirm you're not a bot".
+    ("confirm you're not a bot", "YouTube asked for a bot check. Try again later, or sign in."),
+    ("confirm you’re not a bot", "YouTube asked for a bot check. Try again later, or sign in."),
     ("login required", NOT_PUBLIC),
     ("log in to", NOT_PUBLIC),
     ("sign in to", NOT_PUBLIC),
     ("http error 401", NOT_PUBLIC),
+    # yt-dlp's own wording for "this needs an account"; it always adds "Use --cookies…".
+    ("only works when logged-in", NOT_PUBLIC),
+    ("registered users", NOT_PUBLIC),
+    ("use --cookies", NOT_PUBLIC),
     # Playable nowhere we can reach it.
     ("drm protect", "This video is DRM protected and cannot be downloaded."),
     ("protected by drm", "This video is DRM protected and cannot be downloaded."),
     ("available in your country", "This video is blocked in your region."),
     ("geo restrict", "This video is blocked in your region."),
     ("not available from your location", "This video is blocked in your region."),
+    ("ip address is blocked", "The site blocks this post for your country or network."),
     ("premieres in", "This video has not premiered yet."),
     ("live event will begin", "This live stream has not started yet."),
     ("video unavailable", "This video is unavailable."),
@@ -50,8 +58,6 @@ _MESSAGE_RULES: tuple[tuple[str, str], ...] = (
     ("has been removed", "This video has been removed."),
     ("http error 404", "That page no longer exists on the site."),
     # The site is refusing us, or is unwell.
-    ("confirm you're not a bot", "YouTube asked for a bot check. Try again later."),
-    ("confirm you’re not a bot", "YouTube asked for a bot check. Try again later."),
     ("http error 403", "The site refused the download (HTTP 403). Updating engines may help."),
     ("http error 429", "The site is rate-limiting requests. Wait a bit and retry."),
     ("too many requests", "The site is rate-limiting requests. Wait a bit and retry."),
@@ -78,8 +84,8 @@ _CODE_MESSAGES = {
     "no_output": "The download finished but no file was produced.",
     "worker_exited": "The downloader stopped unexpectedly.",
     "cookies_unavailable": (
-        "The site login you chose could not be read. Close the browser, or pick a fresh"
-        " cookies.txt file, and try again."
+        "Your saved sign-in for this site could not be used. Sign in again from"
+        " Settings → Site logins."
     ),
 }
 
@@ -96,6 +102,9 @@ _NEEDS_LOGIN = (
     "log in to",
     "sign in to",
     "http error 401",
+    "only works when logged-in",
+    "registered users",
+    "use --cookies",
 )
 
 

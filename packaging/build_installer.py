@@ -31,6 +31,9 @@ are staged like every other engine's, and ``setup-runtime --with-spotdl`` instal
 after the required engines are ready (the installer's spotDL task, ticked by default). If it
 fails, the rest still works.
 
+The sign-in browser (PyQt6-WebEngine, plan §6.4) is always installed, after the required engines,
+but its failure is only reported: everything except signing in to a site works without it.
+
 Personal use only (THIRD_PARTY_LICENSES.txt F2, F4, F5): the payload ships the gallery-dl
 (GPL-2.0-only) and requests (Apache-2.0) wheels together, and the spotDL environment (GPLv3), so
 it and any installer built from it must not be published or shared.
@@ -68,8 +71,12 @@ ENGINE_INSTALLS: tuple[tuple[str, str], ...] = (
     ("gallerydl", "gallerydl.txt"),
     ("music", "music.txt"),
 )
+# Always installed, but a failure is reported instead of failing the setup (module docstring).
+BEST_EFFORT_INSTALLS: tuple[tuple[str, str], ...] = (("signin", "signin.txt"),)
 # Shipped and installed offline like the others, but only when asked (see the module docstring).
 OPTIONAL_INSTALLS: tuple[tuple[str, str], ...] = (("spotdl", "spotdl.txt"),)
+# Every engine whose wheels and requirements the payload stages.
+STAGED_INSTALLS = ENGINE_INSTALLS + BEST_EFFORT_INSTALLS + OPTIONAL_INSTALLS
 
 # Engine packages that must never be frozen into the GUI (they run in the runtime's envs).
 ENGINE_PACKAGES = (
@@ -143,7 +150,7 @@ def check_inputs(tools_dir: Path) -> None:
     except fetch_tools.ToolError as exc:
         raise PayloadError(str(exc)) from None
     build_runtime = _load("build_runtime")
-    for _engine, name in ENGINE_INSTALLS + OPTIONAL_INSTALLS:
+    for _engine, name in STAGED_INSTALLS:
         path = REQS / name
         if not path.is_file():
             raise PayloadError(f"{path} is missing")
@@ -172,6 +179,10 @@ def check_onedir(app_dir: Path, tools_dir_in_app: Path) -> None:
     )
     if leaked:
         raise PayloadError(f"engine packages were frozen into the GUI: {', '.join(leaked)}")
+    # The sign-in browser lives in its own engine env so the updater can keep it current.
+    browser = sorted(p.name for p in app_dir.rglob("Qt6WebEngine*") if p.is_file())
+    if browser:
+        raise PayloadError(f"Qt WebEngine was frozen into the GUI: {', '.join(browser)}")
 
 
 def build_gui(dest: Path) -> Path:
@@ -221,7 +232,7 @@ def download_wheels(wheels: Path) -> list[Path]:
     """Every pinned engine wheel for CPython 3.11 on win_amd64, hash-checked by pip."""
     cache = CACHE / "wheels"
     cache.mkdir(parents=True, exist_ok=True)
-    staged = ENGINE_INSTALLS + OPTIONAL_INSTALLS
+    staged = STAGED_INSTALLS
     for _engine, name in staged:
         subprocess.run(
             [
@@ -254,7 +265,7 @@ def stage_runtime_setup(setup: Path) -> None:
     (setup / "packaging" / "engine-requirements").mkdir(parents=True)
     for name in ("build_runtime.py", "build_installer.py"):
         shutil.copy2(HERE / name, setup / "packaging" / name)
-    for _engine, name in ENGINE_INSTALLS + OPTIONAL_INSTALLS:
+    for _engine, name in STAGED_INSTALLS:
         shutil.copy2(REQS / name, setup / "packaging" / "engine-requirements" / name)
     shutil.copytree(
         PROJECT / "src" / "stuff_downloader_worker",
@@ -293,10 +304,10 @@ def setup_runtime(root: Path | None = None, with_spotdl: bool = False) -> dict[s
             f"{engine}:{name}": build_runtime.install_engine(root, engine, REQS / name)
             for engine, name in ENGINE_INSTALLS
         }
-        for engine, name in OPTIONAL_INSTALLS if with_spotdl else ():
+        for engine, name in BEST_EFFORT_INSTALLS + (OPTIONAL_INSTALLS if with_spotdl else ()):
             try:
                 done[f"{engine}:{name}"] = build_runtime.install_engine(root, engine, REQS / name)
-            except Exception as exc:  # optional: report it, keep the working install
+            except Exception as exc:  # not required: report it, keep the working install
                 done[f"{engine}:{name}"] = f"failed: {type(exc).__name__}: {exc}"
     finally:
         for key, value in saved.items():
@@ -508,7 +519,7 @@ def build_setup(payload: Path, out_dir: Path, rebuild_payload: bool = True) -> P
 
 def _inputs() -> list[Path]:
     names = ["LICENSE", "THIRD_PARTY_LICENSES.txt", "requirements.lock"]
-    reqs = ENGINE_INSTALLS + OPTIONAL_INSTALLS
+    reqs = STAGED_INSTALLS
     return [PROJECT / n for n in names] + [REQS / name for _e, name in reqs]
 
 
