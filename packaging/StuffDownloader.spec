@@ -78,6 +78,15 @@ ENGINE_EXCLUDES = [
     "mutagen",
 ]
 
+# The sign-in browser is the worker's "signin" engine, in its own engine env (plan §6.4); the
+# dev venv has Qt WebEngine for running it from source, but the frozen GUI must not carry it.
+WEBENGINE_EXCLUDES = [
+    "PyQt6.QtWebEngineCore",
+    "PyQt6.QtWebEngineWidgets",
+    "PyQt6.QtWebEngineQuick",
+    "PyQt6.QtWebChannel",
+]
+
 a = Analysis(
     [str(ENTRY)],
     pathex=[str(SRC)],
@@ -86,7 +95,7 @@ a = Analysis(
     hiddenimports=["stuff_downloader.app"],
     hookspath=[],
     runtime_hooks=[],
-    excludes=ENGINE_EXCLUDES + ["tkinter", "pytest", "pytestqt"],
+    excludes=ENGINE_EXCLUDES + ["tkinter", "pytest", "pytestqt"] + WEBENGINE_EXCLUDES,
     noarchive=False,
 )
 pyz = PYZ(a.pure)

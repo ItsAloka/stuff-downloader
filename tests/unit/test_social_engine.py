@@ -560,3 +560,43 @@ def test_an_oversized_body_is_refused_not_truncated(monkeypatch):
     client = _fake_curl(monkeypatch, [_FakeResp(200, {}, b"x" * 100)], seen)
     with pytest.raises(EngineError):
         client.fetch("https://www.example.com/x", limit=10)
+
+
+# ── TikTok's bot wall ─────────────────────────────────────────────────────────────────────
+def _wall_page(answer: int, *, extra: bool = True) -> str:
+    """A page shaped like TikTok's "Please wait..." puzzle, whose answer is ``answer``."""
+    import hashlib
+
+    prefix = b"prefix-bytes"
+    digest = hashlib.sha256(prefix + str(answer).encode()).digest()
+    data = {"v": {"a": base64.b64encode(prefix).decode(), "c": base64.b64encode(digest).decode()}}
+    cs = base64.b64encode(json.dumps(data).encode()).decode().rstrip("=")
+    rci = '<p id="rci" class="waforiginalreid"></p><p id="rs" class="abc"></p>' if extra else ""
+    return (
+        "<html><script>if(a<b){x()}</script>Please wait..."
+        f'<p id="wci" class="_wafchallengeid"></p><p id="cs" class="{cs}"></p>{rci}</html>'
+    )
+
+
+def test_the_bot_wall_puzzle_is_answered_with_its_cookies():
+    answer = social.solve_tiktok_challenge(_wall_page(93))
+    assert set(answer) == {"_wafchallengeid", "waforiginalreid"}
+    assert answer["waforiginalreid"] == "abc"
+    solved = json.loads(base64.b64decode(answer["_wafchallengeid"]))
+    assert base64.b64decode(solved["d"]) == b"93"
+
+
+def test_a_page_without_a_puzzle_gets_no_cookies():
+    assert social.solve_tiktok_challenge("<html><p id='cs' class='not base64!'></p></html>") == {}
+    assert social.solve_tiktok_challenge("<html>a normal page</html>") == {}
+    assert set(social.solve_tiktok_challenge(_wall_page(5, extra=False))) == {"_wafchallengeid"}
+
+
+def test_a_puzzle_with_no_answer_in_range_gives_up(monkeypatch):
+    monkeypatch.setattr(social, "MAX_CHALLENGE_TRIES", 10)
+    assert social.solve_tiktok_challenge(_wall_page(500)) == {}
+
+
+def test_a_post_blocked_for_the_network_says_so_plainly():
+    message = "ERROR: [TikTok] 1: Your IP address is blocked from accessing this post"
+    assert "country or network" in errors.friendly_message("download_error", message)

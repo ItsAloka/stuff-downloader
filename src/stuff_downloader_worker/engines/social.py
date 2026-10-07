@@ -22,6 +22,7 @@ rebuilt rows and previews as bytes, and a download re-reads the post and fetches
 from __future__ import annotations
 
 import base64
+import hashlib
 import html
 import json
 import math
@@ -531,6 +532,63 @@ def tiktok_post(page: str) -> tuple[Post | None, int | None]:
     return post, status
 
 
+# TikTok's bot wall ("SlardarWAF") answers a first visit with a small page holding a puzzle:
+# find the number whose SHA-256, appended to a given prefix, matches a given digest. The page's
+# script then sets the answer as a cookie and reloads. This does the same, as yt-dlp does.
+MAX_CHALLENGE_TRIES = 1_000_001
+_CLASS = re.compile(r"""\bclass=["']([^"']{0,8000})["']""")
+
+
+def _class_of(page: str, element_id: str) -> str | None:
+    """The class attribute of the element with ``element_id``: where the puzzle hides its data."""
+    opening = r"<[a-zA-Z]+\s[^<>]{0,8000}?\bid=[\"']" + re.escape(element_id)
+    tag = re.search(opening + r"[\"'][^<>]{0,8000}>", page)
+    found = _CLASS.search(tag.group(0)) if tag else None
+    return found.group(1) if found else None
+
+
+def solve_tiktok_challenge(page: str) -> dict[str, str]:
+    """The cookies that answer TikTok's bot-wall puzzle in ``page``, or {} if there is none."""
+    try:
+        data = json.loads(base64.b64decode(_class_of(page, "cs") + "==="))
+        expected = base64.b64decode(data["v"]["c"])
+        base = hashlib.sha256(base64.b64decode(data["v"]["a"]))
+    except Exception:  # no puzzle on this page, or not one we understand
+        return {}
+    for number in range(MAX_CHALLENGE_TRIES):
+        attempt = base.copy()
+        attempt.update(str(number).encode())
+        if attempt.digest() == expected:
+            data["d"] = base64.b64encode(str(number).encode()).decode()
+            break
+    else:
+        return {}
+    name = _class_of(page, "wci")
+    if not name:
+        return {}
+    answer = {name: base64.b64encode(json.dumps(data, separators=(",", ":")).encode()).decode()}
+    extra_name, extra_value = _class_of(page, "rci"), _class_of(page, "rs")
+    if extra_name and extra_value:
+        answer[extra_name] = extra_value
+    return answer
+
+
+def _fetch_tiktok_page(client: Client, url: str) -> Any:
+    """A TikTok post page, past the bot wall when it puts one up."""
+    page = client.fetch(url, limit=MAX_PAGE_BYTES)
+    if page.status != 200 or _TT_DATA.search(page.text()):
+        return page
+    answer = solve_tiktok_challenge(page.text())
+    if not answer:
+        return page
+    client.cookies.update(answer)
+    try:
+        return client.fetch(url, limit=MAX_PAGE_BYTES)
+    finally:
+        for name in answer:  # the page's own script lets these expire at once
+            client.cookies.pop(name, None)
+
+
 def _read_tiktok(client: Client, url: str) -> Post:
     parts = urlsplit(url)
     if (parts.hostname or "").lower() in _TIKTOK_SHORT:
@@ -539,7 +597,7 @@ def _read_tiktok(client: Client, url: str) -> Post:
     post_id = tiktok_id(urlsplit(url).path)
     if not post_id:
         raise EngineError("unsupported", "unsupported url: not a TikTok post")
-    page = client.fetch(f"https://www.tiktok.com/@i/video/{post_id}", limit=MAX_PAGE_BYTES)
+    page = _fetch_tiktok_page(client, f"https://www.tiktok.com/@i/video/{post_id}")
     post, status = tiktok_post(page.text()) if page.status == 200 else (None, None)
     if post and post.items:
         return post

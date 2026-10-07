@@ -192,7 +192,7 @@ IMAGE_SAVE_FORMATS = ("original", "jpg", "png", "webp")
 DEFAULT_CONTAINER = "mp4"
 MAX_EDITED_TITLE = 300
 _ROW_ID = {
-    "video": re.compile(r"v:(orig|[1-9][0-9]{0,3}:(mp4|webm))"),
+    "video": re.compile(r"v:(orig|(best|[1-9][0-9]{0,3}):(mp4|webm))"),
     "audio": re.compile(r"a:(orig|mp3:(320|256|192|128|64)|m4a|opus|flac|wav)"),
     "image": re.compile(r"i:(orig|best|frame|[1-9][0-9]{0,4}x[1-9][0-9]{0,4})"),
 }
@@ -294,7 +294,8 @@ def row_label(options: dict[str, Any]) -> str:
     container = str(options.get("container") or "")
     parts = row_id.split(":")
     if tab == "video":
-        quality = "Original file" if parts[1:2] == ["orig"] else f"{parts[1]}p"
+        named = {"orig": "Original file", "best": "Best available"}
+        quality = named.get(parts[1], f"{parts[1]}p") if len(parts) > 1 else "Video"
         return f"Video · {quality} · {container.upper()}"
     if tab == "audio":
         if parts[1:2] == ["mp3"]:

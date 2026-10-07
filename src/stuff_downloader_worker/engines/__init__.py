@@ -8,6 +8,7 @@ from .gallerydl import GalleryDlEngine
 from .http import HttpEngine
 from .music import MusicEngine
 from .probe import ProbeEngine
+from .signin import SignInEngine
 from .social import SocialEngine
 from .spotdl import SpotDlEngine
 from .ytdlp import YtDlpEngine
@@ -18,6 +19,7 @@ ENGINES: dict[str, type] = {
     "http": HttpEngine,
     "music": MusicEngine,
     "probe": ProbeEngine,
+    "signin": SignInEngine,
     "social": SocialEngine,
     "spotdl": SpotDlEngine,
     "ytdlp": YtDlpEngine,

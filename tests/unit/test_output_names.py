@@ -179,3 +179,21 @@ def test_a_resumed_job_keeps_its_name_despite_its_own_part_files(tmp_path, tagge
     (tmp_path / leftover).write_bytes(b"half")
     result = _run(FakeYDL(tmp_path, "Artist - Title"), _request(preset="mp3_music"))
     assert result["files"] == [str(tmp_path / "Artist - Title.mp3")]
+
+
+def test_a_failed_download_leaves_no_cover_behind_and_the_retry_keeps_the_name(
+    tmp_path, tagged
+):
+    class Fails(FakeYDL):
+        def process_ie_result(self, info, download):
+            stem = self.params["outtmpl"]["default"][: -len(".%(ext)s")]
+            (self.home / f"{stem}.jpg").write_bytes(b"cover")  # written before the audio
+            (self.home / f"{stem}.webm.part").write_bytes(b"half")
+            raise RuntimeError("HTTP Error 403: Forbidden")
+
+    with pytest.raises(RuntimeError):
+        _run(Fails(tmp_path, "Artist - Song"), _request(preset="mp3_music"))
+    assert not (tmp_path / "Artist - Song.jpg").exists()
+    assert (tmp_path / "Artist - Song.webm.part").exists()  # a retry resumes from it
+    result = _run(FakeYDL(tmp_path, "Artist - Song"), _request(preset="mp3_music"))
+    assert result["files"] == [str(tmp_path / "Artist - Song.mp3")]

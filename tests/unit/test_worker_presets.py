@@ -290,3 +290,16 @@ def test_the_direct_engines_refuse_other_rows(tab, row_id, container):
 def test_the_frame_row_is_not_a_yt_dlp_row():
     with pytest.raises(EngineError):
         _row(tab="image", row_id="i:frame", container="png")
+
+
+def test_a_best_available_row_has_no_height_and_takes_the_best_file(tmp_path):
+    request = presets.parse_row_request(
+        {"mode": "download", "tab": "video", "row_id": "v:best:mp4", "container": "mp4"}
+    )
+    assert request.height is None and request.source_ext == "mp4"
+    opts = presets.build_row_opts(request, str(tmp_path))
+    assert opts["format"] == "bv*[ext=mp4]+ba/b[ext=mp4]/bv*+ba/b"
+    with pytest.raises(EngineError):
+        presets.parse_row_request(
+            {"mode": "download", "tab": "video", "row_id": "v:best:mov", "container": "mp4"}
+        )

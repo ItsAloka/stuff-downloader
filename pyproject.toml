@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "stuff-downloader"
-version = "1.3.0"
+version = "1.4.0"
 description = "Private local Windows desktop downloader (M0 foundation)."
 readme = "README.md"
 license = {text = "MIT"}
@@ -24,6 +24,9 @@ dev = [
     "pytest>=8,<9",
     "pytest-qt>=4.4,<5",
     "ruff>=0.6,<1",
+    # The sign-in engine's browser, when it runs from source. Installed apps get it in its own
+    # engine env (packaging/engine-requirements/signin.in), never in the frozen GUI.
+    "PyQt6-WebEngine==6.11.0",
 ]
 
 [project.scripts]

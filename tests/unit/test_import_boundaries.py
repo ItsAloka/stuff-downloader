@@ -44,9 +44,42 @@ def test_gui_has_no_engine_imports():
     assert _violations(SRC / "stuff_downloader" / "gui", ENGINES) == []
 
 
+# The sign-in engine is the one worker module that uses Qt (WebEngine, plan §6.4). It runs only
+# in its own env, which holds no gallery-dl, so PyQt6 (GPL-3.0-only) and gallery-dl
+# (GPL-2.0-only) still never share a process (THIRD_PARTY_LICENSES.txt section 1).
+SIGNIN = SRC / "stuff_downloader_worker" / "engines" / "signin.py"
+REQS = SRC.parent / "packaging" / "engine-requirements"
+
+
 def test_worker_has_no_qt_or_gui_imports():
     forbidden = QT + ("stuff_downloader",)
-    assert _violations(SRC / "stuff_downloader_worker", forbidden) == []
+    found = _violations(SRC / "stuff_downloader_worker", forbidden)
+    signin = SIGNIN.relative_to(SRC)
+    assert [v for v in found if not v.startswith(f"{signin}:")] == []
+    assert not any(v.endswith(": stuff_downloader") or ": stuff_downloader." in v for v in found)
+
+
+def test_the_sign_in_engine_imports_qt_only_inside_functions():
+    """Importing the engine registry in any env must not load Qt: only running the job does."""
+    tree = ast.parse(SIGNIN.read_text(encoding="utf-8"))
+    for node in tree.body:  # module level
+        names = []
+        if isinstance(node, ast.Import):
+            names = [a.name for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            names = [node.module or ""]
+        assert not any(n.split(".")[0] in QT for n in names), ast.dump(node)
+
+
+def _pinned(name: str) -> set[str]:
+    text = (REQS / name).read_text(encoding="utf-8")
+    return {line.split("==")[0].strip().lower() for line in text.splitlines() if "==" in line}
+
+
+def test_the_sign_in_env_and_the_gallery_dl_env_never_share_their_gpl_packages():
+    assert "pyqt6" in _pinned("signin.txt") and "gallery-dl" not in _pinned("signin.txt")
+    for name in ("gallerydl.txt", "ytdlp.txt", "ytdlp-previous.txt", "music.txt", "spotdl.txt"):
+        assert not {p for p in _pinned(name) if p.startswith("pyqt")}, name
 
 
 def test_boundary_checker_detects_violations(monkeypatch):

@@ -170,7 +170,9 @@ def test_welcome_recheck_refreshes_tools_and_engines(config, qtbot, monkeypatch,
     )
     dialog.recheck_button.click()
     texts = [label.text() for label in dialog.check_labels]
-    assert len(texts) == 5  # FFmpeg and the four engines, the music engine included (R8)
+    # FFmpeg, the four engines (the music engine included, R8) and the sign-in browser (1.4.0)
+    assert len(texts) == 6
+    assert "✖  sign-in browser — not installed" in texts
     assert "✔  yt-dlp engine — env e1" in texts
     assert "✖  music engine — not installed" in texts
     assert "Welcome" in w.welcome_button.text() and w.about_button.text() == "About"

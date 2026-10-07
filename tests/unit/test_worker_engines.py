@@ -104,7 +104,9 @@ def fake_ytdlp(monkeypatch):
 
         def extract_info(self, url, download=False):
             assert download is False
-            if state["raise"]:
+            state.setdefault("urls", []).append(url)
+            only = state.get("raise_for")  # fail just this URL; None fails every URL
+            if state["raise"] and (only is None or url == only):
                 raise FakeDownloadError(state["raise"])
             return json.loads(json.dumps(state["raw"]))
 
@@ -479,7 +481,6 @@ def test_a_failing_analyze_raises_a_classified_engine_error(fake_ytdlp):
     assert "SECRET" not in excinfo.value.message and "://" not in excinfo.value.message
 
 
-
 # ── the format catalog (plan §5.4, R2) ─────────────────────────────────────────────────────
 def test_a_video_offers_one_row_per_existing_height_with_our_ids(fake_ytdlp):
     result = _analyze_page("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
@@ -511,7 +512,11 @@ def test_audio_rows_cover_mp3_bitrates_m4a_opus_flac_and_wav(fake_ytdlp):
 def test_image_rows_are_the_thumbnail_sizes_that_exist(fake_ytdlp):
     result = _analyze_page("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
     assert [r["id"] for r in result["image_rows"]] == [
-        "i:9999x9999", "i:9000x9000", "i:8000x8000", "i:544x544", "i:480x360"
+        "i:9999x9999",
+        "i:9000x9000",
+        "i:8000x8000",
+        "i:544x544",
+        "i:480x360",
     ]
 
 
@@ -524,6 +529,60 @@ def test_an_audio_only_page_has_no_video_rows_and_no_opus_row_without_opus(fake_
     ids = [r["id"] for r in result["audio_rows"]]
     assert "a:opus" not in ids and "a:m4a" in ids
     assert result["audio_rows"][5]["copy"] is False  # no AAC source: encoded at 256 kbps
+
+
+def test_video_files_with_no_stated_height_get_one_best_available_row(fake_ytdlp):
+    # What Facebook, Flickr and Imgur report: plain MP4 links, no height, no codecs.
+    fake_ytdlp["raw"]["formats"] = [
+        {"format_id": "sd", "ext": "mp4", "protocol": "https"},
+        {"format_id": "hd", "ext": "mp4", "protocol": "https", "filesize": 5_000_000},
+    ]
+    result = _analyze_page("https://www.facebook.com/watch/?v=1")
+    assert result["kind"] == "video" and result["tabs"][0] == "video"
+    (row,) = result["video_rows"]
+    assert row["id"] == "v:best:mp4" and row["height"] is None and row["default"] is True
+    assert row["size"] == 5_000_000
+
+
+@pytest.mark.parametrize(
+    ("url", "player"),
+    [
+        ("https://vimeo.com/76979871", "https://player.vimeo.com/video/76979871"),
+        (
+            "https://www.vimeo.com/channels/staffpicks/76979871",
+            "https://player.vimeo.com/video/76979871",
+        ),
+        (
+            "https://vimeo.com/123456789/abcdef1234",
+            "https://player.vimeo.com/video/123456789?h=abcdef1234",
+        ),
+        ("https://vimeo.com/123456789?share=copy", "https://player.vimeo.com/video/123456789"),
+        ("https://player.vimeo.com/video/1", None),
+        ("https://vimeo.com/user123", None),
+        ("https://notvimeo.com/123456", None),
+    ],
+)
+def test_vimeo_page_links_map_to_their_player_link(url, player):
+    from stuff_downloader_worker.engines import ytdlp
+
+    assert ytdlp.vimeo_player_url(url) == player
+
+
+def test_a_vimeo_page_that_wants_an_account_is_read_through_its_player(fake_ytdlp):
+    url = "https://vimeo.com/76979871"
+    fake_ytdlp["raise"] = "ERROR: [vimeo] 76979871: The web client only works when logged-in."
+    fake_ytdlp["raise_for"] = url
+    result = _analyze_page(url)
+    assert fake_ytdlp["urls"] == [url, "https://player.vimeo.com/video/76979871"]
+    assert result["kind"] == "video" and result["video_rows"]
+
+
+def test_other_failures_are_not_retried_through_the_vimeo_player(fake_ytdlp):
+    url = "https://vimeo.com/76979871"
+    fake_ytdlp["raise"] = "ERROR: [vimeo] 76979871: HTTP Error 403: Forbidden"
+    with pytest.raises(EngineError):
+        _analyze_page(url)
+    assert fake_ytdlp["urls"] == [url]
 
 
 def test_a_row_download_reaches_yt_dlp_as_fixed_options(fake_ytdlp, tmp_path):

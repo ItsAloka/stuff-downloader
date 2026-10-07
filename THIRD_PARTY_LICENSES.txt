@@ -143,6 +143,18 @@ requests==2.34.2           Apache-2.0
 urllib3==2.8.0             MIT
 [end]
 
+The sign-in browser (1.4.0) is its own environment, so the library updater keeps it current. It
+is a separate process like the other engines; the GUI never loads Qt WebEngine.
+
+[packaging/engine-requirements/signin.txt]
+pyqt6==6.11.0              GPL-3.0-only (Riverbank Computing; commercial licence also offered)
+pyqt6-qt6==6.11.2          LGPL-3.0 (Qt 6 libraries)
+pyqt6-sip==13.13.0         BSD-2-Clause
+pyqt6-webengine==6.11.0    GPL-3.0-only (Riverbank Computing)
+pyqt6-webengine-qt6==6.11.2  LGPL-3.0 (Qt WebEngine; it bundles Chromium, BSD-3-Clause and
+                           others, whose notices ship in its resources)
+[end]
+
 [packaging/engine-requirements/spotdl.txt]
 annotated-types==0.8.0     MIT
 anyio==3.7.1               MIT

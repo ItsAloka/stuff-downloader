@@ -171,3 +171,8 @@ def test_a_direct_video_frame_row_is_an_image_row():
     assert presets.row_kind(options) == "thumbnail"
     with pytest.raises(ValueError):
         presets.row_download_options("image", "i:frames")
+
+
+def test_a_best_available_row_is_accepted_and_labelled():
+    options = presets.row_download_options("video", "v:best:mp4", "mp4")
+    assert presets.row_label(options) == "Video · Best available · MP4"

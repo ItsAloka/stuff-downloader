@@ -65,7 +65,9 @@ def downloaded(listing, tmp_path_factory):
     out = tmp_path_factory.mktemp("album")
     entries = [e for e in listing.entries if not e.unavailable][:TRACKS]
     assert len(entries) == TRACKS, "not enough available entries to test with"
-    specs = playlist.batch_specs(listing, entries, str(out), "mp3_music", archive=True)
+    specs = playlist.batch_specs(
+        listing, entries, str(out), presets.DEFAULT_MUSIC_BATCH, archive=True
+    )
     results = []
     for spec in specs:
         terminal, _ = run_job(spec)
@@ -100,7 +102,8 @@ def test_the_mp3s_carry_album_track_numbers_and_a_square_cover(downloaded, listi
         probe = ffprobe(path)
         tags = {k.lower(): v for k, v in (probe["format"].get("tags") or {}).items()}
 
-        assert tags.get("album") == listing.title, tags
+        # The track's own album name, from YouTube Music; the page title adds "Album - ".
+        assert tags.get("album") == listing.title.removeprefix("Album - "), tags
         track = str(tags.get("track", "")).split("/")[0]
         assert track.isdigit(), f"no track number in {tags}"
         seen_tracks.add(int(track))
@@ -155,7 +158,9 @@ def test_an_entry_not_in_the_archive_still_downloads(downloaded, listing, tmp_pa
     """The archive must skip what it has seen, not everything."""
     entries = [e for e in listing.entries if not e.unavailable][TRACKS : TRACKS + 1]
     assert entries, "no spare entry to test with"
-    (spec,) = playlist.batch_specs(listing, entries, str(tmp_path), "mp3_music", archive=True)
+    (spec,) = playlist.batch_specs(
+        listing, entries, str(tmp_path), presets.DEFAULT_MUSIC_BATCH, archive=True
+    )
     terminal, _ = run_job(spec)
 
     assert terminal.type == "result", terminal.data

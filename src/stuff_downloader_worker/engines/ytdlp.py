@@ -102,6 +102,24 @@ def _release(lock: Path) -> None:
         pass
 
 
+# The cover yt-dlp saves before the media itself, under the job's claimed name.
+_COVER_EXTS = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def _drop_leftover_covers(folder: Path, stem: str) -> None:
+    """After a failed download, delete the cover it already saved under its claimed name.
+
+    Left behind, it is junk in the owner's folder and makes the retry come out as
+    "name (2)". The claim proved the name was free, so a file with it is this job's own.
+    Partial media (``.part``) stays: a retry resumes from it.
+    """
+    for ext in _COVER_EXTS:
+        try:
+            (folder / f"{stem}{ext}").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _taken(pattern: str, own: Path | None = None) -> bool:
     return any(Path(p) != own and not _TRANSIENT.search(p) for p in glob.glob(pattern))
 
@@ -361,7 +379,37 @@ def video_rows(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "default": height == default_height,
             }
         )
+    if not rows:
+        rows = _best_video_row(formats)
     return rows
+
+
+def _best_video_row(formats: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One "Best available" row for a page whose video formats state no height.
+
+    Facebook, Flickr, Imgur and many smaller sites serve plain MP4 files without saying how
+    tall they are; without this row their Video tab would be empty. yt-dlp lists formats
+    worst to best, so the last video format stands for the row, as ``-f best`` would pick.
+    """
+    videos = [f for f in formats if _has_video(f)]
+    if not videos:
+        return []
+    best = videos[-1]
+    container = best.get("ext") if best.get("ext") in ("mp4", "webm") else "mp4"
+    size, estimate = _size(best)
+    return [
+        {
+            "id": f"v:best:{container}",
+            "height": None,
+            "fps": None,
+            "hdr": False,
+            "vcodec": codec_name(best.get("vcodec")),
+            "container": container,
+            "size": size,
+            "size_is_estimate": estimate,
+            "default": True,
+        }
+    ]
 
 
 def audio_rows(formats: list[dict[str, Any]], duration: Any) -> list[dict[str, Any]]:
@@ -511,6 +559,26 @@ def sanitize_thumbnails(raw: Any) -> list[dict[str, int]]:
             sizes.add((width, height))
     ordered = sorted(sizes, key=lambda s: s[0] * s[1], reverse=True)[:MAX_THUMBNAIL_ROWS]
     return [{"width": w, "height": h} for w, h in ordered]
+
+
+# vimeo.com/<id>, vimeo.com/<id>/<unlisted hash>, vimeo.com/channels/<name>/<id>, and so on.
+_VIMEO_PAGE = re.compile(
+    r"https?://(?:www\.)?vimeo\.com/(?:[^?#]*/)?(\d{3,12})(?:/([0-9a-f]{6,20}))?/?(?:[?#].*)?",
+    re.IGNORECASE,
+)
+# What yt-dlp says when Vimeo's page API wants an account, or the page is gone while the player
+# still serves the video. The player link works without signing in.
+_VIMEO_PAGE_REFUSALS = ("only works when logged-in", "http error 404")
+
+
+def vimeo_player_url(url: str) -> str | None:
+    """The player.vimeo.com link for a vimeo.com page link, or None for any other link."""
+    match = _VIMEO_PAGE.fullmatch(url)
+    if not match:
+        return None
+    video_id, unlisted = match.groups()
+    player = f"https://player.vimeo.com/video/{video_id}"
+    return f"{player}?h={unlisted}" if unlisted else player
 
 
 def redact_urls(text: str) -> str:
@@ -725,7 +793,7 @@ class YtDlpEngine:
         ydl = self._open(yt_dlp, ydl_opts, bool(login_opts))
         try:
             with ydl:
-                info = ydl.extract_info(job.url, download=False)
+                info = self._extract(yt_dlp, ydl, job.url)
                 if not isinstance(info, dict):
                     raise EngineError("download_error", "no media information found")
                 _rearm_archive(ydl, archive_path)
@@ -761,6 +829,19 @@ class YtDlpEngine:
                 return self._download(ydl, info, request, summary, files, stage, emit)
         except yt_dlp.utils.DownloadError as exc:
             raise EngineError(*describe_download_error(str(exc))) from exc
+
+    @staticmethod
+    def _extract(yt_dlp: Any, ydl: Any, url: str) -> Any:
+        """``extract_info`` for ``url``. A vimeo.com page that wants an account (or is gone)
+        is read again through its player link, which Vimeo still serves without one."""
+        try:
+            return ydl.extract_info(url, download=False)
+        except yt_dlp.utils.DownloadError as exc:
+            player = vimeo_player_url(url)
+            text = str(exc).lower()
+            if player is None or not any(r in text for r in _VIMEO_PAGE_REFUSALS):
+                raise
+            return ydl.extract_info(player, download=False)
 
     @staticmethod
     def _open(yt_dlp: Any, ydl_opts: dict[str, Any], with_login: bool) -> Any:
@@ -875,6 +956,10 @@ class YtDlpEngine:
         claim = YtDlpEngine._claim_name(ydl, info)
         try:
             done = ydl.process_ie_result(info, download=True)
+        except BaseException:
+            if claim:
+                _drop_leftover_covers(claim[1].parent, claim[0])
+            raise
         finally:
             if claim:
                 _release(claim[1])

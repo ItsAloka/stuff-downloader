@@ -75,6 +75,8 @@ def test_choice_matches_the_site_and_its_subdomains_only():
     assert cookies.choice_for("https://scontent.instagram.com/p/1", choices)
     assert cookies.choice_for("https://notinstagram.com/p/1", choices) is None
     assert cookies.choice_for("https://instagram.com.evil.example/p/1", choices) is None
+    assert cookies.site_for("https://scontent.instagram.com/p/1", choices) == "instagram.com"
+    assert cookies.site_for("https://notinstagram.com/p/1", choices) == ""
 
 
 def test_settings_store_the_choice_never_the_cookies(tmp_path, cookie_file):
@@ -151,7 +153,7 @@ def test_other_failures_do_not_offer_a_login(code, message):
 
 def test_cookie_failure_has_its_own_plain_message():
     text = errors.friendly_message("cookies_unavailable", site_login.COOKIES_FAILED)
-    assert "could not be read" in text and "cookies.txt" in text
+    assert "could not be used" in text and "Sign in again" in text
 
 
 # ── worker: re-validation and yt-dlp options ─────────────────────────────────────────────
@@ -295,3 +297,21 @@ def test_download_mode_accepts_a_login_alongside_the_preset(fake_ydl):
         get_engine("ytdlp").download(_spec(options), lambda *a: 0)
     assert info.value.code != "bad_options"
     assert fake_ydl["opts"]["cookiesfrombrowser"][0] == "firefox"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "ERROR: [vimeo] 1: The web client only works when logged-in. Use --cookies",
+        "ERROR: [site] 1: This video is only available for registered users. Use --cookies",
+    ],
+)
+def test_yt_dlp_account_wording_offers_sign_in_in_plain_words(message):
+    assert errors.needs_site_login("download_error", message)
+    assert errors.friendly_message("download_error", message) == errors.NOT_PUBLIC
+
+
+def test_the_bot_check_is_named_as_one_and_offers_sign_in():
+    message = "Sign in to confirm you're not a bot. Use --cookies-from-browser or --cookies"
+    assert "bot check" in errors.friendly_message("download_error", message)
+    assert errors.needs_site_login("download_error", message)

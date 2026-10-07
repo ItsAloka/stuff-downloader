@@ -162,5 +162,5 @@ def test_iscc_failure_is_reported_by_main(bi, monkeypatch, capsys):
     assert "error:" in capsys.readouterr().err
 
 
-def test_release_version_is_1_3_0(bi):
-    assert bi._release_version() == "1.3.0"
+def test_release_version_is_1_4_0(bi):
+    assert bi._release_version() == "1.4.0"

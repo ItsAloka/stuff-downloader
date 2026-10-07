@@ -30,7 +30,7 @@ def _sha(data: bytes) -> str:
 
 
 def test_every_engine_requirements_file_is_installed_previous_ytdlp_first(bi):
-    names = [name for _engine, name in bi.ENGINE_INSTALLS + bi.OPTIONAL_INSTALLS]
+    names = [name for _engine, name in bi.STAGED_INSTALLS]
     assert sorted(names) == sorted(
         p.name for p in (PACKAGING / "engine-requirements").glob("*.txt")
     )
@@ -198,11 +198,12 @@ def test_setup_runtime_installs_offline_in_order_and_restores_env(bi, monkeypatc
     root = (tmp_path / "root").resolve()
     assert (root / "python" / "python.exe").read_bytes() == b"py"  # copied into place
     assert calls[0] == ("base", root)
-    assert [c[:2] for c in calls[1:]] == list(bi.ENGINE_INSTALLS)
+    # The required engines first, then the sign-in browser.
+    assert [c[:2] for c in calls[1:]] == list(bi.ENGINE_INSTALLS + bi.BEST_EFFORT_INSTALLS)
     wheels_url = (setup / "wheels").resolve().as_uri()
     assert " " not in wheels_url  # pip splits PIP_FIND_LINKS on whitespace
     assert all(c[2] == "1" and c[3] == wheels_url for c in calls[1:])
-    assert len(result) == 4
+    assert len(result) == 5
     assert "PIP_NO_INDEX" not in os.environ
     assert os.environ["PIP_FIND_LINKS"] == "before"
 
@@ -347,7 +348,8 @@ def test_setup_runtime_skips_spotdl_unless_asked(bi, monkeypatch, tmp_path):
     calls = _staged_runtime(bi, monkeypatch, tmp_path)
     result = bi.setup_runtime()
     assert "spotdl" not in {engine for engine, *_ in calls}
-    assert set(result) == {f"{e}:{n}" for e, n in bi.ENGINE_INSTALLS}
+    installed = bi.ENGINE_INSTALLS + bi.BEST_EFFORT_INSTALLS
+    assert set(result) == {f"{e}:{n}" for e, n in installed}
 
 
 def test_setup_runtime_installs_spotdl_offline_last_when_asked(bi, monkeypatch, tmp_path):
@@ -357,6 +359,16 @@ def test_setup_runtime_installs_spotdl_offline_last_when_asked(bi, monkeypatch, 
     assert all(c[2] == "1" for c in calls)  # every engine offline, from the staged wheels
     assert "PIP_NO_INDEX" not in os.environ
     assert result["spotdl:spotdl.txt"] == "spotdl-id"
+
+
+def test_the_sign_in_browser_is_always_installed_and_never_fails_the_setup(
+    bi, monkeypatch, tmp_path, capsys
+):
+    assert bi.BEST_EFFORT_INSTALLS == (("signin", "signin.txt"),)
+    calls = _staged_runtime(bi, monkeypatch, tmp_path, fail=("signin",))
+    assert bi.main(["setup-runtime"]) == 0
+    assert ("signin", "signin.txt", "1") in calls  # offline, like the others
+    assert "warn signin:signin.txt -> failed: RuntimeError: no network" in capsys.readouterr().out
 
 
 def test_a_failed_spotdl_fetch_never_fails_the_setup(bi, monkeypatch, tmp_path, capsys):
